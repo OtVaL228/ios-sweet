@@ -1,0 +1,38 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..9d36822 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,10 +515,11 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	/* GUACAMOLE (OnePlus 7 Pro): 1440x3120 panel, stride 5760 */
++	MOV64	x0, (0x9c000000 + 3088 * 5760)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #5760
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..764e2b2 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -13,10 +13,11 @@
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
+-#define EARLY_SCALE 2u
++/* GUACAMOLE (OnePlus 7 Pro): ABL splash is 1440x3120 a8r8g8b8, stride 5760 */
++#define EARLY_WIDTH 1440u
++#define EARLY_HEIGHT 3120u
++#define EARLY_STRIDE (5760u / 4)
++#define EARLY_SCALE 3u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)

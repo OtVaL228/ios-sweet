@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--guacamole]
 """
 import hashlib, os, struct, sys
 
@@ -31,6 +31,15 @@ GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+# --guacamole: OnePlus 7 Pro (SM8150). Same SoC-level addresses as sweet
+# (GIC, UFS, SPMI); the ABL splash is 1440x3120 a8r8g8b8 at the same address.
+# Its DDR is 0x80000000-0xbbb00000 + 0xc0000000-0x280000000 (8 GB): the
+# --highmem window 0x100000000+0xfcc00000 is RAM with no fixed carve-outs, but
+# the low PHYS_BASE window crosses the 0xbbb00000 hole, so use --highmem.
+GUACAMOLE = '--guacamole' in sys.argv
+if GUACAMOLE:
+    FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
+    FB_SIZE = 0x1200000
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -242,6 +251,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
+    if GUACAMOLE and '--highmem' not in sys.argv:
+        sys.exit('--guacamole needs --highmem (the low window crosses a DDR hole)')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
