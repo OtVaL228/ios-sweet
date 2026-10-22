@@ -1,0 +1,158 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..4251721 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -77,6 +77,13 @@ enum {
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ *
++ * A panel LARGER than the iPhone X (OnePlus 7 Pro: 1440x3120, the same
++ * 19.5:9 aspect) is driven the other way round: userland still sees
++ * 1125x2436 and present() scales every layer up by panel/logical
++ * (x1.28) with a nearest-neighbour column table. A native 1440x3120 @3x
++ * screen (480x1040 points) matches no iPhone (first guacamole boot:
++ * PosterBoard trapped with sig 5, likely because of it).
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+@@ -113,6 +120,8 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	bool          fScaleUp;       /* panel > logical: scale layers up */
++	uint16_t     *fColMap;        /* panel x -> logical x (fScaleUp) */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -122,6 +131,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
++	    int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -174,8 +185,22 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fScaleUp = false;
++	fColMap = NULL;
++	if (!native && fWidth > SWEET_FB_LOGICAL_W && fHeight > SWEET_FB_LOGICAL_H &&
++	    fWidth < 0x10000 && fHeight < 0x10000) {
++		fColMap = (uint16_t *)IOMalloc(fWidth * sizeof(uint16_t));
++		if (fColMap != NULL) {
++			for (uint32_t x = 0; x < fWidth; x++) {
++				fColMap[x] = (uint16_t)(((uint64_t)x * SWEET_FB_LOGICAL_W) / fWidth);
++			}
++			fLogicalW = SWEET_FB_LOGICAL_W;
++			fLogicalH = SWEET_FB_LOGICAL_H;
++			fScaleUp = true;
++		}
++	}
++	fOffX = fScaleUp ? 0 : (int32_t)(fLogicalW - fWidth) / 2;
++	fOffY = fScaleUp ? 0 : (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -201,8 +226,9 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fScaleUp ? " (scaled up)" : "");
+ 	return true;
+ }
+ 
+@@ -308,6 +334,72 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * One layer, logical rect (dx,dy,w,h) <- surface rect (sx,sy), drawn on a
++ * panel bigger than the logical display: every panel pixel takes the
++ * logical pixel it falls in (nearest neighbour). Pixels go directly
++ * from the (cached) surface into the panel, so the
++ * write-combined panel memory is never read back.
++ */
++void
++AppleCLCD::presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
++    int32_t w, int32_t h)
++{
++	uintptr_t src = s->kernelAddress();
++	uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++
++	if (src == 0 || bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->memory == NULL || sx < 0 || sy < 0) {
++		return;
++	}
++	if (w <= 0 || h <= 0) {
++		w = (int32_t)s->width;
++		h = (int32_t)s->height;
++	}
++	/* clip in logical space: to the surface and to the logical display */
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fLogicalW - dx) {
++		w = (int32_t)fLogicalW - dx;
++	}
++	if (h > (int32_t)fLogicalH - dy) {
++		h = (int32_t)fLogicalH - dy;
++	}
++	if (w <= 0 || h <= 0) {
++		return;
++	}
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++	    (uint64_t)(sx + w) * 4;
++	if (last > s->memory->getLength()) {
++		return;
++	}
++	/* panel range covered: first panel pixel whose logical coord >= d,
++	 * up to the first whose logical coord >= d + w */
++	uint32_t px0 = (uint32_t)(((uint64_t)dx * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t px1 = (uint32_t)(((uint64_t)(dx + w) * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t py0 = (uint32_t)(((uint64_t)dy * fHeight + fLogicalH - 1) / fLogicalH);
++	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH);
++	if (px1 > fWidth) {
++		px1 = fWidth;
++	}
++	if (py1 > fHeight) {
++		py1 = fHeight;
++	}
++	const uintptr_t base = src + s->offset + (uint64_t)sx * 4;
++	for (uint32_t py = py0; py < py1; py++) {
++		uint32_t ly = (uint32_t)(((uint64_t)py * fLogicalH) / fHeight);
++		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + (int32_t)ly - dy) * s->bytesPerRow);
++		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		for (uint32_t px = px0; px < px1; px++) {
++			drow[px] = srow[fColMap[px] - (uint32_t)dx];
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -359,6 +451,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaleUp) {
++			presentScaled(s, sx, sy, dx, dy, w, h);
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
