@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4251721..bb72c6f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -135,6 +135,20 @@ public:
+ 	    int32_t w, int32_t h);
+ };
+ 
++/*
++ * From ios-topaz 0138 (topaz-0138, MakrSas/ios-topaz): the graphics
++ * accelerator's service class. QuartzCore (CAMetalContextCreate, once per
++ * process) polls IOServiceMatching("IOAcceleratorES") 300 times, 100 ms
++ * apart: thirty seconds at every backboardd start. One without
++ * MetalPluginName/MetalPluginClassName is found and then passed over by
++ * Metal (MTLRegisterDevices), which leaves the renderers as they were.
++ * Boot-arg sweetaccel=0 turns it off.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -229,6 +243,17 @@ AppleCLCD::start(IOService *provider)
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+ 	    fScaleUp ? " (scaled up)" : "");
++	uint32_t accelOn = 1;
++	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (accel != NULL && accel->init()) {
++		accel->setName("sgx");
++		if (accel->attach(this)) {
++			accel->registerService();
++			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++		}
++	}
++	OSSafeReleaseNULL(accel);
+ 	return true;
+ }
+ 
