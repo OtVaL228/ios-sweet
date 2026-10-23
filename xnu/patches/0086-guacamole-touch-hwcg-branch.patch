@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a2cdfd0..760d23d 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -194,11 +194,20 @@ touch_clocks(void)
+ 	/* M_AHB, S_AHB, S0 branch halt bits (BRANCH_HALT_VOTED in Linux). */
+ 	const uint32_t branches[] = {0x1e004, 0x1e008, 0x1e144};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
++		if (touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			continue;
++		}
++		uint32_t v = touch_rd(st.gcc, branches[i]);
++		/* S_AHB has hardware clock gating (Linux: hwcg_reg 0x1e008, bit 1).
++		 * In HWCG mode CLK_OFF follows bus activity, so Linux skips the halt
++		 * check (branch_in_hwcg_mode); do the same. */
++		if (branches[i] == 0x1e008u && (v & 2u)) {
++			printf("SWEET TOUCH: GCC branch %#x in HW gating mode (%#x); not polled\n",
++			    branches[i], v);
++			continue;
+ 		}
++		printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i], v);
++		return false;
+ 	}
+ 	return true;
+ }
