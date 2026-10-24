@@ -1,0 +1,228 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..7052e81 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..3e06e13
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,190 @@
++/*
++ * GUACAMOLE (OnePlus 7 Pro, SM8150): Adreno 640 bring-up, stage 1.
++ *
++ * Read-only state probe, enabled with boot-arg sweetgpu=1 (default off).
++ * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
++ * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
++ * and branch clocks, the GMU clock source, the speed bin fuse, and whether
++ * the firmware files the next stages need are on the root volume. It never
++ * writes a register and reads GMU/GPU-SMMU registers only if their power
++ * domain and interface clocks are on (an unclocked block hangs the bus).
++ *
++ * Facts (registers only, no code copied):
++ *  - live DT: kgsl-3d0 0x2c00000 (chipid 0x06040001), GMU 0x2c6a000 + 0x30000,
++ *    GMU PDC cfg/seq 0xb290000/0xb490000, gpucc 0x2c90000 + 0x9000
++ *    ("qcom,gpucc-sm8150"), GPU SMMU 0x2ca0000 (qsmmu-v500), speed bin
++ *    qfprom 0x780000 + 0x4130 mask 0xe0000000 shift 29, zap "a640_zap".
++ *  - Linux drivers/clk/qcom/gpucc-sm8150.c: CX GDSCR 0x106c (hw ctrl
++ *    0x1540), GX GDSCR 0x100c, GMU RCG 0x1120, CBCRs cxo_aon 0x1004,
++ *    gx_gmu 0x1064, ahb 0x1078, crc_ahb 0x107c, cx_apb 0x1088,
++ *    cx_snoc_dvm 0x108c, cx_gmu 0x1098, cxo 0x109c.
++ *  - Linux drivers/clk/qcom/gcc-sm8150.c: gpu_cfg_ahb 0x71004, memnoc_gfx
++ *    0x7100c, snoc_dvm_gfx 0x71018, ddrss_gpu_axi 0x71154, gpu_iref
++ *    0x8c010, gpll0 / gpll0_div votes 0x52004 bits 15 / 16.
++ *  - The stage plan follows the A618 bring-up on SM7150 by mxtpasontop's
++ *    ios-sweet gpu branch and Bergamota's GPU_A630_BRINGUP.md (structure
++ *    only).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_gpu_probe(void);
++
++#define GCC_PA            0x00100000u
++#define GCC_SIZE          0x00090000u
++#define GPUCC_PA          0x02c90000u
++#define GPUCC_SIZE        0x00009000u
++#define QFPROM_PA         0x00780000u
++#define QFPROM_SIZE       0x00007000u
++#define SPEED_BIN_OFF     0x4130u
++
++#define CBCR_CLK_OFF      (1u << 31)
++#define GDSC_PWR_ON       (1u << 31)
++
++static const struct { uint32_t off; const char *name; } gcc_regs[] = {
++	{0x71004, "gpu_cfg_ahb"},
++	{0x7100c, "gpu_memnoc_gfx"},
++	{0x71018, "gpu_snoc_dvm_gfx"},
++	{0x71154, "ddrss_gpu_axi"},
++	{0x8c010, "gpu_iref"},
++};
++
++static const struct { uint32_t off; const char *name; } gpucc_cbcrs[] = {
++	{0x1004, "cxo_aon"},
++	{0x1064, "gx_gmu"},
++	{0x1078, "ahb"},
++	{0x107c, "crc_ahb"},
++	{0x1088, "cx_apb"},
++	{0x108c, "cx_snoc_dvm"},
++	{0x1098, "cx_gmu"},
++	{0x109c, "cxo"},
++};
++
++static const char *const gpu_fw[] = {
++	"/usr/standalone/firmware/sweet/a640_gmu.bin",
++	"/usr/standalone/firmware/sweet/a630_sqe.fw",
++	"/usr/standalone/firmware/sweet/a640_zap.mdt",
++	"/usr/standalone/firmware/sweet/a640_zap.b00",
++	"/usr/standalone/firmware/sweet/a640_zap.b01",
++	"/usr/standalone/firmware/sweet/a640_zap.b02",
++};
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++gpu_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	assert_wait_deadline((event_t)&gpu_wait_ms, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++gpu_fw_report(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	for (unsigned i = 0; i < sizeof(gpu_fw) / sizeof(gpu_fw[0]); ++i) {
++		vnode_t vp = NULLVP;
++		int err = vnode_lookup(gpu_fw[i], 0, &vp, ctx);
++		if (err) {
++			printf("SWEET GPU: fw %s: missing (%d)\n", gpu_fw[i], err);
++			continue;
++		}
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		err = vnode_getattr(vp, &va, ctx);
++		printf("SWEET GPU: fw %s: %llu bytes (%d)\n", gpu_fw[i],
++		    err ? 0ULL : (unsigned long long)va.va_data_size, err);
++		vnode_put(vp);
++	}
++}
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 60;
++	(void)arg;
++	(void)result;
++	/* After root mount, the lock screen and the touch driver (45 s). */
++	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
++	printf("SWEET GPU: Adreno 640 stage 1 (read-only) in %u s\n", delay_s);
++	gpu_wait_ms(delay_s * 1000u);
++
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	vm_offset_t gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	vm_offset_t qfprom = ml_io_map(QFPROM_PA, QFPROM_SIZE);
++	if (!gcc || !gpucc || !qfprom) {
++		printf("SWEET GPU: MMIO mapping failed\n");
++		goto out;
++	}
++
++	uint32_t vote = rd(gcc, 0x52004);
++	printf("SWEET GPU: gcc vote 0x52004=%#x (gpll0 %u gpll0_div %u)\n", vote,
++	    (vote >> 15) & 1u, (vote >> 16) & 1u);
++	for (unsigned i = 0; i < sizeof(gcc_regs) / sizeof(gcc_regs[0]); ++i) {
++		uint32_t v = rd(gcc, gcc_regs[i].off);
++		printf("SWEET GPU: gcc %-16s %#x = %#010x (%s)\n", gcc_regs[i].name,
++		    gcc_regs[i].off, v, (v & CBCR_CLK_OFF) ? "off" : "on");
++	}
++
++	uint32_t cx = rd(gpucc, 0x106c), cxhw = rd(gpucc, 0x1540), gx = rd(gpucc, 0x100c);
++	printf("SWEET GPU: gdsc cx %#010x (%s) hw-ctrl %#x, gx %#010x (%s)\n",
++	    cx, (cx & GDSC_PWR_ON) ? "on" : "off", cxhw, gx, (gx & GDSC_PWR_ON) ? "on" : "off");
++	uint32_t rcg = rd(gpucc, 0x1120), rcgcfg = rd(gpucc, 0x1124);
++	printf("SWEET GPU: gmu rcg cmd %#x cfg %#x (src %u div %u)\n", rcg, rcgcfg,
++	    (rcgcfg >> 8) & 7u, rcgcfg & 0x1fu);
++	for (unsigned i = 0; i < sizeof(gpucc_cbcrs) / sizeof(gpucc_cbcrs[0]); ++i) {
++		uint32_t v = rd(gpucc, gpucc_cbcrs[i].off);
++		printf("SWEET GPU: gpucc %-12s %#x = %#010x (%s)\n", gpucc_cbcrs[i].name,
++		    gpucc_cbcrs[i].off, v, (v & CBCR_CLK_OFF) ? "off" : "on");
++	}
++
++	uint32_t fuse = rd(qfprom, SPEED_BIN_OFF);
++	printf("SWEET GPU: qfprom %#x = %#x, speed bin %u\n", QFPROM_PA + SPEED_BIN_OFF,
++	    fuse, (fuse & 0xe0000000u) >> 29);
++
++	if (!(cx & GDSC_PWR_ON)) {
++		printf("SWEET GPU: CX domain off: GMU/GPU SMMU not read (expected after ABL)\n");
++	} else {
++		printf("SWEET GPU: CX domain on after ABL: GMU state is read in stage 2\n");
++	}
++	gpu_fw_report();
++	printf("SWEET GPU: stage 1 done\n");
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_gpu_probe(void)
++{
++	unsigned stage = 0;
++	(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
++	if (stage == 0) {
++		printf("SWEET GPU: disabled (sweetgpu=0)\n");
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GPU: thread start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..544d2b5 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
+ 	return 0;
+ }
+ 
