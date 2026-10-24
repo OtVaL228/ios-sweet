@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 73a8506..b9d0c24 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1755,8 +1755,15 @@ gpu_stage10(void)
+ 	const struct { uint64_t va; uint32_t off; } maps[] = {
+ 		{GVA_IB, GPUMEM_IB}, {GVA_SCRATCH, GPUMEM_SCRATCH}, {GVA_FENCE, GPUMEM_FENCE},
+ 	};
++	/* 0105: FSR 0x408 = format | PF (bit 3, PERMISSION fault, not a
++	 * translation fault), FAR = the IB. Commands in the ring run privileged
++	 * but an IB runs at the unprivileged level, and so do its CP_MEM_WRITEs:
++	 * the IB and scratch pages need AP[1] (EL0 access), as Linux maps user
++	 * BOs (no IOMMU_PRIV). The fence is written from the ring but is mapped
++	 * the same way for simplicity. */
+ 	for (unsigned i = 0; i < 3; ++i) {
+-		l3[(maps[i].va >> 12) & 0x1ffu] = (gpumem_pa + maps[i].off) | PTE_AF | PTE_SH_OS | PTE_PAGE;
++		l3[(maps[i].va >> 12) & 0x1ffu] = (gpumem_pa + maps[i].off) | PTE_AF | PTE_SH_OS |
++		    PTE_AP_UNPRIV | PTE_PAGE;
+ 	}
+ 	flush_dcache64((addr64_t)(gpumem + 0x2000u), 0x1000u, FALSE);
+ 	__asm__ volatile("dsb sy" ::: "memory");
