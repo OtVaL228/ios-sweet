@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3fe595f..5b5e1d0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2133,9 +2133,18 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ void
+ redwood_gpu_report(const char *why)
+ {
+-	printf("SWEET GPU: report %s: fence seq %u done %u rptr %#x wptr %#x RBBM %#x CP_HW_FAULT %#x\n",
++	if (be_fence) {
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCEMEM), 0x1000u, FALSE);
++	}
++	printf("SWEET GPU: report %s: fence seq %u done %u rptr %#x wptr %#x RBBM %#x CP_INT %#x CP_HW_FAULT %#x\n",
+ 	    why, be_seqno, be_fence ? *be_fence : 0, grd((vm_offset_t)be_gpu, 0x806),
+-	    be_wptr % RB_DWORDS, grd((vm_offset_t)be_gpu, 0x210), grd((vm_offset_t)be_gpu, 0x821));
++	    be_wptr % RB_DWORDS, grd((vm_offset_t)be_gpu, 0x210), grd((vm_offset_t)be_gpu, 0x823),
++	    grd((vm_offset_t)be_gpu, 0x821));
++	if (be_smmu) {
++		printf("SWEET GPU: report %s: smmu CB1 FSR %#x FSYNR0 %#x FAR %#llx\n", why,
++		    rd(be_smmu, SMMU_CB1 + 0x058), rd(be_smmu, SMMU_CB1 + 0x068),
++		    (unsigned long long)rd64(be_smmu, SMMU_CB1 + 0x060));
++	}
+ }
+ 
+ void
+@@ -2171,6 +2180,14 @@ gpu_backend_start(void)
+ 	flush_dcache64((addr64_t)gpumem, GPUMEM_SIZE, FALSE);
+ 	be_fence = (volatile uint32_t *)(gpumem + GPUMEM_FENCEMEM);
+ 	*be_fence = 0;
++	/* 0109: the self-test IB at 0x1100000 shares 2 MB slot 8 with the
++	 * stage-7 kernel block (0x1000000..: SQE, ring, shadow, IB test, fence).
++	 * be_l3_for() saw no L3 recorded for slot 8, allocated a fresh one and
++	 * pointed L2[8] at it: the ring, the fence page and the SQE vanished
++	 * from the GPU's view (fence never landed, RBBM busy 0x800005).
++	 * Register the existing stage-7 L3 table for slot 8 first. */
++	be_l3_pa[GVA_SQE >> 21] = gpumem_pa + 0x2000u;
++	be_l3_kva[GVA_SQE >> 21] = gpumem + 0x2000u;
+ 	be_va_count = 0;
+ 	redwood_gpu_address_free(GVA_USER_START, GVA_USER_END - GVA_USER_START);
+ 	gpu_be_grp = lck_grp_alloc_init("sweet-gpu", LCK_GRP_ATTR_NULL);
