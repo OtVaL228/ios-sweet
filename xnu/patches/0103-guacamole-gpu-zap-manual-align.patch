@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 43777b3..ab926cb 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1493,23 +1493,30 @@ gpu_zap_mem_alloc(void)
+ 	if (zap_mem) {
+ 		return true;
+ 	}
++	/* kmem_alloc_contig's alignment-mask argument did not 1 MiB-align the
++	 * result on this kernel (0x0023 got 0x1060b8000). So over-allocate by
++	 * 1 MiB and take the aligned physical sub-block ourselves; the extra
++	 * span means the aligned PA still has ZAP_MEM_SIZE usable bytes. The
++	 * block is physically contiguous, so a contiguous PA range maps to a
++	 * contiguous VA range at the same offset. */
+ 	vm_offset_t kva;
+-	/* 0x0022001 earlier MEM_SETUP(0x98b15000) was rejected (status 0xffcfffba):
+-	 * 0x98b15000 is not 1 MiB aligned and pil_gpu_region is only 8 KiB. KGSL
+-	 * gives PAS a properly aligned carveout; allocate one. */
+-	if (kmem_alloc_contig(kernel_map, &kva, ZAP_MEM_SIZE, 0x100000u - 1u, 0, 0,
++	vm_size_t total = ZAP_MEM_SIZE + 0x100000u;
++	if (kmem_alloc_contig(kernel_map, &kva, total, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET GPU: no 1 MiB-aligned zap memory\n");
++		printf("SWEET GPU: no contiguous zap memory\n");
+ 		return false;
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
+ 	if (!pn) {
+ 		return false;
+ 	}
+-	zap_mem = kva;
+-	zap_mem_pa = ptoa_64(pn);
+-	printf("SWEET GPU: zap memory %#llx (+%#x, %s)\n", (unsigned long long)zap_mem_pa,
+-	    ZAP_MEM_SIZE, (zap_mem_pa & 0xfffffu) ? "NOT 1MiB-aligned!" : "1MiB-aligned");
++	uint64_t base_pa = ptoa_64(pn);
++	uint64_t aligned_pa = (base_pa + 0xfffffu) & ~0xfffffull;
++	zap_mem = kva + (vm_offset_t)(aligned_pa - base_pa);
++	zap_mem_pa = aligned_pa;
++	printf("SWEET GPU: zap memory alloc %#llx -> aligned %#llx (+%#x, %s)\n",
++	    (unsigned long long)base_pa, (unsigned long long)zap_mem_pa, ZAP_MEM_SIZE,
++	    (zap_mem_pa & 0xfffffu) ? "STILL NOT ALIGNED!" : "1MiB-aligned");
+ 	return (zap_mem_pa & 0xfffffu) == 0;
+ }
+ 
