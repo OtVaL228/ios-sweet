@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 03b935c..b20ca84 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -162,6 +162,15 @@ branch_on(vm_offset_t base, uint32_t off, const char *name, bool poll)
+ 	return ok;
+ }
+ 
++/* With boot-arg ufslogsecs=1 the persistent log flushes every second: a
++ * pause before a risky access keeps the last line if the access hangs. */
++static void
++gpu_checkpoint(const char *what)
++{
++	printf("SWEET GPU: checkpoint: %s\n", what);
++	gpu_wait_ms(2500);
++}
++
+ static void
+ gpu_smmu_dump(void)
+ {
+@@ -178,6 +187,7 @@ gpu_smmu_dump(void)
+ 	uint32_t cbbase = numpage << pgshift;
+ 	printf("SWEET GPU: smmu sCR0 %#x IDR0 %#x IDR1 %#x: %u SMRs, %u CBs at +%#x\n",
+ 	    cr0, idr0, idr1, nsmr, ncb, cbbase);
++	gpu_checkpoint("about to read SMR0/S2CR0");
+ 	for (unsigned i = 0; i < nsmr && i < 16; ++i) {
+ 		printf("SWEET GPU: smmu SMR%u %#010x S2CR%u %#010x\n", i,
+ 		    rd(smmu, 0x800 + 4 * i), i, rd(smmu, 0xc00 + 4 * i));
+@@ -194,11 +204,10 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 	printf("SWEET GPU: stage 2: CX domain + GMU clocks\n");
+ 	wr(gcc, 0x52004, rd(gcc, 0x52004) | (1u << 15) | (1u << 16)); /* gpll0, gpll0_div */
+ 	printf("SWEET GPU: gcc vote 0x52004=%#x\n", rd(gcc, 0x52004));
+-	branch_on(gcc, 0x7100c, "gpu_memnoc_gfx", false);   /* BRANCH_VOTED */
+-	branch_on(gcc, 0x71018, "gpu_snoc_dvm_gfx", true);
+-	branch_on(gcc, 0x71154, "ddrss_gpu_axi", false);    /* BRANCH_VOTED */
+ 
+-	/* CX GDSC: clear SW_COLLAPSE, wait for PWR_ON (gdscr and hw-ctrl bit 31). */
++	/* CX GDSC first: the GPU-side branches (snoc_dvm_gfx, gpucc cx_*) only
++	 * report running once their domain is powered (v1 enabled snoc_dvm_gfx
++	 * before CX and it stayed "off"). */
+ 	wr(gpucc, 0x106c, rd(gpucc, 0x106c) & ~1u);
+ 	bool cx = wait_bits(gpucc, 0x106c, GDSC_PWR_ON, true, 2000);
+ 	printf("SWEET GPU: CX GDSC %s: gdscr %#010x hw-ctrl %#010x\n", cx ? "on" : "TIMEOUT",
+@@ -206,6 +215,9 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 	if (!cx) {
+ 		return;
+ 	}
++	branch_on(gcc, 0x7100c, "gpu_memnoc_gfx", false);   /* BRANCH_VOTED */
++	branch_on(gcc, 0x71018, "gpu_snoc_dvm_gfx", true);
++	branch_on(gcc, 0x71154, "ddrss_gpu_axi", false);    /* BRANCH_VOTED */
+ 
+ 	/* GMU RCG: GPLL0_OUT_MAIN_DIV (source 6) / 1.5 (HID 2) = 200 MHz. */
+ 	wr(gpucc, 0x1124, (6u << 8) | 2u);
+@@ -250,7 +262,17 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 			    pat[i], back, back == pat[i] ? "ok" : "MISMATCH");
+ 		}
+ 	}
+-	gpu_smmu_dump();
++	uint32_t snoc = rd(gcc, 0x71018), apb = rd(gpucc, 0x1088);
++	printf("SWEET GPU: recheck gpu_snoc_dvm_gfx %#010x (%s), gpucc cx_apb %#010x (%s)\n",
++	    snoc, (snoc & CBCR_CLK_OFF) ? "off" : "on", apb, (apb & CBCR_CLK_OFF) ? "off" : "on");
++	if (snoc & CBCR_CLK_OFF) {
++		/* v1 crashed (CrashDump) right after reading the SMMU ID registers,
++		 * with snoc_dvm_gfx (an SMMU clock in the live DT) still off. */
++		printf("SWEET GPU: SMMU clock snoc_dvm_gfx off: SMMU not read\n");
++	} else {
++		gpu_checkpoint("about to read the GPU SMMU");
++		gpu_smmu_dump();
++	}
+ 	printf("SWEET GPU: stage 2 done (CX and GMU clocks left on, GMU in reset)\n");
+ }
+ 
