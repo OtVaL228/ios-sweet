@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index b9d0c24..97b12fd 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1808,7 +1808,11 @@ gpu_stage10(void)
+ 	rb[w++] = (uint32_t)(GVA_IB >> 32);
+ 	rb[w++] = n;
+ 	rb[w++] = pkt7(70, 4);                            /* CP_EVENT_WRITE */
+-	rb[w++] = 0x4u | 0x40000000u;                     /* CACHE_FLUSH_TS, TIMESTAMP */
++	/* 0106: the IB ran (both scratch words landed) but the fence word got
++	 * 0x2c1e74c3: the TIMESTAMP flag (bit 30) makes the CP store its own
++	 * counter sample, not our payload. Linux's submit fence is
++	 * EVENT(CACHE_FLUSH_TS) | IRQ (bit 31), which writes the payload. */
++	rb[w++] = 0x4u | 0x80000000u;                     /* CACHE_FLUSH_TS | IRQ */
+ 	rb[w++] = (uint32_t)GVA_FENCE;
+ 	rb[w++] = (uint32_t)(GVA_FENCE >> 32);
+ 	rb[w++] = 0xf00dface;                             /* fence value */
+@@ -1832,6 +1836,10 @@ gpu_stage10(void)
+ 		delay(1000);
+ 	}
+ 	bool ok = fv == 0xf00dface && s0 == 0xcafe0001u && s1 == 0xcafe0002u;
++	uint32_t int0 = grd(gpu, 0x201);
++	printf("SWEET GPU: RBBM_INT_0_STATUS %#x (CACHE_FLUSH_TS bit 0x100000 %s)\n", int0,
++	    (int0 & 0x100000u) ? "set: the fence IRQ fired" : "clear");
++	gwr(gpu, 0x0037, int0);                           /* RBBM_INT_CLEAR_CMD */
+ 	printf("SWEET GPU: IB %s after %u ms: scratch %#x %#x fence %#x (want cafe0001 cafe0002 f00dface)\n",
+ 	    ok ? "EXECUTED" : "did not complete", ms, s0, s1, fv);
+ 	gpu_cp_report(gpu, "after IB");
