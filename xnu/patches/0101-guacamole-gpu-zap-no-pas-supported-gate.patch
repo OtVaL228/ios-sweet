@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4ead0b8..14dd6b2 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1531,11 +1531,9 @@ gpu_zap_load(void)
+ 	/* 0099 left no stage-9 line at all: make the first SMC observable. */
+ 	gpu_checkpoint("about to call SCM PAS_IS_SUPPORTED(13) (first SMC to the SIP service)");
+ 	uint64_t st = scm_call(7, 1, ZAP_PAS_ID, 0, 0, &r);
+-	printf("SWEET GPU: SCM PAS_IS_SUPPORTED(13) status %#llx result %#llx\n",
+-	    (unsigned long long)st, (unsigned long long)r);
+-	if (st || r != 1) {
+-		return false;
+-	}
++	printf("SWEET GPU: SCM PAS_IS_SUPPORTED(13) status %#llx result %#llx%s\n",
++	    (unsigned long long)st, (unsigned long long)r,
++	    (st || r != 1) ? " (ignored: Linux's zap loader never asks, it goes straight to INIT_IMAGE)" : "");
+ 	unsigned msz = 0;
+ 	const uint8_t *mdt = gpu_adt_blob("zap-metadata", &msz);
+ 	if (!mdt || msz < 0x34 || msz > ZAP_META_SIZE || mdt[0] != 0x7f || mdt[4] != 1) {
