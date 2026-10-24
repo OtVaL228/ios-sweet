@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index b20ca84..c318310 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -95,10 +95,21 @@ static const char *const gpu_fw[] = {
+ 	"/usr/standalone/firmware/sweet/a640_zap.b02",
+ };
+ 
++/*
++ * MMIO through explicit single-register LDR/STR with a base-only address:
++ * always a valid ISS syndrome (ISV=1) if the access traps to a hypervisor
++ * that emulates it (Qualcomm's QHEE does this for SMMU stage-2 state). A
++ * plain volatile access may compile to post-indexed or paired forms in a
++ * loop, which a trapping hypervisor cannot decode.
++ */
+ static inline uint32_t
+ rd(vm_offset_t base, uint32_t off)
+ {
+-	return *(volatile uint32_t *)(base + off);
++	uint32_t v;
++	volatile uint32_t *p = (volatile uint32_t *)(base + off);
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(p) : "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
+ }
+ 
+ static void
+@@ -148,8 +159,9 @@ wait_bits(vm_offset_t base, uint32_t off, uint32_t mask, bool set, unsigned us)
+ static inline void
+ wr(vm_offset_t base, uint32_t off, uint32_t v)
+ {
+-	*(volatile uint32_t *)(base + off) = v;
+-	__asm__ volatile("dsb sy" ::: "memory");
++	volatile uint32_t *p = (volatile uint32_t *)(base + off);
++	__asm__ volatile ("str %w0, [%1]" : : "r"(v), "r"(p) : "memory");
++	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+ static bool
+@@ -187,15 +199,21 @@ gpu_smmu_dump(void)
+ 	uint32_t cbbase = numpage << pgshift;
+ 	printf("SWEET GPU: smmu sCR0 %#x IDR0 %#x IDR1 %#x: %u SMRs, %u CBs at +%#x\n",
+ 	    cr0, idr0, idr1, nsmr, ncb, cbbase);
+-	gpu_checkpoint("about to read SMR0/S2CR0");
+-	for (unsigned i = 0; i < nsmr && i < 16; ++i) {
+-		printf("SWEET GPU: smmu SMR%u %#010x S2CR%u %#010x\n", i,
+-		    rd(smmu, 0x800 + 4 * i), i, rd(smmu, 0xc00 + 4 * i));
+-	}
++	printf("SWEET GPU: smmu sGFSR %#x sGFSYNR0 %#x sGFAR %#x\n",
++	    rd(smmu, 0x48), rd(smmu, 0x50), rd(smmu, 0x40));
+ 	if (cbbase + 0x1000u <= SMMU_SIZE) {
++		gpu_checkpoint("about to read context bank 0");
+ 		printf("SWEET GPU: smmu CB0 SCTLR %#x TTBR0 %#x FSR %#x\n",
+ 		    rd(smmu, cbbase + 0x0), rd(smmu, cbbase + 0x20), rd(smmu, cbbase + 0x58));
+ 	}
++	gpu_checkpoint("about to read SMR0 (one LDR)");
++	printf("SWEET GPU: smmu SMR0 %#010x\n", rd(smmu, 0x800));
++	gpu_checkpoint("SMR0 read survived; about to read S2CR0");
++	printf("SWEET GPU: smmu S2CR0 %#010x\n", rd(smmu, 0xc00));
++	for (unsigned i = 1; i < nsmr && i < 16; ++i) {
++		printf("SWEET GPU: smmu SMR%u %#010x S2CR%u %#010x\n", i,
++		    rd(smmu, 0x800 + 4 * i), i, rd(smmu, 0xc00 + 4 * i));
++	}
+ }
+ 
+ static void
