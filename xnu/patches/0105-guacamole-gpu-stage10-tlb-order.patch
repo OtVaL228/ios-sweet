@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 55acf63..73a8506 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1745,7 +1745,12 @@ gpu_stage10(void)
+ 	}
+ 	printf("SWEET GPU: stage 10: IB + fence self-test\n");
+ 
+-	/* Map the three new buffers into the GPU's CB1 page tables (RW). */
++	/* Map the three new buffers into the GPU's CB1 page tables (RW). The
++	 * stage-7 L3 table covers GPU VA 0x1000000..0x11fffff, so these fall in
++	 * it. 0104 faulted (CB1 FSR 0x408, FAR 0x1030000 = the IB) because the
++	 * TLB was invalidated BEFORE the new PTEs were flushed to memory. Order
++	 * now: write PTEs -> flush the page tables (NC walks read RAM directly)
++	 * -> invalidate the TLB -> only then submit. */
+ 	uint64_t *l3 = (uint64_t *)(gpumem + 0x2000u);
+ 	const struct { uint64_t va; uint32_t off; } maps[] = {
+ 		{GVA_IB, GPUMEM_IB}, {GVA_SCRATCH, GPUMEM_SCRATCH}, {GVA_FENCE, GPUMEM_FENCE},
+@@ -1753,12 +1758,20 @@ gpu_stage10(void)
+ 	for (unsigned i = 0; i < 3; ++i) {
+ 		l3[(maps[i].va >> 12) & 0x1ffu] = (gpumem_pa + maps[i].off) | PTE_AF | PTE_SH_OS | PTE_PAGE;
+ 	}
+-	flush_dcache64((addr64_t)gpumem, GPUMEM_SIZE, FALSE);
++	flush_dcache64((addr64_t)(gpumem + 0x2000u), 0x1000u, FALSE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < 3; ++i) {
++		printf("SWEET GPU: map %#llx -> PTE %#llx\n", (unsigned long long)maps[i].va,
++		    (unsigned long long)l3[(maps[i].va >> 12) & 0x1ffu]);
++	}
+ 	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
+ 	if (smmu) {
+ 		wr(smmu, SMMU_CB1 + 0x618, 0);                /* TLBIALL */
+-		wr(smmu, SMMU_CB1 + 0x7f0, 0);
+-		wait_bits(smmu, SMMU_CB1 + 0x7f4, 1u, false, 1000);
++		wr(smmu, SMMU_CB1 + 0x7f0, 0);                /* TLBSYNC */
++		bool sync = wait_bits(smmu, SMMU_CB1 + 0x7f4, 1u, false, 1000);
++		wr(smmu, SMMU_CB1 + 0x058, rd(smmu, SMMU_CB1 + 0x058));  /* clear any stale FSR */
++		printf("SWEET GPU: CB1 TLB invalidate %s, FSR %#x\n", sync ? "ok" : "TIMEOUT",
++		    rd(smmu, SMMU_CB1 + 0x058));
+ 	}
+ 
+ 	volatile uint32_t *scratch = (volatile uint32_t *)(gpumem + GPUMEM_SCRATCH);
