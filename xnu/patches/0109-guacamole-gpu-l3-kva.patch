@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ef0c9f5..3fe595f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1887,7 +1887,8 @@ static struct { uint64_t start, size; } be_va[1024];
+ static unsigned be_va_count;
+ 
+ /* On-demand L2/L3 tables for CB1, carved from contiguous pages. */
+-static uint64_t be_l3_pa[GVA_USER_END >> 21]; /* 0 = none; one L3 covers 2 MB */
++static uint64_t be_l3_pa[GVA_USER_END >> 21];      /* 0 = none; one L3 covers 2 MB */
++static vm_offset_t be_l3_kva[GVA_USER_END >> 21];  /* kernel VA of that L3 page */
+ 
+ static uint64_t *
+ be_l3_for(uint64_t va, bool create)
+@@ -1899,8 +1900,11 @@ be_l3_for(uint64_t va, bool create)
+ 		return NULL;                   /* below the IB/ring block or out of range */
+ 	}
+ 	unsigned slot = (unsigned)(va >> 21);
++	/* 0108 panicked here on the second page of a slot: the L3 pages are
++	 * separate allocations, not inside gpumem, so "pa - gpumem_pa + gpumem"
++	 * was a wild pointer (data abort, FAR = that + 8 * index). Keep the VA. */
+ 	if (be_l3_pa[slot]) {
+-		return (uint64_t *)(be_l3_pa[slot] - gpumem_pa + gpumem);
++		return (uint64_t *)be_l3_kva[slot];
+ 	}
+ 	if (!create) {
+ 		return NULL;
+@@ -1918,6 +1922,7 @@ be_l3_for(uint64_t va, bool create)
+ 	uint64_t *l2 = (uint64_t *)(gpumem + 0x1000u);     /* stage-7 L2 (L1[0]) */
+ 	l2[(va >> 21) & 0x1ffu] = pa | PTE_TABLE;
+ 	be_l3_pa[slot] = pa;
++	be_l3_kva[slot] = kva;
+ 	flush_dcache64((addr64_t)(gpumem + 0x1000u), 0x1000u, FALSE);
+ 	return (uint64_t *)kva;
+ }
+@@ -2022,7 +2027,7 @@ redwood_gpu_mapped(void)
+ 		be_tables_dirty = false;
+ 		for (unsigned s = 0; s < (GVA_USER_END >> 21); s++) {
+ 			if (be_l3_pa[s]) {
+-				flush_dcache64((addr64_t)(be_l3_pa[s] - gpumem_pa + gpumem), 0x1000u, FALSE);
++				flush_dcache64((addr64_t)be_l3_kva[s], 0x1000u, FALSE);
+ 			}
+ 		}
+ 		be_tlb_flush();
