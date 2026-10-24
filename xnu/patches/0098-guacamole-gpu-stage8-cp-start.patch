@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4bcafde..0d98bfd 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -20,6 +20,8 @@
+  * sweetgpu=7: stage 6, then a GPU SMMU context (CB1), GPU memory (SQE,
+  *   ring, RPTR shadow) and Linux hw_init's register programming; the CP is
+  *   not started (CP_SQE_CNTL untouched).
++ * sweetgpu=8: stage 7, then CP_SQE_CNTL = 1 and a ring with CP_ME_INIT +
++ *   CP_WHERE_AM_I; wait for the read pointer to reach the write pointer.
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -1353,6 +1355,112 @@ gpu_stage7(void)
+ 	return true;
+ }
+ 
++/*
++ * ===== Stage 8: start the CP, first commands =====
++ *
++ * Linux v6.6 hw_init()/a6xx_cp_init()/a6xx_flush(): CP_SQE_CNTL = 1, then
++ * one CP_ME_INIT (opcode 72, 8 dwords: 0x2f, 3, 0x20000000, 0 x5) and, as
++ * update_shadow_rptr() does on WHERE_AM_I-capable a640 microcode, a
++ * CP_WHERE_AM_I (98) that writes the read pointer to the shadow; then
++ * CP_RB_WPTR. Type-7 header: 0x70000000 | cnt | parity(cnt) << 15 |
++ * opcode << 16 | parity(opcode) << 23 (adreno_gpu.h OUT_PKT7/PM4_PARITY).
++ * Idle = rptr == wptr and RBBM_STATUS & ~CP_AHB_BUSY_CX_MASTER == 0.
++ * No zap shader yet: the GPU stays in its secure mode (stage 9).
++ */
++static uint32_t
++pm4_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	    (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++pkt7(uint32_t opcode, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (pm4_parity(cnt) << 15) | ((opcode & 0x7fu) << 16) |
++	       (pm4_parity(opcode) << 23);
++}
++
++static void
++gpu_cp_report(vm_offset_t gpu, const char *when)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++	printf("SWEET GPU: [%s] SQE_CNTL %#x RBBM_STATUS %#x INT_0 %#x CP_INT %#x CP_HW_FAULT %#x\n",
++	    when, grd(gpu, 0x808), grd(gpu, 0x210), grd(gpu, 0x201), grd(gpu, 0x823), grd(gpu, 0x821));
++	printf("SWEET GPU: [%s] CP_STATUS_1 %#x PROTECT_STATUS %#x RB_RPTR %#x WPTR %#x shadow %#x\n",
++	    when, grd(gpu, 0x825), grd(gpu, 0x824), grd(gpu, 0x806), grd(gpu, 0x807),
++	    *(volatile uint32_t *)(gpumem + GPUMEM_SHADOW));
++	if (smmu) {
++		printf("SWEET GPU: [%s] smmu CB1 FSR %#x FSYNR0 %#x FAR %#llx sGFSR %#x sGFSYNR0 %#x\n",
++		    when, rd(smmu, SMMU_CB1 + 0x058), rd(smmu, SMMU_CB1 + 0x068),
++		    (unsigned long long)rd64(smmu, SMMU_CB1 + 0x060), rd(smmu, 0x48), rd(smmu, 0x50));
++	}
++}
++
++static bool
++gpu_stage8(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	printf("SWEET GPU: stage 8: start the CP\n");
++	uint32_t *rb = (uint32_t *)(gpumem + GPUMEM_RB);
++	unsigned w = 0;
++	rb[w++] = pkt7(72, 8);                            /* CP_ME_INIT */
++	rb[w++] = 0x0000002f;
++	rb[w++] = 0x00000003;                             /* multiple hw contexts */
++	rb[w++] = 0x20000000;                             /* error detection */
++	rb[w++] = 0;
++	rb[w++] = 0;
++	rb[w++] = 0;                                      /* no workarounds */
++	rb[w++] = 0;
++	rb[w++] = 0;
++	rb[w++] = pkt7(98, 2);                            /* CP_WHERE_AM_I -> shadow */
++	rb[w++] = (uint32_t)GVA_SHADOW;
++	rb[w++] = (uint32_t)(GVA_SHADOW >> 32);
++	*(volatile uint32_t *)(gpumem + GPUMEM_SHADOW) = 0xdeadbeefu;
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_RB), RB_SIZE, FALSE);
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++	printf("SWEET GPU: ring: ME_INIT hdr %#x, WHERE_AM_I hdr %#x, %u dwords\n", rb[0], rb[9], w);
++	gpu_cp_report(gpu, "before SQE start");
++
++	gpu_checkpoint("about to write CP_SQE_CNTL = 1");
++	gwr(gpu, 0x808, 1);                               /* CP_SQE_CNTL: start the SQE */
++	delay(1000);
++	gpu_cp_report(gpu, "SQE started");
++	if (grd(gpu, 0x823) || grd(gpu, 0x821)) {
++		printf("SWEET GPU: CP fault right after SQE start; ring not submitted\n");
++		return false;
++	}
++
++	gpu_checkpoint("about to submit the ring (CP_RB_WPTR)");
++	gwr(gpu, 0x807, w);                               /* CP_RB_WPTR */
++	unsigned ms = 0;
++	uint32_t shadow = 0;
++	bool idle = false;
++	for (; ms < 500; ++ms) {
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++		shadow = *(volatile uint32_t *)(gpumem + GPUMEM_SHADOW);
++		if (shadow == w && !(grd(gpu, 0x210) & ~1u) && !(grd(gpu, 0x201) & (1u << 23))) {
++			idle = true;
++			break;
++		}
++		if (grd(gpu, 0x823) || grd(gpu, 0x821)) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("SWEET GPU: ring %s after %u ms: shadow rptr %#x (want %#x)\n",
++	    idle ? "DRAINED, CP idle" : "NOT drained", ms, shadow, w);
++	gpu_cp_report(gpu, "after submit");
++	if (idle) {
++		printf("SWEET GPU: stage 8 done: the CP executed ME_INIT and WHERE_AM_I\n");
++	}
++	return idle;
++}
++
+ static unsigned gpu_stage;
+ 
+ static void
+@@ -1408,8 +1516,8 @@ gpu_thread(void *arg, wait_result_t result)
+ 	printf("SWEET GPU: stage 1 done\n");
+ 	if (gpu_stage >= 2 && gpu_stage2(gcc, gpucc) && gpu_stage >= 3 && gpu_stage3() &&
+ 	    gpu_stage >= 4 && gpu_stage4() && gpu_stage >= 5 && gpu_stage5() && gpu_stage >= 6 &&
+-	    gpu_stage6() && gpu_stage >= 7) {
+-		gpu_stage7();
++	    gpu_stage6() && gpu_stage >= 7 && gpu_stage7() && gpu_stage >= 8) {
++		gpu_stage8();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
