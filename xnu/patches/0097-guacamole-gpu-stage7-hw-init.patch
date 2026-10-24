@@ -1,0 +1,341 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index b4fa0af..4bcafde 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -17,6 +17,9 @@
+  *   ARC levels, bw table, CORE_FW_START, START).
+  * sweetgpu=6: stage 5, then a GX perf vote and OOB GPU_SET: the GMU powers
+  *   GX; read RBBM/CP status (no GPU register writes).
++ * sweetgpu=7: stage 6, then a GPU SMMU context (CB1), GPU memory (SQE,
++ *   ring, RPTR shadow) and Linux hw_init's register programming; the CP is
++ *   not started (CP_SQE_CNTL untouched).
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -1042,6 +1045,314 @@ gpu_stage6(void)
+ 	return true;
+ }
+ 
++/*
++ * ===== Stage 7: GPU-side SMMU context, GPU memory, register init (no CP start) =====
++ *
++ * Linux v6.6 a6xx_gpu.c hw_init() for the a640, up to but NOT including
++ * "gpu_write(CP_SQE_CNTL, 1)": GBIF unhalt, secure TSB off, 64-bit address
++ * mode, HWCG (a640_hwcg[], SP clock gated around it, RBBM_CLOCK_CNTL
++ * 0x8aa8aa82), GBIF QoS, UCHE ranges (GMEM 1 MiB at 0x100000), ROQ/mem
++ * pool, PC_DBG_ECO 0x00200200, UBWC (amsbc 1, hbb_lo 2), hang detection,
++ * CP protect (a6xx_protect[], 32 slots), SQE image (first dword skipped,
++ * adreno_fw_create_bo) at CP_SQE_INSTR_BASE, a 32 KiB ring at CP_RB_BASE
++ * with RB_CNTL BUFSZ 12 BLKSZ 2 NO_UPDATE (no hw APRIV on a640) and the
++ * RPTR shadow. Register numbers: a6xx.xml.h. mxtpasontop's A618 notes:
++ * an early SQE_CNTL write was not harmless; this stage never writes it.
++ * GPU traffic (DT gfx3d_user: SID 0 mask 0x401) -> exact SMRs 0x000/0x400
++ * -> CB1 (the GMU keeps CB0 for now); its tables map the buffers at GPU VA
++ * 0x01000000 (ring/SQE read-only, shadow privileged, as Linux maps them).
++ */
++#define GPU_REG(n)        ((uint32_t)(n) * 4u)
++#define GPUMEM_SIZE       0x100000u
++#define GPUMEM_SQE        0x10000u
++#define GPUMEM_RB         0x20000u
++#define GPUMEM_SHADOW     0x30000u
++#define GVA_SQE           0x01000000ull
++#define GVA_RB            0x01010000ull
++#define GVA_SHADOW        0x01020000ull
++#define RB_SIZE           0x8000u
++#define SMMU_CB1          0x9000u
++#define PTE_AP_RO         (2ull << 6)
++
++static vm_offset_t gpumem;
++static uint64_t gpumem_pa;
++
++static const struct { uint16_t reg; uint32_t val; } a640_hwcg[] = {
++	{0x00b0, 0x02222222},	/* RBBM_CLOCK_CNTL_SP0 */
++	{0x00b4, 0x02222220},	/* RBBM_CLOCK_CNTL2_SP0 */
++	{0x00b8, 0x00000080},	/* RBBM_CLOCK_DELAY_SP0 */
++	{0x00bc, 0x0000F3CF},	/* RBBM_CLOCK_HYST_SP0 */
++	{0x00c0, 0x02222222},	/* RBBM_CLOCK_CNTL_TP0 */
++	{0x00c4, 0x22222222},	/* RBBM_CLOCK_CNTL2_TP0 */
++	{0x00c8, 0x22222222},	/* RBBM_CLOCK_CNTL3_TP0 */
++	{0x00cc, 0x00022222},	/* RBBM_CLOCK_CNTL4_TP0 */
++	{0x00d0, 0x11111111},	/* RBBM_CLOCK_DELAY_TP0 */
++	{0x00d4, 0x11111111},	/* RBBM_CLOCK_DELAY2_TP0 */
++	{0x00d8, 0x11111111},	/* RBBM_CLOCK_DELAY3_TP0 */
++	{0x00dc, 0x00011111},	/* RBBM_CLOCK_DELAY4_TP0 */
++	{0x00e0, 0x77777777},	/* RBBM_CLOCK_HYST_TP0 */
++	{0x00e4, 0x77777777},	/* RBBM_CLOCK_HYST2_TP0 */
++	{0x00e8, 0x77777777},	/* RBBM_CLOCK_HYST3_TP0 */
++	{0x00ec, 0x00077777},	/* RBBM_CLOCK_HYST4_TP0 */
++	{0x00f0, 0x22222222},	/* RBBM_CLOCK_CNTL_RB0 */
++	{0x00f4, 0x01002222},	/* RBBM_CLOCK_CNTL2_RB0 */
++	{0x00f8, 0x00002220},	/* RBBM_CLOCK_CNTL_CCU0 */
++	{0x0100, 0x00040F00},	/* RBBM_CLOCK_HYST_RB_CCU0 */
++	{0x0104, 0x05222022},	/* RBBM_CLOCK_CNTL_RAC */
++	{0x0105, 0x00005555},	/* RBBM_CLOCK_CNTL2_RAC */
++	{0x0106, 0x00000011},	/* RBBM_CLOCK_DELAY_RAC */
++	{0x0107, 0x00445044},	/* RBBM_CLOCK_HYST_RAC */
++	{0x0108, 0x04222222},	/* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{0x0111, 0x00002222},	/* RBBM_CLOCK_MODE_VFD */
++	{0x0114, 0x00222222},	/* RBBM_CLOCK_MODE_GPC */
++	{0x0117, 0x00000002},	/* RBBM_CLOCK_DELAY_HLSQ_2 */
++	{0x011b, 0x00002222},	/* RBBM_CLOCK_MODE_HLSQ */
++	{0x0109, 0x00004000},	/* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{0x0112, 0x00002222},	/* RBBM_CLOCK_DELAY_VFD */
++	{0x0115, 0x00000200},	/* RBBM_CLOCK_DELAY_GPC */
++	{0x011c, 0x00000000},	/* RBBM_CLOCK_DELAY_HLSQ */
++	{0x010a, 0x00000000},	/* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{0x0113, 0x00000000},	/* RBBM_CLOCK_HYST_VFD */
++	{0x0116, 0x04104004},	/* RBBM_CLOCK_HYST_GPC */
++	{0x011d, 0x00000000},	/* RBBM_CLOCK_HYST_HLSQ */
++	{0x0120, 0x00000222},	/* RBBM_CLOCK_CNTL_TEX_FCHE */
++	{0x0121, 0x00000111},	/* RBBM_CLOCK_DELAY_TEX_FCHE */
++	{0x0122, 0x00000000},	/* RBBM_CLOCK_HYST_TEX_FCHE */
++	{0x010b, 0x22222222},	/* RBBM_CLOCK_CNTL_UCHE */
++	{0x0110, 0x00000004},	/* RBBM_CLOCK_HYST_UCHE */
++	{0x010f, 0x00000002},	/* RBBM_CLOCK_DELAY_UCHE */
++	{0x0533, 0x00000182},	/* RBBM_ISDB_CNT */
++	{0x0044, 0x00000000},	/* RBBM_RAC_THRESHOLD_CNT */
++	{0x0042, 0x00000000},	/* RBBM_SP_HYST_CNT */
++	{0x0118, 0x00000222},	/* RBBM_CLOCK_CNTL_GMU_GX */
++	{0x0119, 0x00000111},	/* RBBM_CLOCK_DELAY_GMU_GX */
++	{0x011a, 0x00000555},	/* RBBM_CLOCK_HYST_GMU_GX */
++};
++
++static const uint32_t a6xx_protect[32] = {
++	0x13fc0000,	/* RDONLY 0x00000 +0x04ff */
++	0x00140501,	/* RDONLY 0x00501 +0x0005 */
++	0x0bd0050b,	/* RDONLY 0x0050b +0x02f4 */
++	0x8000050e,	/* NORDWR 0x0050e +0x0000 */
++	0x80000510,	/* NORDWR 0x00510 +0x0000 */
++	0x80000534,	/* NORDWR 0x00534 +0x0000 */
++	0x82080800,	/* NORDWR 0x00800 +0x0082 */
++	0x802008a0,	/* NORDWR 0x008a0 +0x0008 */
++	0x809008ab,	/* NORDWR 0x008ab +0x0024 */
++	0x02b808de,	/* RDONLY 0x008de +0x00ae */
++	0x81340900,	/* NORDWR 0x00900 +0x004d */
++	0x89c8098d,	/* NORDWR 0x0098d +0x0272 */
++	0x80040e00,	/* NORDWR 0x00e00 +0x0001 */
++	0x80300e03,	/* NORDWR 0x00e03 +0x000c */
++	0x830c3c00,	/* NORDWR 0x03c00 +0x00c3 */
++	0x7ffc3cc4,	/* RDONLY 0x03cc4 +0x1fff */
++	0x873c8630,	/* NORDWR 0x08630 +0x01cf */
++	0x80008e00,	/* NORDWR 0x08e00 +0x0000 */
++	0x80008e08,	/* NORDWR 0x08e08 +0x0000 */
++	0x807c8e50,	/* NORDWR 0x08e50 +0x001f */
++	0x876c9624,	/* NORDWR 0x09624 +0x01db */
++	0x80049e70,	/* NORDWR 0x09e70 +0x0001 */
++	0x861c9e78,	/* NORDWR 0x09e78 +0x0187 */
++	0x873ca630,	/* NORDWR 0x0a630 +0x01cf */
++	0x8000ae02,	/* NORDWR 0x0ae02 +0x0000 */
++	0x8cbcae50,	/* NORDWR 0x0ae50 +0x032f */
++	0x8000b604,	/* NORDWR 0x0b604 +0x0000 */
++	0x8004be02,	/* NORDWR 0x0be02 +0x0001 */
++	0xdf7cbe20,	/* NORDWR 0x0be20 +0x17df */
++	0xaffcf000,	/* NORDWR 0x0f000 +0x0bff */
++	0x7ffcfc00,	/* RDONLY 0x0fc00 +0x1fff */
++	0x80011c00,	/* NORDWR 0x11c00 +0x0000 */
++};
++
++static void
++gwr(vm_offset_t gpu, uint32_t n, uint32_t v)
++{
++	wr(gpu, GPU_REG(n), v);
++}
++
++static void
++gwr64(vm_offset_t gpu, uint32_t n, uint64_t v)
++{
++	wr(gpu, GPU_REG(n), (uint32_t)v);
++	wr(gpu, GPU_REG(n + 1), (uint32_t)(v >> 32));
++}
++
++static uint32_t
++grd(vm_offset_t gpu, uint32_t n)
++{
++	return rd(gpu, GPU_REG(n));
++}
++
++static bool
++gpu_mem_setup(void)
++{
++	if (gpumem == 0) {
++		vm_offset_t kva;
++		if (kmem_alloc_contig(kernel_map, &kva, GPUMEM_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET GPU: no contiguous GPU memory\n");
++			return false;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++		if (!pn) {
++			return false;
++		}
++		gpumem = kva;
++		gpumem_pa = ptoa_64(pn);
++	}
++	DTEntry node;
++	const void *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "sqe-firmware", &prop, &size) != kSuccess ||
++	    size < 8 || size - 4u > 0x10000u) {
++		printf("SWEET GPU: no usable /sweet-gpu sqe-firmware\n");
++		return false;
++	}
++	const uint32_t *sqe = (const uint32_t *)prop;
++	bzero((void *)gpumem, GPUMEM_SIZE);
++	memcpy((void *)(gpumem + GPUMEM_SQE), &sqe[1], size - 4u);
++	/* a6xx_ucode_check_version() for a630_sqe.fw (looks at the image as loaded) */
++	const uint32_t *img = (const uint32_t *)(gpumem + GPUMEM_SQE);
++	bool whereami = (((img[0] & 0xfu) == 0xau) && (img[2] & 0xfu) >= 1u) || (img[0] & 0xfffu) >= 0x190u;
++	printf("SWEET GPU: SQE %u bytes, version %#x (dw0 %#x dw2 %#x): %s\n", size - 4u,
++	    img[0] & 0xfffu, img[0], img[2], whereami ? "has WHERE_AM_I, ok" : "TOO OLD (< 0x190)");
++	/* tables: L1[0] -> L2, L2[8] -> L3 (GPU VA 0x01000000..0x011fffff) */
++	uint64_t *l1 = (uint64_t *)gpumem, *l2 = (uint64_t *)(gpumem + 0x1000u), *l3 = (uint64_t *)(gpumem + 0x2000u);
++	l1[0] = (gpumem_pa + 0x1000u) | PTE_TABLE;
++	l2[(GVA_SQE >> 21) & 0x1ffu] = (gpumem_pa + 0x2000u) | PTE_TABLE;
++	for (uint32_t o = 0; o < 0x10000u; o += 0x1000u) {
++		l3[((GVA_SQE + o) >> 12) & 0x1ffu] = (gpumem_pa + GPUMEM_SQE + o) | PTE_AF | PTE_SH_OS |
++		    PTE_AP_UNPRIV | PTE_AP_RO | PTE_PAGE;
++	}
++	for (uint32_t o = 0; o < RB_SIZE; o += 0x1000u) {
++		l3[((GVA_RB + o) >> 12) & 0x1ffu] = (gpumem_pa + GPUMEM_RB + o) | PTE_AF | PTE_SH_OS |
++		    PTE_AP_UNPRIV | PTE_AP_RO | PTE_PAGE;
++	}
++	l3[(GVA_SHADOW >> 12) & 0x1ffu] = (gpumem_pa + GPUMEM_SHADOW) | PTE_AF | PTE_SH_OS | PTE_PAGE;
++	flush_dcache64((addr64_t)gpumem, GPUMEM_SIZE, FALSE);
++	printf("SWEET GPU: GPU memory %#llx: SQE @%#llx RB @%#llx shadow @%#llx (GPU VA)\n",
++	    (unsigned long long)gpumem_pa, GVA_SQE, GVA_RB, GVA_SHADOW);
++	return whereami;
++}
++
++static bool
++gpu_smmu_gpu_context(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		return false;
++	}
++	wr(smmu, SMMU_CB1 + 0x000, 0);
++	wr(smmu, SMMU_GR1 + 0x004, (1u << 16) | (0xfu << 12) | (3u << 8) | 2u);  /* CBAR1: S1, WB, NSH, VMID 2 */
++	wr(smmu, SMMU_GR1 + 0x804, 1u);                                         /* CBA2R1: VA64 */
++	wr(smmu, SMMU_CB1 + 0x010, (7u << 15) | (1u << 4) | 1u);
++	wr64(smmu, SMMU_CB1 + 0x020, gpumem_pa);
++	wr64(smmu, SMMU_CB1 + 0x028, 0);
++	wr(smmu, SMMU_CB1 + 0x030, 32u | (2u << 12) | (1u << 23));
++	wr(smmu, SMMU_CB1 + 0x034, 0);
++	wr(smmu, SMMU_CB1 + 0x038, 0xf404ff44u);
++	wr(smmu, SMMU_CB1 + 0x03c, 0);
++	wr(smmu, SMMU_CB1 + 0x058, rd(smmu, SMMU_CB1 + 0x058));
++	wr(smmu, SMMU_CB1 + 0x618, 0);
++	wr(smmu, SMMU_CB1 + 0x7f0, 0);
++	bool sync = wait_bits(smmu, SMMU_CB1 + 0x7f4, 1u, false, 1000);
++	const uint32_t sids[2] = {0x000u, 0x400u};
++	bool stuck = true;
++	for (unsigned i = 0; i < 2; ++i) {
++		wr(smmu, 0xc00 + 4 * (4 + i), 1u);                  /* S2CR4/5 -> CB1 */
++		wr(smmu, 0x800 + 4 * (4 + i), (1u << 31) | sids[i]);
++		uint32_t smr = rd(smmu, 0x800 + 4 * (4 + i));
++		stuck &= smr == ((1u << 31) | sids[i]);
++		printf("SWEET GPU: smmu SMR%u %#010x S2CR%u %#010x\n", 4 + i, smr, 4 + i, rd(smmu, 0xc00 + 4 * (4 + i)));
++	}
++	wr(smmu, SMMU_CB1 + 0x000, 0x1067u);
++	printf("SWEET GPU: smmu CB1 (GPU) sync %s SCTLR %#x TTBR0 %#llx FSR %#x sGFSR %#x\n",
++	    sync ? "ok" : "TIMEOUT", rd(smmu, SMMU_CB1), (unsigned long long)rd64(smmu, SMMU_CB1 + 0x020),
++	    rd(smmu, SMMU_CB1 + 0x058), rd(smmu, 0x48));
++	return sync && stuck;
++}
++
++static bool
++gpu_stage7(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!gpu || !gmu) {
++		return false;
++	}
++	printf("SWEET GPU: stage 7: GPU SMMU context + memory + hw_init registers (CP stays halted)\n");
++	if (!gpu_mem_setup() || !gpu_smmu_gpu_context()) {
++		return false;
++	}
++	gpu_checkpoint("about to program the GPU registers");
++	gwr(gpu, 0x3c45, 0);                              /* GBIF_HALT */
++	gwr(gpu, 0x0016, 0);                              /* RBBM_GBIF_HALT */
++	gwr(gpu, 0xf803, 0);                              /* RBBM_SECVID_TSB_CNTL */
++	gwr64(gpu, 0xf800, 0);                            /* TSB_TRUSTED_BASE */
++	gwr(gpu, 0xf802, 0);                              /* TSB_TRUSTED_SIZE */
++	static const uint16_t addr_mode[] = {0x842, 0xc01, 0x8601, 0x8e05, 0x9e01, 0xbe05,
++	    0xa601, 0x9601, 0xe00, 0xae01, 0xb601, 0xf810};
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); ++i) {
++		gwr(gpu, addr_mode[i], 1);                    /* *_ADDR_MODE_CNTL: 64-bit */
++	}
++	/* HWCG: gate the SP clock while programming (GMU GX_SPTPRAC_CLOCK_CONTROL bit 0) */
++	wr(gmu, GMU_R(0x80), rd(gmu, GMU_R(0x80)) & ~1u);
++	for (unsigned i = 0; i < sizeof(a640_hwcg) / sizeof(a640_hwcg[0]); ++i) {
++		gwr(gpu, a640_hwcg[i].reg, a640_hwcg[i].val);
++	}
++	wr(gmu, GMU_R(0x80), rd(gmu, GMU_R(0x80)) | 1u);
++	gwr(gpu, 0x00ae, 0x8aa8aa82u);                    /* RBBM_CLOCK_CNTL */
++	for (unsigned i = 0; i < 4; ++i) {
++		gwr(gpu, 0x3c03 + i, 0x00071620u);            /* GBIF_QSB_SIDE0..3 */
++	}
++	gwr(gpu, 0x0011, 0x3);                            /* RBBM_GBIF_CLIENT_QOS_CNTL */
++	gwr(gpu, 0x050b, 0xffffffffu);                    /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	gwr64(gpu, 0x0e05, 0x0001ffffffffffc0ull);        /* UCHE_WRITE_RANGE_MAX */
++	gwr64(gpu, 0x0e09, 0x0001fffffffff000ull);        /* UCHE_TRAP_BASE */
++	gwr64(gpu, 0x0e07, 0x0001fffffffff000ull);        /* UCHE_WRITE_THRU_BASE */
++	gwr64(gpu, 0x0e0b, 0x00100000ull);                /* UCHE_GMEM_RANGE_MIN */
++	gwr64(gpu, 0x0e0d, 0x00100000ull + 0x100000ull - 1); /* UCHE_GMEM_RANGE_MAX (GMEM 1 MiB) */
++	gwr(gpu, 0x0e18, 0x804);                          /* UCHE_FILTER_CNTL */
++	gwr(gpu, 0x0e17, 0x4);                            /* UCHE_CACHE_WAYS */
++	gwr(gpu, 0x08c2, 0x02000140u);                    /* CP_ROQ_THRESHOLDS_2 */
++	gwr(gpu, 0x08c1, 0x8040362cu);                    /* CP_ROQ_THRESHOLDS_1 */
++	gwr(gpu, 0x08c3, 128);                            /* CP_MEM_POOL_SIZE */
++	gwr(gpu, 0x9e00, 0x00200200u);                    /* PC_DBG_ECO_CNTL */
++	gwr(gpu, 0x098d, 0x1);                            /* CP_AHB_CNTL */
++	gwr(gpu, 0x0500, 0x1);                            /* RBBM_PERFCTR_CNTL */
++	gwr(gpu, 0x08d0, 0);                              /* CP_PERFCTR_CP_SEL(0): ALWAYS_COUNT */
++	gwr(gpu, 0x8e08, (1u << 4) | (2u << 1));          /* RB_NC_MODE_CNTL: amsbc, hbb_lo 2 */
++	gwr(gpu, 0xb604, 2u << 1);                        /* TPL1_NC_MODE_CNTL */
++	gwr(gpu, 0xae02, 2u << 1);                        /* SP_NC_MODE_CNTL */
++	gwr(gpu, 0x0e01, 2u << 21);                       /* UCHE_MODE_CNTL */
++	gwr(gpu, 0x001f, (1u << 30) | 0x1fffffu);         /* RBBM_INTERFACE_HANG_INT_CNTL */
++	gwr(gpu, 0x0e19, 1);                              /* UCHE_CLIENT_PF */
++	gwr(gpu, 0x084f, 0x1u | 0x2u | 0x8u);             /* CP_PROTECT_CNTL */
++	for (unsigned i = 0; i < 31; ++i) {
++		gwr(gpu, 0x850 + i, a6xx_protect[i]);         /* CP_PROTECT(i) */
++	}
++	gwr(gpu, 0x850 + 31, a6xx_protect[31]);
++	/* adreno_hw_init: ring empty, pointers 0 */
++	gwr(gpu, 0x0807, 0);                              /* CP_RB_WPTR */
++	gwr64(gpu, 0x0830, GVA_SQE);                      /* CP_SQE_INSTR_BASE */
++	gwr64(gpu, 0x0800, GVA_RB);                       /* CP_RB_BASE */
++	gwr(gpu, 0x0802, 0x0800020cu);                    /* CP_RB_CNTL: BUFSZ 12, BLKSZ 2, NO_UPDATE */
++	gwr64(gpu, 0x0804, GVA_SHADOW);                   /* CP_RB_RPTR_ADDR */
++
++	printf("SWEET GPU: readback RB_BASE %#x:%#x RB_CNTL %#x SQE_BASE %#x:%#x RPTR_ADDR %#x:%#x\n",
++	    grd(gpu, 0x801), grd(gpu, 0x800), grd(gpu, 0x802), grd(gpu, 0x831), grd(gpu, 0x830),
++	    grd(gpu, 0x805), grd(gpu, 0x804));
++	printf("SWEET GPU: readback CLOCK_CNTL %#x PROTECT_CNTL %#x PROTECT31 %#x GMEM_MAX %#x ROQ2 %#x\n",
++	    grd(gpu, 0x0ae), grd(gpu, 0x84f), grd(gpu, 0x86f), grd(gpu, 0xe0d), grd(gpu, 0x8c2));
++	printf("SWEET GPU: status RBBM %#x INT_0 %#x CP_HW_FAULT %#x CP_PROTECT_STATUS %#x RPTR %#x WPTR %#x SQE_CNTL %#x\n",
++	    grd(gpu, 0x210), grd(gpu, 0x201), grd(gpu, 0x821), grd(gpu, 0x824), grd(gpu, 0x806),
++	    grd(gpu, 0x807), grd(gpu, 0x808));
++	gpu_gmu_report(gmu, "stage 7");
++	printf("SWEET GPU: stage 7 done: GPU programmed, CP still halted (no SQE_CNTL write)\n");
++	return true;
++}
++
+ static unsigned gpu_stage;
+ 
+ static void
+@@ -1096,8 +1407,9 @@ gpu_thread(void *arg, wait_result_t result)
+ 	gpu_fw_report();
+ 	printf("SWEET GPU: stage 1 done\n");
+ 	if (gpu_stage >= 2 && gpu_stage2(gcc, gpucc) && gpu_stage >= 3 && gpu_stage3() &&
+-	    gpu_stage >= 4 && gpu_stage4() && gpu_stage >= 5 && gpu_stage5() && gpu_stage >= 6) {
+-		gpu_stage6();
++	    gpu_stage >= 4 && gpu_stage4() && gpu_stage >= 5 && gpu_stage5() && gpu_stage >= 6 &&
++	    gpu_stage6() && gpu_stage >= 7) {
++		gpu_stage7();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
