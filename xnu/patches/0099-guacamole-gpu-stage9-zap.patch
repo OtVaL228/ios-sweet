@@ -1,0 +1,233 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0d98bfd..d1111bc 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -22,6 +22,8 @@
+  *   not started (CP_SQE_CNTL untouched).
+  * sweetgpu=8: stage 7, then CP_SQE_CNTL = 1 and a ring with CP_ME_INIT +
+  *   CP_WHERE_AM_I; wait for the read pointer to reach the write pointer.
++ * sweetgpu=9: stage 8, then the a640 zap shader through SCM PAS (id 13) and
++ *   CP_SET_SECURE_MODE(0).
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -1461,6 +1463,207 @@ gpu_stage8(void)
+ 	return idle;
+ }
+ 
++/*
++ * ===== Stage 9: zap shader through TrustZone, leave secure mode =====
++ *
++ * Linux v6.6 a6xx_zap_shader_init() -> adreno zap loader -> qcom_mdt_load()
++ * with PAS id 13 (live DT /soc/qcom,kgsl-hyp qcom,pas-id 13, "a640_zap"),
++ * then hw_init()'s CP_SET_SECURE_MODE(0) packet. SCM over SMCCC (Linux
++ * qcom_scm-smc.c): x0 = 0x42000000 | svc << 8 | cmd (std call, SMC64, SIP
++ * owner), x1 = arginfo (count | type << (4 + 2 i), RW = 2), x2.. = args;
++ * x0 = status, x1 = first result; status 1 (INTERRUPTED) re-enters with
++ * x0 = 1 and x6 as returned. PIL svc 2: INIT_IMAGE 1 (pas, metadata PA),
++ * MEM_SETUP 2 (pas, addr, size), AUTH_AND_RESET 5 (pas), IS_SUPPORTED 7.
++ * Metadata = ELF header + phdrs + hash segment = a640_zap.mdt as shipped;
++ * it goes to uncached low RAM outside XNU's window (0xf0000000). The
++ * loadable segments (a640_zap.bNN, NN = phdr index) go to the reserved
++ * 8 KiB pil_gpu_region 0x98b15000, relocated if the ELF says so.
++ */
++#define ZAP_PAS_ID        13u
++#define ZAP_MEM_PA        0x98b15000u
++#define ZAP_MEM_SIZE      0x2000u
++#define ZAP_META_PA       0xf0000000u
++#define ZAP_META_SIZE     0x4000u
++
++static uint64_t
++scm_call(uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *res)
++{
++	register uint64_t x0 __asm__("x0") = 0x42000000u | (2u << 8) | cmd;
++	register uint64_t x1 __asm__("x1") = arginfo;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	register uint64_t x4 __asm__("x4") = a4;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
++	for (unsigned tries = 0; tries < 1000; ++tries) {
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++		    : : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		if (x0 != 1) {                                /* QCOM_SCM_INTERRUPTED */
++			break;
++		}
++		x0 = 1;                                       /* resume; x6 carries the session */
++	}
++	if (res) {
++		*res = x1;
++	}
++	return x0;
++}
++
++static const void *
++gpu_adt_blob(const char *name, unsigned *size)
++{
++	DTEntry node;
++	const void *prop;
++	unsigned int sz;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, name, &prop, &sz) != kSuccess) {
++		return NULL;
++	}
++	*size = sz;
++	return prop;
++}
++
++static bool
++gpu_zap_load(void)
++{
++	uint64_t r = 0;
++	uint64_t st = scm_call(7, 1, ZAP_PAS_ID, 0, 0, &r);
++	printf("SWEET GPU: SCM PAS_IS_SUPPORTED(13) status %#llx result %#llx\n",
++	    (unsigned long long)st, (unsigned long long)r);
++	if (st || r != 1) {
++		return false;
++	}
++	unsigned msz = 0;
++	const uint8_t *mdt = gpu_adt_blob("zap-metadata", &msz);
++	if (!mdt || msz < 0x34 || msz > ZAP_META_SIZE || mdt[0] != 0x7f || mdt[4] != 1) {
++		printf("SWEET GPU: zap-metadata missing or not ELF32\n");
++		return false;
++	}
++	uint32_t phoff = *(const uint32_t *)(mdt + 0x1c);
++	unsigned phnum = *(const uint16_t *)(mdt + 0x2c), phsz = *(const uint16_t *)(mdt + 0x2a);
++	if (phsz != 32 || phnum > 8 || phoff + phnum * 32u > msz) {
++		printf("SWEET GPU: zap ELF phdrs unexpected (off %#x n %u sz %u)\n", phoff, phnum, phsz);
++		return false;
++	}
++	uint32_t min_a = 0xffffffffu, max_a = 0;
++	bool reloc = false;
++	for (unsigned i = 0; i < phnum; ++i) {
++		const uint32_t *ph = (const uint32_t *)(mdt + phoff + 32u * i);
++		bool hash = (ph[6] & (7u << 24)) == (2u << 24);
++		printf("SWEET GPU: zap phdr %u type %u off %#x paddr %#x filesz %#x memsz %#x flags %#x align %#x%s\n",
++		    i, ph[0], ph[1], ph[3], ph[4], ph[5], ph[6], ph[7], hash ? " (hash)" : "");
++		if (ph[6] & (1u << 27)) {
++			reloc = true;
++		}
++		if (ph[0] != 1 || hash || !ph[5]) {
++			continue;
++		}
++		if (ph[3] < min_a) {
++			min_a = ph[3];
++		}
++		if (ph[3] + ph[5] > max_a) {
++			max_a = ph[3] + ph[5];
++		}
++	}
++	if (min_a >= max_a || max_a - min_a > ZAP_MEM_SIZE || (!reloc && min_a != ZAP_MEM_PA)) {
++		printf("SWEET GPU: zap extent %#x..%#x reloc %d does not fit %#x+%#x\n", min_a, max_a,
++		    reloc, ZAP_MEM_PA, ZAP_MEM_SIZE);
++		return false;
++	}
++	vm_offset_t meta = ml_io_map(ZAP_META_PA, ZAP_META_SIZE);
++	vm_offset_t mem = ml_io_map(ZAP_MEM_PA, ZAP_MEM_SIZE);
++	if (!meta || !mem) {
++		return false;
++	}
++	for (unsigned i = 0; i < msz / 4u; ++i) {
++		wr(meta, 4u * i, ((const uint32_t *)mdt)[i]);
++	}
++	gpu_checkpoint("about to call SCM PAS_INIT_IMAGE(13)");
++	st = scm_call(1, 2u | (2u << 6), ZAP_PAS_ID, ZAP_META_PA, 0, &r);
++	printf("SWEET GPU: SCM PAS_INIT_IMAGE status %#llx result %#llx\n",
++	    (unsigned long long)st, (unsigned long long)r);
++	if (st || r) {
++		return false;
++	}
++	st = scm_call(2, 3, ZAP_PAS_ID, ZAP_MEM_PA, max_a - min_a, &r);
++	printf("SWEET GPU: SCM PAS_MEM_SETUP(%#x, %#x) status %#llx result %#llx\n", ZAP_MEM_PA,
++	    max_a - min_a, (unsigned long long)st, (unsigned long long)r);
++	if (st || r) {
++		return false;
++	}
++	for (uint32_t o = 0; o < ZAP_MEM_SIZE; o += 4u) {
++		wr(mem, o, 0);
++	}
++	for (unsigned i = 0; i < phnum; ++i) {
++		const uint32_t *ph = (const uint32_t *)(mdt + phoff + 32u * i);
++		bool hash = (ph[6] & (7u << 24)) == (2u << 24);
++		if (ph[0] != 1 || hash || !ph[4]) {
++			continue;
++		}
++		char name[8] = "zap-b0";
++		name[6] = (char)('0' + i);
++		name[7] = 0;
++		unsigned bsz = 0;
++		const uint32_t *seg = gpu_adt_blob(name, &bsz);
++		if (!seg || bsz < ph[4]) {
++			printf("SWEET GPU: %s missing or short (%u < %#x)\n", name, bsz, ph[4]);
++			return false;
++		}
++		uint32_t dst = (reloc ? ph[3] - min_a : ph[3] - ZAP_MEM_PA);
++		for (uint32_t k = 0; k < ph[4] / 4u; ++k) {
++			wr(mem, dst + 4u * k, seg[k]);
++		}
++		printf("SWEET GPU: zap segment %u (%s, %#x bytes) at %#x\n", i, name, ph[4], ZAP_MEM_PA + dst);
++	}
++	gpu_checkpoint("about to call SCM PAS_AUTH_AND_RESET(13)");
++	st = scm_call(5, 1, ZAP_PAS_ID, 0, 0, &r);
++	printf("SWEET GPU: SCM PAS_AUTH_AND_RESET status %#llx result %#llx\n",
++	    (unsigned long long)st, (unsigned long long)r);
++	return st == 0 && r == 0;
++}
++
++static bool
++gpu_stage9(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		return false;
++	}
++	printf("SWEET GPU: stage 9: zap shader + leave secure mode\n");
++	if (!gpu_zap_load()) {
++		printf("SWEET GPU: zap shader not loaded; GPU stays in secure mode\n");
++		return false;
++	}
++	uint32_t *rb = (uint32_t *)(gpumem + GPUMEM_RB);
++	unsigned w = grd(gpu, 0x807);
++	rb[w++] = pkt7(102, 1);                           /* CP_SET_SECURE_MODE */
++	rb[w++] = 0;
++	rb[w++] = pkt7(98, 2);                            /* CP_WHERE_AM_I */
++	rb[w++] = (uint32_t)GVA_SHADOW;
++	rb[w++] = (uint32_t)(GVA_SHADOW >> 32);
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_RB), RB_SIZE, FALSE);
++	gwr(gpu, 0x807, w);
++	unsigned ms = 0;
++	uint32_t shadow = 0;
++	for (; ms < 500; ++ms) {
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++		shadow = *(volatile uint32_t *)(gpumem + GPUMEM_SHADOW);
++		if (shadow == w || grd(gpu, 0x823) || grd(gpu, 0x821)) {
++			break;
++		}
++		delay(1000);
++	}
++	bool ok = shadow == w && !grd(gpu, 0x823) && !grd(gpu, 0x821);
++	printf("SWEET GPU: CP_SET_SECURE_MODE(0) %s after %u ms (shadow %#x want %#x)\n",
++	    ok ? "executed" : "FAILED", ms, shadow, w);
++	gpu_cp_report(gpu, "secure mode off");
++	if (ok) {
++		printf("SWEET GPU: stage 9 done: zap authenticated, GPU out of secure mode\n");
++	}
++	return ok;
++}
++
+ static unsigned gpu_stage;
+ 
+ static void
+@@ -1516,8 +1719,9 @@ gpu_thread(void *arg, wait_result_t result)
+ 	printf("SWEET GPU: stage 1 done\n");
+ 	if (gpu_stage >= 2 && gpu_stage2(gcc, gpucc) && gpu_stage >= 3 && gpu_stage3() &&
+ 	    gpu_stage >= 4 && gpu_stage4() && gpu_stage >= 5 && gpu_stage5() && gpu_stage >= 6 &&
+-	    gpu_stage6() && gpu_stage >= 7 && gpu_stage7() && gpu_stage >= 8) {
+-		gpu_stage8();
++	    gpu_stage6() && gpu_stage >= 7 && gpu_stage7() && gpu_stage >= 8 && gpu_stage8() &&
++	    gpu_stage >= 9) {
++		gpu_stage9();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
