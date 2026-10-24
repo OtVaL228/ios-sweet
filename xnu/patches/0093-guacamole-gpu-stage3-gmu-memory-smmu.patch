@@ -1,0 +1,345 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c318310..2b06543 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -8,6 +8,9 @@
+  *   read the GMU (CM3 held in reset), test ITCM/DTCM write/readback, and
+  *   dump the GPU SMMU read-only. No firmware, no RPMh votes (the CPUs/UFS
+  *   already hold CX), the GMU is never released from reset.
++ * sweetgpu=3: stage 2, then GMU memory (icache/dcache/HFI/log/debug/dummy),
++ *   the firmware's DDR blocks copied from ADT /sweet-gpu, and the GPU SMMU
++ *   context bank 0 + exact SMRs for the GMU streams; GMU still in reset.
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -41,9 +44,14 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA            0x00100000u
+@@ -62,7 +70,7 @@ void sweet_gpu_probe(void);
+  * from the GMU block (KGSL numbers them from the GPU base: n*4 - 0x6a000). */
+ #define GMU_ITCM          (0x0c00u * 4)  /* CM3_ITCM_START, 16 KiB */
+ #define GMU_DTCM          (0x1c00u * 4)  /* CM3_DTCM_START, 16 KiB */
+-#define GMU_FW_INIT       (0x1cfau * 4)  /* CM3_FW_INIT_RESULT */
++#define GMU_FW_INIT       (0x501cu * 4)  /* CM3_FW_INIT_RESULT (0090-0092 read 0x1cfa*4: wrong) */
+ #define GMU_SYSRESET      (0x5000u * 4)  /* CM3_SYSRESET: 1 = held in reset */
+ #define CBCR_CLK_OFF      (1u << 31)
+ #define GDSC_PWR_ON       (1u << 31)
+@@ -216,7 +224,7 @@ gpu_smmu_dump(void)
+ 	}
+ }
+ 
+-static void
++static bool
+ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ {
+ 	printf("SWEET GPU: stage 2: CX domain + GMU clocks\n");
+@@ -231,7 +239,7 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 	printf("SWEET GPU: CX GDSC %s: gdscr %#010x hw-ctrl %#010x\n", cx ? "on" : "TIMEOUT",
+ 	    rd(gpucc, 0x106c), rd(gpucc, 0x1540));
+ 	if (!cx) {
+-		return;
++		return false;
+ 	}
+ 	branch_on(gcc, 0x7100c, "gpu_memnoc_gfx", false);   /* BRANCH_VOTED */
+ 	branch_on(gcc, 0x71018, "gpu_snoc_dvm_gfx", true);
+@@ -244,7 +252,7 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 	printf("SWEET GPU: GMU RCG 200 MHz %s: cmd %#x cfg %#x\n", upd ? "set" : "UPDATE TIMEOUT",
+ 	    rd(gpucc, 0x1120), rd(gpucc, 0x1124));
+ 	if (!upd) {
+-		return;
++		return false;
+ 	}
+ 	bool ok = branch_on(gpucc, 0x1078, "gpucc ahb", true);
+ 	ok &= branch_on(gpucc, 0x109c, "gpucc cxo", true);
+@@ -255,13 +263,13 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 	    (rd(gpucc, 0x1120) & (1u << 31)) ? "off" : "on");
+ 	if (!ok) {
+ 		printf("SWEET GPU: GMU interface clocks not running: GMU not read\n");
+-		return;
++		return false;
+ 	}
+ 
+ 	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
+ 	if (!gmu) {
+ 		printf("SWEET GPU: GMU map failed\n");
+-		return;
++		return false;
+ 	}
+ 	uint32_t rst = rd(gmu, GMU_SYSRESET);
+ 	printf("SWEET GPU: GMU CM3_SYSRESET %#x (1 = in reset) FW_INIT_RESULT %#x\n",
+@@ -292,6 +300,252 @@ gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
+ 		gpu_smmu_dump();
+ 	}
+ 	printf("SWEET GPU: stage 2 done (CX and GMU clocks left on, GMU in reset)\n");
++	return rst == 1;
++}
++
++/*
++ * ===== Stage 3: GMU memory + GPU SMMU context for the GMU (no GMU boot) =====
++ *
++ * The A640 GMU firmware is in Linux's block format (a640_gmu.bin, ADT
++ * /sweet-gpu gmu-firmware): blocks for ITCM (0x0, 16 KiB) and DTCM
++ * (0x40000, 16 KiB) plus blocks for "icache" (GMU VA 0x4000, 256K-16K) and
++ * "dcache" (VA 0x44000, 256K-16K) in DDR (Linux a6xx_gmu.c allocates these
++ * for the a640 family). So, unlike the A618 (raw image, TCM only), the GMU
++ * reaches DDR through the GPU SMMU from its first instruction: the SMMU
++ * context must exist before it is released from reset (stage 4).
++ *
++ * Memory: one physically contiguous, cacheable 1 MiB block; the CPU writes
++ * it and cleans it to PoC; the SMMU walks NC tables and the PTEs map the
++ * pages Normal-NC, so the GMU sees DDR directly. (VM_WIMG_WCOMB via
++ * pmap_set_cache_attributes is avoided: on this kernel its cache flush
++ * truncates PAs above 4 GiB, see mxtpasontop's 0083.)
++ * SMMU (ARM SMMU-500, 4 KiB pages, CBs at +0x8000): CB0, AArch64 stage 1
++ * with stage 2 bypass, 32-bit VA, 3-level 4 KiB tables; exact SMRs for the
++ * GMU stream IDs 4/5 (DT gmu_user/gmu_kernel, iommus mask 0x400, so also
++ * 0x404/0x405) -> CB0. Masked SMRs did not stick on SM7150 (mxtpasontop).
++ * All register numbers: ARM SMMUv2 architecture; layout: live DT + Linux.
++ */
++#define GMEM_SIZE        0x100000u
++#define GMEM_PT          0x00000u   /* L1, L2a, L2b, L3a, L3b, L3c (4 KiB each) */
++#define GMEM_ICACHE      0x10000u   /* GMU VA 0x4000,  0x3c000 */
++#define GMEM_DCACHE      0x50000u   /* GMU VA 0x44000, 0x3c000 */
++#define GMEM_HFI         0x90000u   /* GMU VA 0x60100000, 16 KiB */
++#define GMEM_DUMMY       0x98000u   /* GMU VA 0x60000000, 4 KiB */
++#define GMEM_DEBUG       0x9c000u   /* GMU VA 0x60200000, 16 KiB */
++#define GMEM_LOG         0xa0000u   /* GMU VA 0x60300000, 16 KiB */
++#define GVA_ICACHE       0x00004000u
++#define GVA_DCACHE       0x00044000u
++#define GVA_DUMMY        0x60000000u
++#define GVA_HFI          0x60100000u
++#define GVA_DEBUG        0x60200000u
++#define GVA_LOG          0x60300000u
++#define CACHE_SIZE       0x3c000u
++
++#define PTE_TABLE        3ull
++#define PTE_PAGE         3ull
++#define PTE_AF           (1ull << 10)
++#define PTE_SH_OS        (2ull << 8)
++#define PTE_AP_UNPRIV    (1ull << 6)   /* EL0+EL1 RW; absent = privileged only */
++
++static vm_offset_t gmem;      /* kernel VA of the block */
++static uint64_t gmem_pa;
++
++static inline void
++wr64(vm_offset_t base, uint32_t off, uint64_t v)
++{
++	volatile uint64_t *p = (volatile uint64_t *)(base + off);
++	__asm__ volatile ("str %x0, [%1]" : : "r"(v), "r"(p) : "memory");
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint64_t
++rd64(vm_offset_t base, uint32_t off)
++{
++	uint64_t v;
++	volatile uint64_t *p = (volatile uint64_t *)(base + off);
++	__asm__ volatile ("ldr %x0, [%1]" : "=r"(v) : "r"(p) : "memory");
++	return v;
++}
++
++static uint64_t *
++pt(unsigned idx)
++{
++	return (uint64_t *)(gmem + GMEM_PT + idx * 0x1000u);
++}
++
++static uint64_t
++pt_pa(unsigned idx)
++{
++	return gmem_pa + GMEM_PT + idx * 0x1000u;
++}
++
++/* Map [va, va+len) -> gmem offset off, 4 KiB pages, in the L3 table l3. */
++static void
++pt_map(unsigned l3, uint32_t va, uint32_t off, uint32_t len, bool priv)
++{
++	uint64_t *t = pt(l3);
++	for (uint32_t o = 0; o < len; o += 0x1000u) {
++		unsigned i = ((va + o) >> 12) & 0x1ffu;
++		t[i] = (gmem_pa + off + o) | PTE_AF | PTE_SH_OS | (priv ? 0 : PTE_AP_UNPRIV) | PTE_PAGE;
++	}
++}
++
++static bool
++gpu_gmem_setup(void)
++{
++	if (gmem == 0) {
++		vm_offset_t kva;
++		if (kmem_alloc_contig(kernel_map, &kva, GMEM_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET GPU: no contiguous GMU memory\n");
++			return false;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++		if (!pn) {
++			printf("SWEET GPU: GMU memory has no physical page\n");
++			return false;
++		}
++		gmem = kva;
++		gmem_pa = ptoa_64(pn);
++	}
++	/* Tables: L1[0] -> L2a (0..1G), L1[1] -> L2b (1G..2G);
++	 * L2a[0] -> L3a (0..2M); L2b[256] -> L3b (0x60000000..), L2b[257] -> L3c. */
++	bzero(pt(0), 6 * 0x1000u);
++	pt(0)[0] = pt_pa(1) | PTE_TABLE;
++	pt(0)[1] = pt_pa(2) | PTE_TABLE;
++	pt(1)[0] = pt_pa(3) | PTE_TABLE;
++	pt(2)[256] = pt_pa(4) | PTE_TABLE;
++	pt(2)[257] = pt_pa(5) | PTE_TABLE;
++	pt_map(3, GVA_ICACHE, GMEM_ICACHE, CACHE_SIZE, true);   /* Linux: IOMMU_PRIV */
++	pt_map(3, GVA_DCACHE, GMEM_DCACHE, CACHE_SIZE, true);
++	pt_map(4, GVA_DUMMY, GMEM_DUMMY, 0x1000u, false);
++	pt_map(4, GVA_HFI, GMEM_HFI, 0x4000u, false);
++	pt_map(5, GVA_DEBUG, GMEM_DEBUG, 0x4000u, false);
++	pt_map(5, GVA_LOG, GMEM_LOG, 0x4000u, false);
++	flush_dcache64((addr64_t)gmem, GMEM_SIZE, FALSE);
++	printf("SWEET GPU: GMU memory %#llx (+%#x), tables at %#llx\n", (unsigned long long)gmem_pa,
++	    GMEM_SIZE, (unsigned long long)pt_pa(0));
++	return true;
++}
++
++/* Firmware from ADT /sweet-gpu: report blocks, copy the DDR ones. */
++static const uint32_t *gmu_fw;
++static unsigned gmu_fw_size;
++
++static bool
++gpu_fw_blocks(bool copy)
++{
++	DTEntry node;
++	const void *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "gmu-firmware", &prop, &size) != kSuccess) {
++		printf("SWEET GPU: no /sweet-gpu gmu-firmware in the ADT\n");
++		return false;
++	}
++	gmu_fw = (const uint32_t *)prop;
++	gmu_fw_size = size;
++	unsigned nblk = 0, bad = 0;
++	for (unsigned o = 0; o + 16u <= size; ) {
++		const uint32_t *b = (const uint32_t *)((uintptr_t)prop + o);
++		uint32_t addr = b[0], len = b[1];
++		const char *where = "?";
++		if (len & 3u || o + 16u + len > size) {
++			printf("SWEET GPU: fw block at %#x: bad size %#x\n", o, len);
++			return false;
++		}
++		if (addr < 0x4000u && addr + len <= 0x4000u) {
++			where = "ITCM";
++		} else if (addr >= 0x40000u && addr + len <= 0x44000u) {
++			where = "DTCM";
++		} else if (addr >= GVA_ICACHE && addr + len <= GVA_ICACHE + CACHE_SIZE) {
++			where = "icache";
++			if (copy) {
++				memcpy((void *)(gmem + GMEM_ICACHE + (addr - GVA_ICACHE)), &b[4], len);
++			}
++		} else if (addr >= GVA_DCACHE && addr + len <= GVA_DCACHE + CACHE_SIZE) {
++			where = "dcache";
++			if (copy) {
++				memcpy((void *)(gmem + GMEM_DCACHE + (addr - GVA_DCACHE)), &b[4], len);
++			}
++		} else {
++			bad++;
++		}
++		printf("SWEET GPU: fw block %u addr %#x size %#x -> %s\n", nblk, addr, len, where);
++		nblk++;
++		o += 16u + len;
++	}
++	if (copy) {
++		flush_dcache64((addr64_t)gmem, GMEM_SIZE, FALSE);
++	}
++	printf("SWEET GPU: gmu firmware %u bytes, %u blocks, %u unplaced\n", size, nblk, bad);
++	return bad == 0;
++}
++
++/* SMMU: GR0 page 0, GR1 page 1, CB n at 0x8000 + n * 0x1000 (4 KiB pages). */
++#define SMMU_GR1         0x1000u
++#define SMMU_CB0         0x8000u
++static const uint32_t gmu_sids[4] = {0x004u, 0x005u, 0x404u, 0x405u};
++
++static bool
++gpu_smmu_gmu_context(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		return false;
++	}
++	/* CB0: disable while (re)programming. */
++	wr(smmu, SMMU_CB0 + 0x000, 0);
++	wr(smmu, SMMU_GR1 + 0x000, (1u << 16) | (0xfu << 12) | (3u << 8) | 1u); /* CBAR0: S1, WB, NSH, VMID 1 */
++	wr(smmu, SMMU_GR1 + 0x800, 1u);                                         /* CBA2R0: VA64 */
++	wr(smmu, SMMU_CB0 + 0x010, (7u << 15) | (1u << 4) | 1u);                /* TCR2: SEP, AS, PASIZE 36 */
++	wr64(smmu, SMMU_CB0 + 0x020, pt_pa(0));                                 /* TTBR0, ASID 0 */
++	wr64(smmu, SMMU_CB0 + 0x028, 0);                                        /* TTBR1 */
++	wr(smmu, SMMU_CB0 + 0x030, 32u | (2u << 12) | (1u << 23));              /* TCR: T0SZ 32, NC walks, OS, 4K, EPD1 */
++	wr(smmu, SMMU_CB0 + 0x034, 0);                                          /* CONTEXTIDR */
++	wr(smmu, SMMU_CB0 + 0x038, 0xf404ff44u);                                /* MAIR0: NC, WB, DEV, INC_OCACHE */
++	wr(smmu, SMMU_CB0 + 0x03c, 0);
++	wr(smmu, SMMU_CB0 + 0x058, rd(smmu, SMMU_CB0 + 0x058));                 /* clear FSR */
++	/* TLB: invalidate CB0, sync. */
++	wr(smmu, SMMU_CB0 + 0x618, 0);
++	wr(smmu, SMMU_CB0 + 0x7f0, 0);
++	bool sync = wait_bits(smmu, SMMU_CB0 + 0x7f4, 1u, false, 1000);
++	/* Streams: S2CR first (translate via CB0), then the exact SMR. */
++	for (unsigned i = 0; i < 4; ++i) {
++		wr(smmu, 0xc00 + 4 * i, 0u);
++		wr(smmu, 0x800 + 4 * i, (1u << 31) | gmu_sids[i]);
++	}
++	/* Enable translation: M, TRE, AFE, CFRE, CFIE, ASIDPNE. */
++	wr(smmu, SMMU_CB0 + 0x000, 0x1067u);
++	printf("SWEET GPU: smmu CB0 TLB sync %s; CBAR0 %#x CBA2R0 %#x\n", sync ? "ok" : "TIMEOUT",
++	    rd(smmu, SMMU_GR1 + 0x000), rd(smmu, SMMU_GR1 + 0x800));
++	printf("SWEET GPU: smmu CB0 SCTLR %#x TCR %#x TCR2 %#x TTBR0 %#llx MAIR0 %#x FSR %#x\n",
++	    rd(smmu, SMMU_CB0 + 0x000), rd(smmu, SMMU_CB0 + 0x030), rd(smmu, SMMU_CB0 + 0x010),
++	    (unsigned long long)rd64(smmu, SMMU_CB0 + 0x020), rd(smmu, SMMU_CB0 + 0x038), rd(smmu, SMMU_CB0 + 0x058));
++	bool stuck = true;
++	for (unsigned i = 0; i < 4; ++i) {
++		uint32_t smr = rd(smmu, 0x800 + 4 * i), s2cr = rd(smmu, 0xc00 + 4 * i);
++		bool ok = smr == ((1u << 31) | gmu_sids[i]);
++		stuck &= ok;
++		printf("SWEET GPU: smmu SMR%u %#010x S2CR%u %#010x %s\n", i, smr, i, s2cr,
++		    ok ? "" : "(did not stick)");
++	}
++	printf("SWEET GPU: smmu sGFSR %#x after setup\n", rd(smmu, 0x48));
++	return sync && stuck;
++}
++
++static void
++gpu_stage3(void)
++{
++	printf("SWEET GPU: stage 3: GMU memory + SMMU context (GMU stays in reset)\n");
++	if (!gpu_gmem_setup()) {
++		return;
++	}
++	bool fw = gpu_fw_blocks(true);
++	gpu_checkpoint("about to program the GPU SMMU (CB0 + SMRs)");
++	bool ctx = gpu_smmu_gmu_context();
++	printf("SWEET GPU: stage 3 done: firmware %s, SMMU context %s\n",
++	    fw ? "placed" : "MISSING/BAD", ctx ? "ok" : "FAILED");
+ }
+ 
+ static unsigned gpu_stage;
+@@ -347,8 +601,8 @@ gpu_thread(void *arg, wait_result_t result)
+ 	}
+ 	gpu_fw_report();
+ 	printf("SWEET GPU: stage 1 done\n");
+-	if (gpu_stage >= 2) {
+-		gpu_stage2(gcc, gpucc);
++	if (gpu_stage >= 2 && gpu_stage2(gcc, gpucc) && gpu_stage >= 3) {
++		gpu_stage3();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());

@@ -83,6 +83,34 @@ def node(name, props=(), children=()):
     return n
 
 
+# --guacamole: Adreno 640 firmware for the kernel's GPU bring-up (sweet_gpu.c,
+# ADT /sweet-gpu), pulled from the phone's /vendor/firmware (not in git).
+GPU_FW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/gpu/fw')
+
+
+def guac_gpu_node(ph):
+    gmu = os.path.join(GPU_FW_DIR, 'a640_gmu.bin')
+    if not os.path.exists(gmu):
+        print(f'warning: {gmu} missing, no /sweet-gpu node', file=sys.stderr)
+        return []
+    props = [ph(), ('compatible', cstr('qcom,adreno-640.1'))]
+    for prop, name, limit in (('gmu-firmware', 'a640_gmu.bin', 0x40000),
+                              ('sqe-firmware', 'a630_sqe.fw', 0x8004),
+                              ('zap-metadata', 'a640_zap.mdt', 0x4000),
+                              ('zap-b00', 'a640_zap.b00', 0x4000),
+                              ('zap-b01', 'a640_zap.b01', 0x10000),
+                              ('zap-b02', 'a640_zap.b02', 0x10000)):
+        path = os.path.join(GPU_FW_DIR, name)
+        if not os.path.exists(path):
+            print(f'warning: {path} missing', file=sys.stderr)
+            continue
+        blob = open(path, 'rb').read()
+        if not 0 < len(blob) <= limit or len(blob) % 4:
+            raise ValueError(f'{name}: unexpected size {len(blob)}')
+        props.append((prop, blob))
+    return [node('sweet-gpu', props)]
+
+
 def build(seed=None, qemu=False, highmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -247,7 +275,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + (guac_gpu_node(ph) if GUACAMOLE and not qemu else []) + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
