@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index d1111bc..4ead0b8 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1528,6 +1528,8 @@ static bool
+ gpu_zap_load(void)
+ {
+ 	uint64_t r = 0;
++	/* 0099 left no stage-9 line at all: make the first SMC observable. */
++	gpu_checkpoint("about to call SCM PAS_IS_SUPPORTED(13) (first SMC to the SIP service)");
+ 	uint64_t st = scm_call(7, 1, ZAP_PAS_ID, 0, 0, &r);
+ 	printf("SWEET GPU: SCM PAS_IS_SUPPORTED(13) status %#llx result %#llx\n",
+ 	    (unsigned long long)st, (unsigned long long)r);
+@@ -1626,11 +1628,11 @@ gpu_zap_load(void)
+ static bool
+ gpu_stage9(void)
+ {
++	printf("SWEET GPU: stage 9: zap shader + leave secure mode\n");
+ 	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
+ 	if (!gpu) {
+ 		return false;
+ 	}
+-	printf("SWEET GPU: stage 9: zap shader + leave secure mode\n");
+ 	if (!gpu_zap_load()) {
+ 		printf("SWEET GPU: zap shader not loaded; GPU stays in secure mode\n");
+ 		return false;
