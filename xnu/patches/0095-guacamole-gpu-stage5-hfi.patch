@@ -1,0 +1,345 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 9ef4f89..2f36eb5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -13,6 +13,8 @@
+  *   context bank 0 + exact SMRs for the GMU streams; GMU still in reset.
+  * sweetgpu=4: stage 3, then HFI queue table, RSC/PDC microcode, TCM blocks,
+  *   boot registers, release the GMU and wait for its init result.
++ * sweetgpu=5: stage 4, then the HFI v2 handshake (perf table from cmd-db
++ *   ARC levels, bw table, CORE_FW_START, START).
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -54,6 +56,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *count);
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA            0x00100000u
+@@ -706,22 +709,22 @@ gpu_gmu_report(vm_offset_t gmu, const char *when)
+ 	    h[6], h[16], h[17], h[18], h[28], h[29]);
+ }
+ 
+-static void
++static bool
+ gpu_stage4(void)
+ {
+ 	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
+ 	if (!gmu || !gmu_fw) {
+ 		printf("SWEET GPU: stage 4 needs the GMU map and the firmware\n");
+-		return;
++		return false;
+ 	}
+ 	printf("SWEET GPU: stage 4: GMU cold boot\n");
+ 	gpu_hfi_table_init();
+ 	if (!gpu_rpmh_init(gmu)) {
+-		return;
++		return false;
+ 	}
+ 	wr(gmu, GMU_R(0x51cc), 1);                        /* GENERAL_7: register retention */
+ 	if (!gpu_rpmh_start(gmu)) {
+-		return;
++		return false;
+ 	}
+ 	gpu_fw_tcm_load(gmu);
+ 	uint32_t ver = rd(gmu, GMU_R(0x1c00 + 0xff8));
+@@ -765,6 +768,217 @@ gpu_stage4(void)
+ 	gpu_wait_ms(1000);
+ 	gpu_gmu_report(gmu, "+1 s");
+ 	printf("SWEET GPU: stage 4 done (GMU left running, idle)\n");
++	return (v & mask) == want;
++}
++
++/*
++ * ===== Stage 5: HFI v2 handshake =====
++ *
++ * Linux v6.6 a6xx_hfi_start() for non-legacy GMUs (everything but the a630
++ * family): PERF_TABLE (4), BW_TABLE (3), CORE_FW_START (14), START (10).
++ * Header: seqnum << 20 | type(cmd 0) << 16 | dwords << 8 | id; writes pad
++ * to 4 dwords with 0xfafafafa; HOST2GMU_INTR_SET bit 0 rings; responses
++ * come on queue 1, GMU2HOST_INTR_INFO bit 0 (MSGQ), read index realigned
++ * to 4. Perf votes: a6xx_gmu_rpmh_arc_votes_init() over the cmd-db ARC
++ * tables ("gfx.lvl"/"cx.lvl" primary, "mx.lvl" secondary) with the
++ * mainline sm8150 OPP levels (speed bin 0: 257/345/427/499.2/585 MHz at
++ * LOW_SVS/SVS/SVS_L1/SVS_L2/NOM; GMU 200 MHz at MIN_SVS). BW table:
++ * a640_build_bw_table() (one "off" level). The HFI memory is cacheable:
++ * the CPU invalidates before reading and cleans after writing, and only
++ * talks while the GMU has nothing outstanding.
++ */
++#define HFI_Q0            (GMEM_HFI + 0x1000u)
++#define HFI_Q1            (GMEM_HFI + 0x2000u)
++#define HFI_QSIZE         (0x1000u / 4u)
++
++static unsigned hfi_seq;
++
++static void
++hfi_sync(void)
++{
++	flush_dcache64((addr64_t)(gmem + GMEM_HFI), 0x4000u, FALSE);
++}
++
++static int
++hfi_send(vm_offset_t gmu, unsigned id, uint32_t *msg, unsigned dwords, uint32_t *payload)
++{
++	uint32_t *t = (uint32_t *)(gmem + GMEM_HFI);
++	uint32_t *q0h = t + 6, *q1h = t + 18;
++	uint32_t *q0 = (uint32_t *)(gmem + HFI_Q0), *q1 = (uint32_t *)(gmem + HFI_Q1);
++	unsigned seq = (++hfi_seq) % 0xfffu;
++	msg[0] = (seq << 20) | (0u << 16) | (dwords << 8) | id;
++	hfi_sync();
++	uint32_t w = q0h[11], r = q0h[10];
++	unsigned space = (r - w - 1u) & (HFI_QSIZE - 1u);
++	if (space < dwords + 4u) {
++		printf("SWEET GPU: hfi id %u: no queue space (r %u w %u)\n", id, r, w);
++		return ENOSPC;
++	}
++	for (unsigned i = 0; i < dwords; ++i) {
++		q0[w] = msg[i];
++		w = (w + 1u) % HFI_QSIZE;
++	}
++	for (; w % 4u; w = (w + 1u) % HFI_QSIZE) {
++		q0[w] = 0xfafafafau;
++	}
++	q0h[11] = w;
++	hfi_sync();
++	wr(gmu, GMU_R(0x5194), 1);                        /* HOST2GMU_INTR_SET */
++	bool got = wait_bits(gmu, GMU_R(0x5192), 1u, true, 100000);  /* GMU2HOST_INTR_INFO.MSGQ */
++	if (!got) {
++		hfi_sync();
++		printf("SWEET GPU: hfi id %u seq %u: no response (q0 r/w %u/%u, q1 r/w %u/%u, info %#x)\n",
++		    id, seq, q0h[10], q0h[11], q1h[10], q1h[11], rd(gmu, GMU_R(0x5192)));
++		return ETIMEDOUT;
++	}
++	wr(gmu, GMU_R(0x5191), 1);                        /* GMU2HOST_INTR_CLR */
++	for (unsigned tries = 0; tries < 8; ++tries) {
++		hfi_sync();
++		uint32_t rr = q1h[10], ww = q1h[11];
++		if (rr == ww) {
++			printf("SWEET GPU: hfi id %u seq %u: response queue empty\n", id, seq);
++			return ENOENT;
++		}
++		uint32_t resp[24] = {0};
++		uint32_t hdr = q1[rr], n = (hdr >> 8) & 0xffu;
++		for (unsigned i = 0; i < n && i < 24u; ++i) {
++			resp[i] = q1[rr];
++			rr = (rr + 1u) % HFI_QSIZE;
++		}
++		rr = ((rr + 3u) & ~3u) % HFI_QSIZE;
++		q1h[10] = rr;
++		hfi_sync();
++		if ((hdr & 0xffu) == 100u) {                  /* HFI_F2H_MSG_ERROR */
++			printf("SWEET GPU: hfi GMU error code %u (%#x %#x)\n", resp[1], resp[2], resp[3]);
++			continue;
++		}
++		if (((resp[1] >> 20) & 0xfffu) != seq) {
++			printf("SWEET GPU: hfi unexpected response hdr %#x ret %#x\n", hdr, resp[1]);
++			continue;
++		}
++		printf("SWEET GPU: hfi id %u seq %u -> ack hdr %#x error %u payload %#x\n",
++		    id, seq, hdr, resp[2], resp[3]);
++		if (payload) {
++			*payload = resp[3];
++		}
++		return resp[2] ? EIO : 0;
++	}
++	return EIO;
++}
++
++static uint32_t
++arc_vote(const uint16_t *pri, unsigned np, const uint16_t *sec, unsigned ns, unsigned level)
++{
++	unsigned pi = 0, si = 0, j;
++	for (j = 0; j < np; ++j) {
++		if (pri[j] >= level) {
++			pi = j;
++			break;
++		}
++	}
++	if (j == np) {
++		return 0xffffffffu;
++	}
++	for (j = 0; j < ns; ++j) {
++		if (sec[j] >= level) {
++			si = j;
++			break;
++		} else if (sec[j]) {
++			si = j;
++		}
++	}
++	return ((uint32_t)pri[pi] << 16) | (si << 8) | pi;
++}
++
++static bool
++gpu_stage5(void)
++{
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!gmu) {
++		return false;
++	}
++	printf("SWEET GPU: stage 5: HFI v2 handshake\n");
++	uint16_t gfx[16], cx[16], mx[16];
++	unsigned ng = 0, nc = 0, nm = 0;
++	int e1 = sweet_cmd_db_aux("gfx.lvl", gfx, 16, &ng);
++	int e2 = sweet_cmd_db_aux("cx.lvl", cx, 16, &nc);
++	int e3 = sweet_cmd_db_aux("mx.lvl", mx, 16, &nm);
++	printf("SWEET GPU: cmd-db gfx.lvl %d/%u cx.lvl %d/%u mx.lvl %d/%u\n", e1, ng, e2, nc, e3, nm);
++	if (e1 || e2 || e3 || !ng || !nc || !nm) {
++		return false;
++	}
++	for (unsigned k = 0; k < ng; k += 8) {
++		printf("SWEET GPU: gfx.lvl[%u..] %u %u %u %u %u %u %u %u\n", k, gfx[k], gfx[k + 1],
++		    gfx[k + 2], gfx[k + 3], gfx[k + 4], gfx[k + 5], gfx[k + 6], gfx[k + 7]);
++	}
++	static const uint32_t gpu_khz[6] = {0, 257000, 345000, 427000, 499200, 585000};
++	static const unsigned gpu_lvl[6] = {0, 64, 128, 192, 224, 256};
++	static const uint32_t gmu_khz[2] = {0, 200000};
++	static const unsigned gmu_lvl[2] = {0, 48};
++
++	uint32_t perf[3 + 16 * 3 + 4 * 2];
++	bzero(perf, sizeof(perf));
++	perf[1] = 6;
++	perf[2] = 2;
++	for (unsigned i = 0; i < 6; ++i) {
++		uint32_t v = arc_vote(gfx, ng, mx, nm, gpu_lvl[i]);
++		if (v == 0xffffffffu) {
++			printf("SWEET GPU: gfx level %u not in cmd-db\n", gpu_lvl[i]);
++			return false;
++		}
++		perf[3 + 3 * i] = v;
++		perf[3 + 3 * i + 1] = 0xffffffffu;            /* acd: none */
++		perf[3 + 3 * i + 2] = gpu_khz[i];
++		printf("SWEET GPU: gx level %u: %u kHz vote %#x\n", i, gpu_khz[i], v);
++	}
++	for (unsigned i = 0; i < 2; ++i) {
++		uint32_t v = arc_vote(cx, nc, mx, nm, gmu_lvl[i]);
++		if (v == 0xffffffffu) {
++			printf("SWEET GPU: cx level %u not in cmd-db\n", gmu_lvl[i]);
++			return false;
++		}
++		perf[3 + 48 + 2 * i] = v;
++		perf[3 + 48 + 2 * i + 1] = gmu_khz[i];
++		printf("SWEET GPU: cx level %u: %u kHz vote %#x\n", i, gmu_khz[i], v);
++	}
++
++	uint32_t bw[1 + 5 + 6 + 12 + 8 + 128];
++	bzero(bw, sizeof(bw));
++	uint32_t *b = bw + 1;
++	b[0] = 1;                                         /* bw_level_num */
++	b[1] = 3;                                         /* cnoc_cmds_num */
++	b[2] = 3;                                         /* ddr_cmds_num */
++	b[3] = 1;                                         /* cnoc_wait_bitmask */
++	b[4] = 1;                                         /* ddr_wait_bitmask */
++	uint32_t *cnoc_addr = b + 5, *cnoc_data = b + 11, *ddr_addr = b + 23, *ddr_data = b + 31;
++	cnoc_addr[0] = 0x50034;
++	cnoc_addr[1] = 0x5007c;
++	cnoc_addr[2] = 0x5004c;
++	cnoc_data[0] = 0x40000000;
++	cnoc_data[1] = 0x00000000;
++	cnoc_data[2] = 0x40000000;
++	cnoc_data[6 + 0] = 0x60000001;
++	cnoc_data[6 + 1] = 0x20000001;
++	cnoc_data[6 + 2] = 0x60000001;
++	ddr_addr[0] = 0x50000;
++	ddr_addr[1] = 0x5003c;
++	ddr_addr[2] = 0x5000c;
++	ddr_data[0] = 0x40000000;
++	ddr_data[1] = 0x40000000;
++	ddr_data[2] = 0x40000000;
++
++	uint32_t core[2] = {0, 0}, start[1] = {0};
++	wr(gmu, GMU_R(0x5191), 0xffffffffu);              /* GMU2HOST_INTR_CLR: stale bits */
++	if (hfi_send(gmu, 4, perf, sizeof(perf) / 4u, NULL) ||
++	    hfi_send(gmu, 3, bw, sizeof(bw) / 4u, NULL) ||
++	    hfi_send(gmu, 14, core, 2, NULL) ||
++	    hfi_send(gmu, 10, start, 1, NULL)) {
++		gpu_gmu_report(gmu, "hfi failed");
++		return false;
++	}
++	gpu_gmu_report(gmu, "hfi started");
++	printf("SWEET GPU: stage 5 done: GMU accepted the perf/bw tables and START\n");
++	return true;
+ }
+ 
+ static unsigned gpu_stage;
+@@ -821,8 +1035,8 @@ gpu_thread(void *arg, wait_result_t result)
+ 	gpu_fw_report();
+ 	printf("SWEET GPU: stage 1 done\n");
+ 	if (gpu_stage >= 2 && gpu_stage2(gcc, gpucc) && gpu_stage >= 3 && gpu_stage3() &&
+-	    gpu_stage >= 4) {
+-		gpu_stage4();
++	    gpu_stage >= 4 && gpu_stage4() && gpu_stage >= 5) {
++		gpu_stage5();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 8a80720..1d1279a 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *count);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -205,6 +206,55 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++/*
++ * GUACAMOLE: cmd-db auxiliary data of one resource (any slave type), as
++ * the little-endian 16-bit words Linux's cmd_db_read_aux_data() returns:
++ * the ARC levels ("gfx.lvl", "cx.lvl", "mx.lvl") the GMU perf table needs.
++ * Read-only; no RSC traffic.
++ */
++int
++sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *count)
++{
++	int err = rh_map();
++	if (err) {
++		return err;
++	}
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned n = rh_db16(h + 6);
++		if ((entries & 3u) || !rh_range(entries, n * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < n; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t len = rh_db16(e + 20), off = aux + rh_db16(e + 22);
++			if ((len & 1u) || !rh_range(off, len)) {
++				return EINVAL;
++			}
++			unsigned words = len / 2u;
++			for (unsigned k = 0; k < words && k < max; ++k) {
++				out[k] = rh_db16(off + 2u * k);
++			}
++			*count = words < max ? words : max;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
