@@ -1,0 +1,186 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3e06e13..03b935c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,7 +1,13 @@
+ /*
+  * GUACAMOLE (OnePlus 7 Pro, SM8150): Adreno 640 bring-up, stage 1.
+  *
+- * Read-only state probe, enabled with boot-arg sweetgpu=1 (default off).
++ * sweetgpu=1: read-only state probe (default off).
++ * sweetgpu=2: stage 1, then power the GPU CX domain and the GMU's clocks
++ *   (gpll0 votes, GCC memnoc/snoc/axi, CX GDSC, GMU RCG 200 MHz from
++ *   GPLL0_OUT_MAIN_DIV / 1.5 = CFG 0x602, gpucc ahb/cxo/cx_gmu/snoc/apb),
++ *   read the GMU (CM3 held in reset), test ITCM/DTCM write/readback, and
++ *   dump the GPU SMMU read-only. No firmware, no RPMh votes (the CPUs/UFS
++ *   already hold CX), the GMU is never released from reset.
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -48,6 +54,16 @@ void sweet_gpu_probe(void);
+ #define QFPROM_SIZE       0x00007000u
+ #define SPEED_BIN_OFF     0x4130u
+ 
++#define GMU_PA            0x02c6a000u
++#define GMU_SIZE          0x00030000u
++#define SMMU_PA           0x02ca0000u
++#define SMMU_SIZE         0x00010000u
++/* GMU registers: Linux a6xx_gmu.xml.h dword numbers, byte offset = n * 4
++ * from the GMU block (KGSL numbers them from the GPU base: n*4 - 0x6a000). */
++#define GMU_ITCM          (0x0c00u * 4)  /* CM3_ITCM_START, 16 KiB */
++#define GMU_DTCM          (0x1c00u * 4)  /* CM3_DTCM_START, 16 KiB */
++#define GMU_FW_INIT       (0x1cfau * 4)  /* CM3_FW_INIT_RESULT */
++#define GMU_SYSRESET      (0x5000u * 4)  /* CM3_SYSRESET: 1 = held in reset */
+ #define CBCR_CLK_OFF      (1u << 31)
+ #define GDSC_PWR_ON       (1u << 31)
+ 
+@@ -115,6 +131,131 @@ gpu_fw_report(void)
+ 	}
+ }
+ 
++
++static bool
++wait_bits(vm_offset_t base, uint32_t off, uint32_t mask, bool set, unsigned us)
++{
++	for (unsigned i = 0; i < us; ++i) {
++		uint32_t v = rd(base, off);
++		if (set ? (v & mask) == mask : (v & mask) == 0) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static inline void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static bool
++branch_on(vm_offset_t base, uint32_t off, const char *name, bool poll)
++{
++	wr(base, off, rd(base, off) | 1u);
++	bool ok = !poll || wait_bits(base, off, CBCR_CLK_OFF, false, 200);
++	printf("SWEET GPU: enable %-16s %#x = %#010x%s\n", name, off, rd(base, off),
++	    ok ? "" : " (still off)");
++	return ok;
++}
++
++static void
++gpu_smmu_dump(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		printf("SWEET GPU: SMMU map failed\n");
++		return;
++	}
++	uint32_t cr0 = rd(smmu, 0x0), idr0 = rd(smmu, 0x20), idr1 = rd(smmu, 0x24);
++	unsigned nsmr = idr0 & 0xffu;
++	unsigned pgshift = (idr1 & (1u << 31)) ? 16 : 12;
++	unsigned numpage = 1u << (((idr1 >> 28) & 7u) + 1);
++	unsigned ncb = idr1 & 0xffu;
++	uint32_t cbbase = numpage << pgshift;
++	printf("SWEET GPU: smmu sCR0 %#x IDR0 %#x IDR1 %#x: %u SMRs, %u CBs at +%#x\n",
++	    cr0, idr0, idr1, nsmr, ncb, cbbase);
++	for (unsigned i = 0; i < nsmr && i < 16; ++i) {
++		printf("SWEET GPU: smmu SMR%u %#010x S2CR%u %#010x\n", i,
++		    rd(smmu, 0x800 + 4 * i), i, rd(smmu, 0xc00 + 4 * i));
++	}
++	if (cbbase + 0x1000u <= SMMU_SIZE) {
++		printf("SWEET GPU: smmu CB0 SCTLR %#x TTBR0 %#x FSR %#x\n",
++		    rd(smmu, cbbase + 0x0), rd(smmu, cbbase + 0x20), rd(smmu, cbbase + 0x58));
++	}
++}
++
++static void
++gpu_stage2(vm_offset_t gcc, vm_offset_t gpucc)
++{
++	printf("SWEET GPU: stage 2: CX domain + GMU clocks\n");
++	wr(gcc, 0x52004, rd(gcc, 0x52004) | (1u << 15) | (1u << 16)); /* gpll0, gpll0_div */
++	printf("SWEET GPU: gcc vote 0x52004=%#x\n", rd(gcc, 0x52004));
++	branch_on(gcc, 0x7100c, "gpu_memnoc_gfx", false);   /* BRANCH_VOTED */
++	branch_on(gcc, 0x71018, "gpu_snoc_dvm_gfx", true);
++	branch_on(gcc, 0x71154, "ddrss_gpu_axi", false);    /* BRANCH_VOTED */
++
++	/* CX GDSC: clear SW_COLLAPSE, wait for PWR_ON (gdscr and hw-ctrl bit 31). */
++	wr(gpucc, 0x106c, rd(gpucc, 0x106c) & ~1u);
++	bool cx = wait_bits(gpucc, 0x106c, GDSC_PWR_ON, true, 2000);
++	printf("SWEET GPU: CX GDSC %s: gdscr %#010x hw-ctrl %#010x\n", cx ? "on" : "TIMEOUT",
++	    rd(gpucc, 0x106c), rd(gpucc, 0x1540));
++	if (!cx) {
++		return;
++	}
++
++	/* GMU RCG: GPLL0_OUT_MAIN_DIV (source 6) / 1.5 (HID 2) = 200 MHz. */
++	wr(gpucc, 0x1124, (6u << 8) | 2u);
++	wr(gpucc, 0x1120, rd(gpucc, 0x1120) | 1u);
++	bool upd = wait_bits(gpucc, 0x1120, 1u, false, 500);
++	printf("SWEET GPU: GMU RCG 200 MHz %s: cmd %#x cfg %#x\n", upd ? "set" : "UPDATE TIMEOUT",
++	    rd(gpucc, 0x1120), rd(gpucc, 0x1124));
++	if (!upd) {
++		return;
++	}
++	bool ok = branch_on(gpucc, 0x1078, "gpucc ahb", true);
++	ok &= branch_on(gpucc, 0x109c, "gpucc cxo", true);
++	ok &= branch_on(gpucc, 0x1098, "gpucc cx_gmu", true);
++	branch_on(gpucc, 0x108c, "gpucc cx_snoc_dvm", true);
++	branch_on(gpucc, 0x1088, "gpucc cx_apb", true);
++	printf("SWEET GPU: GMU RCG after enable: cmd %#x (root %s)\n", rd(gpucc, 0x1120),
++	    (rd(gpucc, 0x1120) & (1u << 31)) ? "off" : "on");
++	if (!ok) {
++		printf("SWEET GPU: GMU interface clocks not running: GMU not read\n");
++		return;
++	}
++
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!gmu) {
++		printf("SWEET GPU: GMU map failed\n");
++		return;
++	}
++	uint32_t rst = rd(gmu, GMU_SYSRESET);
++	printf("SWEET GPU: GMU CM3_SYSRESET %#x (1 = in reset) FW_INIT_RESULT %#x\n",
++	    rst, rd(gmu, GMU_FW_INIT));
++	if (rst != 1) {
++		printf("SWEET GPU: GMU core not held in reset: TCMs not touched\n");
++	} else {
++		const uint32_t pat[2] = {0x5a5aa5a5u, 0xc0ffee11u};
++		const uint32_t tcm[2] = {GMU_ITCM, GMU_DTCM};
++		for (unsigned i = 0; i < 2; ++i) {
++			uint32_t old = rd(gmu, tcm[i]);
++			wr(gmu, tcm[i], pat[i]);
++			uint32_t back = rd(gmu, tcm[i]);
++			wr(gmu, tcm[i], old);
++			printf("SWEET GPU: %s write %#x read %#x: %s\n", i ? "DTCM" : "ITCM",
++			    pat[i], back, back == pat[i] ? "ok" : "MISMATCH");
++		}
++	}
++	gpu_smmu_dump();
++	printf("SWEET GPU: stage 2 done (CX and GMU clocks left on, GMU in reset)\n");
++}
++
++static unsigned gpu_stage;
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -166,6 +307,9 @@ gpu_thread(void *arg, wait_result_t result)
+ 	}
+ 	gpu_fw_report();
+ 	printf("SWEET GPU: stage 1 done\n");
++	if (gpu_stage >= 2) {
++		gpu_stage2(gcc, gpucc);
++	}
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+@@ -176,6 +320,7 @@ sweet_gpu_probe(void)
+ {
+ 	unsigned stage = 0;
+ 	(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
++	gpu_stage = stage;
+ 	if (stage == 0) {
+ 		printf("SWEET GPU: disabled (sweetgpu=0)\n");
+ 		return;
