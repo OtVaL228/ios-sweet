@@ -1,0 +1,70 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..7a4f023 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,56 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * dyld asks AMFI what it may do for the process it is starting:
++ * amfi_check_dyld_policy_self() in iOS 16.7.16's /usr/lib/dyld is
++ * __sandbox_ms("AMFI", 90, { u64 in_flags, u64 *out_flags }). With no
++ * policy of that name the call fails and dyld runs restricted: no @ path
++ * expansion ("security policy does not allow @ path expansion", G3 run),
++ * DYLD_* variables ignored. Answer with the AMFI_DYLD_OUTPUT_* flags of
++ * dyld's ProcessConfig::Security (open-source dyld): everything except a
++ * custom shared cache. Other AMFI operations stay unsupported (ENOSYS); the
++ * first use of each is logged.
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    90
++#define SWEET_AMFI_DYLD_ALLOW_AT_PATH           (1ULL << 0)
++#define SWEET_AMFI_DYLD_ALLOW_PATH_VARS         (1ULL << 1)
++#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    (1ULL << 3)
++#define SWEET_AMFI_DYLD_ALLOW_PRINT_VARS        (1ULL << 4)
++#define SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION  (1ULL << 5)
++#define SWEET_AMFI_DYLD_ALLOW_INTERPOSING       (1ULL << 6)
++#define SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS     (1ULL << 7)
++
++static uint64_t sweet_amfi_syscall_seen;
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 64 && call != SWEET_AMFI_CHECK_DYLD_POLICY &&
++	    !(sweet_amfi_syscall_seen & (1ULL << call))) {
++		sweet_amfi_syscall_seen |= 1ULL << call;
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s op %d unsupported\n", name, call);
++	}
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++		return ENOSYS;
++	}
++	uint64_t args[2];               /* in_flags, user address of out_flags */
++	int error = copyin(arg, args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_PATH_VARS |
++	    SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS | SWEET_AMFI_DYLD_ALLOW_PRINT_VARS |
++	    SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION | SWEET_AMFI_DYLD_ALLOW_INTERPOSING |
++	    SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS;
++	return copyout(&allow, (user_addr_t)args[1], sizeof(allow));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +408,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",             /* the name __mac_syscall callers (dyld) use */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
