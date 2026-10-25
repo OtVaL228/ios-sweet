@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/sweet_mailbox.c b/bsd/dev/sweet_mailbox.c
+index 88a28fa..fd749fd 100644
+--- a/bsd/dev/sweet_mailbox.c
++++ b/bsd/dev/sweet_mailbox.c
+@@ -68,11 +68,18 @@ box_thread(void *arg, wait_result_t wr)
+ 	box_wait_ms(30000);
+ 
+ 	void *buf = NULL;
+-	int err = sweet_ufs_read_partition("logdump", 0, BOX_MAX_SIZE, &buf);
++	/* The UFS driver only talks to LUN 0 (where userdata is). 0113 asked
++	 * for logdump and got ENOENT: it lives on another LUN. The partition
++	 * is a boot-arg so no rebuild is needed to move it. */
++	char part[40] = "logdump";
++	(void)PE_parse_boot_arg_str("sweetboxpart", part, sizeof(part));
++	int err = sweet_ufs_read_partition(part, 0, BOX_MAX_SIZE, &buf);
+ 	if (err || !buf) {
+-		printf("SWEET BOX: read logdump: %d\n", err);
++		printf("SWEET BOX: read %s: %d%s\n", part, err,
++		    err == ENOENT ? " (not on UFS LUN 0; pick one with sweetboxpart=)" : "");
+ 		goto out;
+ 	}
++	printf("SWEET BOX: using partition %s\n", part);
+ 	const uint8_t *p = (const uint8_t *)buf;
+ 	if (memcmp(p, BOX_MAGIC_DONE, BOX_MAGIC_LEN) == 0) {
+ 		printf("SWEET BOX: SWEETDNE — already extracted, skipping\n");
+@@ -129,7 +136,7 @@ box_thread(void *arg, wait_result_t wr)
+ 		uint8_t stamp[512];
+ 		bzero(stamp, sizeof(stamp));
+ 		memcpy(stamp, BOX_MAGIC_DONE, BOX_MAGIC_LEN);
+-		err = sweet_ufs_stamp_partition("logdump", stamp);
++		err = sweet_ufs_stamp_partition(part, stamp);
+ 		printf("SWEET BOX: stamped SWEETDNE: %d\n", err);
+ 	}
+ free_buf:
