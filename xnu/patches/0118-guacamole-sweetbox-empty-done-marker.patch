@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_mailbox.c b/bsd/dev/sweet_mailbox.c
+index ef155f9..a1d1cb7 100644
+--- a/bsd/dev/sweet_mailbox.c
++++ b/bsd/dev/sweet_mailbox.c
+@@ -19,6 +19,10 @@
+  * After each extraction the thread writes BOX_DONE_FILE (its text: how many
+  * files). /usr/libexec/sweet-autorun waits for it before it runs
+  * /private/var/tmp/autorun.sh, so every file from the box is in place.
++ * Before launchd the root pass empties it: there is no RTC, the clock starts
++ * at 0 on every boot, so the last boot's file looked newer than this boot
++ * (0116 on the phone: autorun found it before the box was extracted).
++ * sweet-autorun waits for it to be non-empty.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -69,10 +73,12 @@ box_write_file(const char *path, const uint8_t *data, uint32_t size, vfs_context
+ 		printf("SWEET BOX: open %s: %d\n", path, err);
+ 		return err ? err : ENOENT;
+ 	}
+-	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
+-	uio_addiov(uio, (user_addr_t)(uintptr_t)data, size);
+-	err = VNOP_WRITE(vp, uio, 0, ctx);
+-	uio_free(uio);
++	if (size) {                        /* size 0: O_TRUNC has emptied it */
++		uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++		uio_addiov(uio, (user_addr_t)(uintptr_t)data, size);
++		err = VNOP_WRITE(vp, uio, 0, ctx);
++		uio_free(uio);
++	}
+ 	int cerr = vnode_close(vp, FWRITE, ctx);
+ 	return err ? err : cerr;
+ }
+@@ -246,7 +252,12 @@ sweet_mailbox_root_install(void)
+ 	unsigned enabled = 0, root = 0;
+ 	(void)PE_parse_boot_argn("sweetmailbox", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweetboxroot", &root, sizeof(root));
+-	if (!enabled || !root) {
++	if (!enabled) {
++		return;
++	}
++	int err = box_write_file(BOX_DONE_FILE, NULL, 0, vfs_context_kernel());
++	printf("SWEET BOX: emptied " BOX_DONE_FILE ": %d\n", err);
++	if (!root) {
+ 		return;
+ 	}
+ 	char part[40];

@@ -143,9 +143,14 @@ SWEETBOX instead of reflashing userdata:
   A broken launchd.plist can be replaced the same way on the next boot.
 - 0116: the kernel writes `/private/var/tmp/SWEETBOX.done` after extracting;
   `sweet-autorun` is in the default `sweetnull` list (its stdout -> log).
+- 0118: the root pass empties SWEETBOX.done before launchd (whenever
+  `sweetmailbox=1`), and sweet-autorun waits for it to be non-empty. There
+  is no RTC: the clock starts at 0 every boot, so an mtime check took the
+  last boot's marker for this boot's (GPU test run: autorun.sh not found,
+  the box was extracted only afterwards).
 - `tools/sweet-root-tweaks.py` adds job `com.sweet.autorun`
   (`/usr/libexec/sweet-autorun`, RunAtLoad). `userland/autorun/sweet-autorun.c`
-  waits for SWEETBOX.done of this boot, renames autorun.sh to autorun.sh.ran
+  waits for SWEETBOX.done of this boot (non-empty), renames autorun.sh to autorun.sh.ran
   and runs it line by line (no shell: words, quotes, `&`, builtins cd, sleep,
   export, echo, wait, exit). Output lines appear in the log as `SWEET RUN:`.
 - The phone's launchd.plist is the IPSW one + the sweet-root-tweaks.py edits

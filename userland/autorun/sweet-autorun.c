@@ -3,8 +3,9 @@
  *
  * launchd starts it at boot (job com.sweet.autorun, added to launchd.plist by
  * tools/sweet-root-tweaks.py). It waits until the kernel has extracted this
- * boot's box (SWEETBOX.done newer than the boot time, patch 0116), renames
- * autorun.sh to autorun.sh.ran so it runs once, and executes it.
+ * boot's box (SWEETBOX.done non-empty: 0116 writes it after extracting, 0118
+ * empties it before launchd; with no RTC an mtime check can't tell boots
+ * apart), renames autorun.sh to autorun.sh.ran so it runs once, and runs it.
  *
  * iOS has no /bin/sh, so this is a tiny line interpreter, not a shell:
  *   - one command per line, '#' starts a comment
@@ -31,7 +32,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -343,16 +343,6 @@ line_run(char *line, int lineno)
 	return -1;
 }
 
-static time_t
-boot_time(void)
-{
-	struct timeval tv = { 0, 0 };
-	size_t len = sizeof(tv);
-	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
-	(void)sysctl(mib, 2, &tv, &len, NULL, 0);
-	return tv.tv_sec;
-}
-
 int
 main(void)
 {
@@ -364,11 +354,10 @@ main(void)
 	setenv("HOME", DIR_BOX, 1);
 	(void)chdir(DIR_BOX);
 
-	time_t booted = boot_time();
 	say("SWEET RUN: waiting for " DONE_FILE " (up to %d s)", WAIT_SECS);
 	struct stat st;
 	int waited = 0;
-	while (!(stat(DONE_FILE, &st) == 0 && st.st_mtime >= booted)) {
+	while (!(stat(DONE_FILE, &st) == 0 && st.st_size > 0)) {
 		if (waited++ >= WAIT_SECS) {
 			say("SWEET RUN: no SWEETBOX this boot, nothing to run");
 			return 0;
