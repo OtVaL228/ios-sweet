@@ -1,0 +1,268 @@
+diff --git a/bsd/dev/sweet_mailbox.c b/bsd/dev/sweet_mailbox.c
+index fd749fd..2891f7b 100644
+--- a/bsd/dev/sweet_mailbox.c
++++ b/bsd/dev/sweet_mailbox.c
+@@ -9,6 +9,12 @@
+  * /private/var/tmp/<name> on the iOS root (flat: "/" in names becomes "_";
+  * the kernel has no mkdir KPI), then stamps the partition with
+  * SWEETDNE so the kernel skips it on the next boot.
++ *
++ * Entries named ROOT/<path> are not extracted there. With boot-arg
++ * sweetboxroot=1, sweet_mailbox_root_install() writes them to /<path> on
++ * the root right after it mounts (bsd_init, before launchd), so a
++ * launchd.plist from the box is used by this very boot, and a broken one
++ * can be replaced the same way. The parent directory must exist.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -33,6 +39,11 @@ extern int sweet_ufs_stamp_partition(const char *part, const uint8_t sector[512]
+ #define BOX_MAGIC_LEN  8
+ #define BOX_MAX_SIZE   (64u * 1024u * 1024u)
+ #define BOX_BASE_DIR   "/private/var/tmp"
++#define BOX_ROOT       "ROOT/"
++#define BOX_ROOT_LEN   5
++
++/* ROOT/ entries the root pass wrote this boot (for the SWEETDNE stamp). */
++static unsigned box_root_installed;
+ 
+ static void
+ box_wait_ms(unsigned ms)
+@@ -61,47 +72,75 @@ box_write_file(const char *path, const uint8_t *data, uint32_t size, vfs_context
+ 	return err ? err : cerr;
+ }
+ 
+-static void
+-box_thread(void *arg, wait_result_t wr)
++/* No empty, "." or ".." components: ROOT/ paths stay what they say. */
++static bool
++box_root_path_ok(const char *path)
+ {
+-	(void)arg; (void)wr;
+-	box_wait_ms(30000);
++	const char *c = path;
++	for (;;) {
++		const char *e = strchr(c, '/');
++		size_t n = e ? (size_t)(e - c) : strlen(c);
++		if (n == 0 || (n == 1 && c[0] == '.') || (n == 2 && c[0] == '.' && c[1] == '.')) {
++			return false;
++		}
++		if (!e) {
++			return true;
++		}
++		c = e + 1;
++	}
++}
+ 
++/*
++ * Reads the box from the partition in boot-arg sweetboxpart (default
++ * logdump). Returns the buffer (BOX_MAX_SIZE, kmem_free it) when it holds an
++ * unextracted box, else NULL.
++ */
++static void *
++box_read(const char *part, uint32_t *nfiles_out)
++{
+ 	void *buf = NULL;
+-	/* The UFS driver only talks to LUN 0 (where userdata is). 0113 asked
+-	 * for logdump and got ENOENT: it lives on another LUN. The partition
+-	 * is a boot-arg so no rebuild is needed to move it. */
+-	char part[40] = "logdump";
+-	(void)PE_parse_boot_arg_str("sweetboxpart", part, sizeof(part));
+ 	int err = sweet_ufs_read_partition(part, 0, BOX_MAX_SIZE, &buf);
+ 	if (err || !buf) {
+ 		printf("SWEET BOX: read %s: %d%s\n", part, err,
+ 		    err == ENOENT ? " (not on UFS LUN 0; pick one with sweetboxpart=)" : "");
+-		goto out;
++		return NULL;
+ 	}
+ 	printf("SWEET BOX: using partition %s\n", part);
+ 	const uint8_t *p = (const uint8_t *)buf;
++	uint32_t nfiles = 0;
+ 	if (memcmp(p, BOX_MAGIC_DONE, BOX_MAGIC_LEN) == 0) {
+ 		printf("SWEET BOX: SWEETDNE — already extracted, skipping\n");
+-		goto free_buf;
+-	}
+-	if (memcmp(p, BOX_MAGIC, BOX_MAGIC_LEN) != 0) {
++	} else if (memcmp(p, BOX_MAGIC, BOX_MAGIC_LEN) != 0) {
+ 		printf("SWEET BOX: no SWEETBOX magic, skipping\n");
+-		goto free_buf;
++	} else {
++		memcpy(&nfiles, p + BOX_MAGIC_LEN, 4);
++		if (nfiles == 0 || nfiles > 512) {
++			printf("SWEET BOX: bad file count %u\n", nfiles);
++			nfiles = 0;
++		}
+ 	}
+-	uint32_t nfiles;
+-	memcpy(&nfiles, p + BOX_MAGIC_LEN, 4);
+-	if (nfiles == 0 || nfiles > 512) {
+-		printf("SWEET BOX: bad file count %u\n", nfiles);
+-		goto free_buf;
++	if (!nfiles) {
++		kmem_free(kernel_map, (vm_offset_t)buf, BOX_MAX_SIZE);
++		return NULL;
+ 	}
+-	printf("SWEET BOX: %u file(s) to extract\n", nfiles);
++	*nfiles_out = nfiles;
++	return buf;
++}
++
++/*
++ * One pass over the box. root_pass: write only the ROOT/ entries, to their
++ * path on the root. Otherwise extract the rest flat to BOX_BASE_DIR.
++ * Returns how many entries of that kind were written; *total gets how many
++ * there are.
++ */
++static unsigned
++box_walk(const uint8_t *p, uint32_t nfiles, bool root_pass, unsigned *total)
++{
+ 	const uint8_t *cur = p + BOX_MAGIC_LEN + 4;
+ 	const uint8_t *end = p + BOX_MAX_SIZE;
+-
+ 	vfs_context_t ctx = vfs_context_kernel();
++	unsigned written = 0, mine = 0;
+ 
+-	unsigned extracted = 0;
+ 	for (uint32_t i = 0; i < nfiles; i++) {
+ 		if (cur + 2 > end) { printf("SWEET BOX: truncated\n"); break; }
+ 		uint16_t namelen;
+@@ -114,38 +153,106 @@ box_thread(void *arg, wait_result_t wr)
+ 		uint32_t size;
+ 		memcpy(&size, cur, 4); cur += 4;
+ 		if (cur + size > end) { printf("SWEET BOX: %s: overrun\n", name); break; }
+-		for (unsigned k = 0; name[k]; k++) {
+-			if (name[k] == '/') {
+-				name[k] = '_';         /* flat: no directories */
+-			}
+-		}
+-		if (name[0] == '.') {
+-			name[0] = '_';             /* no ".." or hidden names */
++		const uint8_t *data = cur;
++		cur += size;
++
++		bool is_root = strncmp(name, BOX_ROOT, BOX_ROOT_LEN) == 0;
++		if (is_root != root_pass) {
++			continue;
+ 		}
++		mine++;
+ 		char dest[512];
+-		snprintf(dest, sizeof(dest), BOX_BASE_DIR "/%s", name);
+-		err = box_write_file(dest, cur, size, ctx);
+-		if (!err) {
+-			printf("SWEET BOX: extracted %s (%u B)\n", dest, size);
+-			extracted++;
++		if (is_root) {
++			if (!box_root_path_ok(name + BOX_ROOT_LEN)) {
++				printf("SWEET BOX: %s: bad root path, skipped\n", name);
++				continue;
++			}
++			snprintf(dest, sizeof(dest), "/%s", name + BOX_ROOT_LEN);
++		} else {
++			for (unsigned k = 0; name[k]; k++) {
++				if (name[k] == '/') {
++					name[k] = '_';         /* flat: no directories */
++				}
++			}
++			if (name[0] == '.') {
++				name[0] = '_';             /* no ".." or hidden names */
++			}
++			snprintf(dest, sizeof(dest), BOX_BASE_DIR "/%s", name);
+ 		}
+-		cur += size;
++		if (box_write_file(dest, data, size, ctx) == 0) {
++			printf("SWEET BOX: %s %s (%u B)\n", is_root ? "installed" : "extracted", dest, size);
++			written++;
++		}
++	}
++	*total = mine;
++	return written;
++}
++
++static void
++box_part(char part[40])
++{
++	/* The UFS driver only talks to LUN 0 (where userdata is). 0113 asked
++	 * for logdump and got ENOENT: it lives on another LUN. The partition
++	 * is a boot-arg so no rebuild is needed to move it. */
++	strlcpy(part, "logdump", 40);
++	(void)PE_parse_boot_arg_str("sweetboxpart", part, 40);
++}
++
++static void
++box_thread(void *arg, wait_result_t wr)
++{
++	(void)arg; (void)wr;
++	box_wait_ms(30000);
++
++	char part[40];
++	box_part(part);
++	uint32_t nfiles = 0;
++	void *buf = box_read(part, &nfiles);
++	if (!buf) {
++		goto out;
+ 	}
+-	printf("SWEET BOX: done, %u/%u files\n", extracted, nfiles);
+-	if (extracted == nfiles) {
++	printf("SWEET BOX: %u file(s) to extract\n", nfiles);
++	unsigned total = 0;
++	unsigned extracted = box_walk(buf, nfiles, false, &total);
++	unsigned root_total = nfiles - total;
++	printf("SWEET BOX: done, %u/%u files, %u/%u root files\n",
++	    extracted, total, box_root_installed, root_total);
++	if (extracted == total && box_root_installed == root_total) {
+ 		uint8_t stamp[512];
+ 		bzero(stamp, sizeof(stamp));
+ 		memcpy(stamp, BOX_MAGIC_DONE, BOX_MAGIC_LEN);
+-		err = sweet_ufs_stamp_partition(part, stamp);
++		int err = sweet_ufs_stamp_partition(part, stamp);
+ 		printf("SWEET BOX: stamped SWEETDNE: %d\n", err);
+ 	}
+-free_buf:
+ 	kmem_free(kernel_map, (vm_offset_t)buf, BOX_MAX_SIZE);
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* bsd_init, right after the root is mounted and before launchd runs. */
++void
++sweet_mailbox_root_install(void)
++{
++	unsigned enabled = 0, root = 0;
++	(void)PE_parse_boot_argn("sweetmailbox", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetboxroot", &root, sizeof(root));
++	if (!enabled || !root) {
++		return;
++	}
++	char part[40];
++	box_part(part);
++	uint32_t nfiles = 0;
++	void *buf = box_read(part, &nfiles);
++	if (!buf) {
++		return;
++	}
++	unsigned total = 0;
++	box_root_installed = box_walk(buf, nfiles, true, &total);
++	printf("SWEET BOX: root pass, %u/%u files installed\n", box_root_installed, total);
++	kmem_free(kernel_map, (vm_offset_t)buf, BOX_MAX_SIZE);
++}
++
+ void
+ sweet_mailbox_probe(void)
+ {
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..5e6527a 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -950,6 +950,12 @@ bsd_init(void)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* SWEETBOX ROOT/ entries (boot-args sweetmailbox=1 sweetboxroot=1), before launchd. */
++	extern void sweet_mailbox_root_install(void);
++	sweet_mailbox_root_install();
++#endif
++
+ 
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
