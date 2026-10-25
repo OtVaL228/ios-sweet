@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/sweet_mailbox.c b/bsd/dev/sweet_mailbox.c
+index a1d1cb7..86832fb 100644
+--- a/bsd/dev/sweet_mailbox.c
++++ b/bsd/dev/sweet_mailbox.c
+@@ -68,12 +68,24 @@ box_write_file(const char *path, const uint8_t *data, uint32_t size, vfs_context
+ {
+ 	struct vnode *vp = NULLVP;
+ 	/* vnode_open takes kernel F-flags (FWRITE), not O_WRONLY. */
+-	int err = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, 0755, 0, &vp, ctx);
++	int err = vnode_open(path, FWRITE | O_CREAT, 0755, 0, &vp, ctx);
+ 	if (err || vp == NULLVP) {
+ 		printf("SWEET BOX: open %s: %d\n", path, err);
+ 		return err ? err : ENOENT;
+ 	}
+-	if (size) {                        /* size 0: O_TRUNC has emptied it */
++	/*
++	 * vnode_open() ignores O_TRUNC (vn_open_auth leaves it to the open
++	 * syscall), so a shorter file kept the old one's tail and 0118 did not
++	 * empty SWEETBOX.done. Truncate like kern_core.c does.
++	 */
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_data_size, 0);
++	err = vnode_setattr(vp, &va, ctx);
++	if (err) {
++		printf("SWEET BOX: truncate %s: %d\n", path, err);
++	}
++	if (!err && size) {
+ 		uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
+ 		uio_addiov(uio, (user_addr_t)(uintptr_t)data, size);
+ 		err = VNOP_WRITE(vp, uio, 0, ctx);

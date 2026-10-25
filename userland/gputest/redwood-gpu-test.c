@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 enum {
 	kDrmGemClose  = 0x09,
@@ -62,6 +63,7 @@ struct drm_gem_close { uint32_t handle, pad; };
 #define BUF_SIZE              0x2000u
 #define OUT_OFFSET            0x1000u
 #define MAGIC                 0x5eed0640u
+#define WAIT_SECS             300u
 
 static io_connect_t conn;
 
@@ -101,10 +103,21 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
-	if (!svc) {
-		printf("no RedwoodGPU service (boot with sweetgpu=11?)\n");
-		return 2;
+	/* The GPU stages start 60 s after the kernel and take a while: wait for the service. */
+	io_service_t svc = 0;
+	unsigned waited = 0;
+	while (!(svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU")))) {
+		if (waited == 0) {
+			printf("waiting for the RedwoodGPU service (up to %u s)\n", WAIT_SECS);
+		}
+		if (waited++ >= WAIT_SECS) {
+			printf("no RedwoodGPU service (boot with sweetgpu=11?)\n");
+			return 2;
+		}
+		sleep(1);
+	}
+	if (waited) {
+		printf("RedwoodGPU service after %u s\n", waited);
 	}
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
 	IOObjectRelease(svc);

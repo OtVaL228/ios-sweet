@@ -148,6 +148,10 @@ SWEETBOX instead of reflashing userdata:
   is no RTC: the clock starts at 0 every boot, so an mtime check took the
   last boot's marker for this boot's (GPU test run: autorun.sh not found,
   the box was extracted only afterwards).
+- 0119: 0118 still did not empty it: the kernel's vnode_open() ignores
+  O_TRUNC (vn_open_auth leaves it to the open syscall), so every box file
+  written over a longer one kept the old tail. box_write_file truncates
+  with vnode_setattr(va_data_size = 0), as kern_core.c does.
 - `tools/sweet-root-tweaks.py` adds job `com.sweet.autorun`
   (`/usr/libexec/sweet-autorun`, RunAtLoad). `userland/autorun/sweet-autorun.c`
   waits for SWEETBOX.done of this boot (non-empty), renames autorun.sh to autorun.sh.ran
