@@ -51,6 +51,8 @@ extern char **environ;
 struct job {
 	pid_t pid;          /* 0 once reaped */
 	int fd;             /* read end of its output pipe, -1 at EOF */
+	int status;         /* from waitpid, reported once the pipe is drained */
+	bool unreported;
 	char name[32];
 	char buf[1024];
 	size_t len;
@@ -85,6 +87,20 @@ job_flush_line(struct job *j)
 	j->len = 0;
 }
 
+static void
+job_report(struct job *j)
+{
+	if (!j->unreported) {
+		return;
+	}
+	if (WIFEXITED(j->status)) {
+		say("SWEET RUN: [%s] exit %d", j->name, WEXITSTATUS(j->status));
+	} else if (WIFSIGNALED(j->status)) {
+		say("SWEET RUN: [%s] killed by signal %d", j->name, WTERMSIG(j->status));
+	}
+	j->unreported = false;
+}
+
 /* Reads what is there; at EOF flushes the last partial line and closes. */
 static void
 job_read(struct job *j)
@@ -100,6 +116,7 @@ job_read(struct job *j)
 		}
 		close(j->fd);
 		j->fd = -1;
+		job_report(j);
 		return;
 	}
 	for (ssize_t i = 0; i < n; i++) {
@@ -116,16 +133,15 @@ job_read(struct job *j)
 static void
 job_reap(struct job *j, int options)
 {
-	int status;
-	if (!j->pid || waitpid(j->pid, &status, options) != j->pid) {
+	if (!j->pid || waitpid(j->pid, &j->status, options) != j->pid) {
 		return;
 	}
-	if (WIFEXITED(status)) {
-		say("SWEET RUN: [%s] exit %d", j->name, WEXITSTATUS(status));
-	} else if (WIFSIGNALED(status)) {
-		say("SWEET RUN: [%s] killed by signal %d", j->name, WTERMSIG(status));
-	}
 	j->pid = 0;
+	j->unreported = true;
+	/* Output still in the pipe comes first; job_read reports at EOF. */
+	if (j->fd < 0) {
+		job_report(j);
+	}
 }
 
 /*
@@ -164,6 +180,7 @@ relay(struct job *until)
 		}
 		/* The command exited but its pipe lives on: stop waiting for it. */
 		if (until && until->pid == 0 && r == 0) {
+			job_report(until);
 			return;
 		}
 	}
@@ -175,6 +192,7 @@ job_slot(void)
 	for (int i = 0; i < MAX_JOBS; i++) {
 		if (jobs[i].pid == 0 && jobs[i].fd < 0) {
 			jobs[i].len = 0;
+			jobs[i].unreported = false;
 			return &jobs[i];
 		}
 	}

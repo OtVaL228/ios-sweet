@@ -20,6 +20,7 @@ as coming from a device tree (DT) or Linux.
 | Touch (Samsung S6SY761) | works (0085-0087) |
 | GPU (Adreno 640) | kernel bring-up done, IB + fence path works, redwood_gpu_* backend up; userland next |
 | File drop (SWEETBOX) | works: raw image in `rawdump` -> files in /private/var/tmp |
+| Autorun of /private/var/tmp/autorun.sh | works (0115/0116, userland/autorun) |
 | Wi-Fi, audio, RTC, CPU frequency | not started |
 
 ## Workflow
@@ -163,9 +164,15 @@ python3 tools/sweet-mailbox.py pack box.img \
 Boot with `sweetmailbox=1 sweetboxpart=rawdump sweetboxroot=1`. Later boxes
 only carry autorun.sh and its files (no `sweetboxroot`).
 
+First phone run (CI 40200983409): both ROOT/ files installed before
+`exec launchd`, launchd took the new cache, sweet-autorun waited for
+SWEETBOX.done and relayed `vm_stat` (`SWEET RUN: [vm_stat] ...`). To update
+only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
+`sweetboxroot=1` again.
+
 ## Next
 
-1. Autorun: 0115/0116 + sweet-autorun written, not yet run on the phone (see Autorun).
+1. Done: autorun works on the phone (CI 40200983409, see Autorun).
 2. G2b: port RedwoodGPU.cpp (topaz, from HackiOS, APSL) on the redwood_gpu_*
    backend; SweetSurface fields drawn/planeCount/state only needed for G4.
    A small userland test: open the user client, GEM_NEW, SUBMIT, WAIT_FENCE.
