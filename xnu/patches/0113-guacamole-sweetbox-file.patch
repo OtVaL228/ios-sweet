@@ -1,0 +1,186 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5b5e1d0..2f615a4 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1873,6 +1873,22 @@ gpu_stage10(void)
+ #define GVA_USER_END      0xf0000000ull
+ #define RB_DWORDS         (RB_SIZE / 4u)
+ 
++/* Prototypes: RedwoodGPU.cpp calls these (extern "C"). */
++bool redwood_gpu_ready(void);
++bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t redwood_gpu_address(uint64_t size);
++void redwood_gpu_address_free(uint64_t address, uint64_t size);
++bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void redwood_gpu_mapped(void);
++void redwood_gpu_unmap(uint64_t address, uint64_t size);
++void redwood_gpu_to_memory(void *start, uint64_t size);
++uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool redwood_gpu_done(uint32_t fence);
++uint32_t redwood_gpu_last(void);
++void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void redwood_gpu_report(const char *why);
++void redwood_gpu_stop(void);
++
+ static vm_offset_t be_gpu, be_smmu;
+ static uint32_t be_wptr, be_seqno;
+ static volatile uint32_t *be_fence;
+diff --git a/bsd/dev/sweet_mailbox.c b/bsd/dev/sweet_mailbox.c
+new file mode 100644
+index 0000000..88a28fa
+--- /dev/null
++++ b/bsd/dev/sweet_mailbox.c
+@@ -0,0 +1,153 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEETBOX: kernel-side extractor for files deployed via the logdump partition.
++ *
++ * tools/sweet-mailbox.py packs files into a raw image:
++ *   [SWEETBOX magic 8 B][file count 4 B][name_len 2 B][name][data_len 4 B][data]...
++ * sweet_mailbox_probe() (boot-arg sweetmailbox=1) reads that image from
++ * "logdump" via sweet_ufs_read_partition(), extracts each file to
++ * /private/var/tmp/<name> on the iOS root (flat: "/" in names becomes "_";
++ * the kernel has no mkdir KPI), then stamps the partition with
++ * SWEETDNE so the kernel skips it on the next boot.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_ufs_read_partition(const char *part, uint64_t offset,
++    uint32_t size, void **buf_out);
++extern int sweet_ufs_stamp_partition(const char *part, const uint8_t sector[512]);
++
++#define BOX_MAGIC      "SWEETBOX"
++#define BOX_MAGIC_DONE "SWEETDNE"
++#define BOX_MAGIC_LEN  8
++#define BOX_MAX_SIZE   (64u * 1024u * 1024u)
++#define BOX_BASE_DIR   "/private/var/tmp"
++
++static void
++box_wait_ms(unsigned ms)
++{
++	uint64_t d;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &d);
++	assert_wait_deadline((event_t)&box_wait_ms, THREAD_UNINT, d);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++box_write_file(const char *path, const uint8_t *data, uint32_t size, vfs_context_t ctx)
++{
++	struct vnode *vp = NULLVP;
++	/* vnode_open takes kernel F-flags (FWRITE), not O_WRONLY. */
++	int err = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, 0755, 0, &vp, ctx);
++	if (err || vp == NULLVP) {
++		printf("SWEET BOX: open %s: %d\n", path, err);
++		return err ? err : ENOENT;
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++	uio_addiov(uio, (user_addr_t)(uintptr_t)data, size);
++	err = VNOP_WRITE(vp, uio, 0, ctx);
++	uio_free(uio);
++	int cerr = vnode_close(vp, FWRITE, ctx);
++	return err ? err : cerr;
++}
++
++static void
++box_thread(void *arg, wait_result_t wr)
++{
++	(void)arg; (void)wr;
++	box_wait_ms(30000);
++
++	void *buf = NULL;
++	int err = sweet_ufs_read_partition("logdump", 0, BOX_MAX_SIZE, &buf);
++	if (err || !buf) {
++		printf("SWEET BOX: read logdump: %d\n", err);
++		goto out;
++	}
++	const uint8_t *p = (const uint8_t *)buf;
++	if (memcmp(p, BOX_MAGIC_DONE, BOX_MAGIC_LEN) == 0) {
++		printf("SWEET BOX: SWEETDNE — already extracted, skipping\n");
++		goto free_buf;
++	}
++	if (memcmp(p, BOX_MAGIC, BOX_MAGIC_LEN) != 0) {
++		printf("SWEET BOX: no SWEETBOX magic, skipping\n");
++		goto free_buf;
++	}
++	uint32_t nfiles;
++	memcpy(&nfiles, p + BOX_MAGIC_LEN, 4);
++	if (nfiles == 0 || nfiles > 512) {
++		printf("SWEET BOX: bad file count %u\n", nfiles);
++		goto free_buf;
++	}
++	printf("SWEET BOX: %u file(s) to extract\n", nfiles);
++	const uint8_t *cur = p + BOX_MAGIC_LEN + 4;
++	const uint8_t *end = p + BOX_MAX_SIZE;
++
++	vfs_context_t ctx = vfs_context_kernel();
++
++	unsigned extracted = 0;
++	for (uint32_t i = 0; i < nfiles; i++) {
++		if (cur + 2 > end) { printf("SWEET BOX: truncated\n"); break; }
++		uint16_t namelen;
++		memcpy(&namelen, cur, 2); cur += 2;
++		if (!namelen || namelen > 255 || cur + namelen + 4 > end) {
++			printf("SWEET BOX: bad entry %u\n", i); break;
++		}
++		char name[256];
++		memcpy(name, cur, namelen); name[namelen] = '\0'; cur += namelen;
++		uint32_t size;
++		memcpy(&size, cur, 4); cur += 4;
++		if (cur + size > end) { printf("SWEET BOX: %s: overrun\n", name); break; }
++		for (unsigned k = 0; name[k]; k++) {
++			if (name[k] == '/') {
++				name[k] = '_';         /* flat: no directories */
++			}
++		}
++		if (name[0] == '.') {
++			name[0] = '_';             /* no ".." or hidden names */
++		}
++		char dest[512];
++		snprintf(dest, sizeof(dest), BOX_BASE_DIR "/%s", name);
++		err = box_write_file(dest, cur, size, ctx);
++		if (!err) {
++			printf("SWEET BOX: extracted %s (%u B)\n", dest, size);
++			extracted++;
++		}
++		cur += size;
++	}
++	printf("SWEET BOX: done, %u/%u files\n", extracted, nfiles);
++	if (extracted == nfiles) {
++		uint8_t stamp[512];
++		bzero(stamp, sizeof(stamp));
++		memcpy(stamp, BOX_MAGIC_DONE, BOX_MAGIC_LEN);
++		err = sweet_ufs_stamp_partition("logdump", stamp);
++		printf("SWEET BOX: stamped SWEETDNE: %d\n", err);
++	}
++free_buf:
++	kmem_free(kernel_map, (vm_offset_t)buf, BOX_MAX_SIZE);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_mailbox_probe(void)
++{
++	unsigned enabled = 0;
++	(void)PE_parse_boot_argn("sweetmailbox", &enabled, sizeof(enabled));
++	if (!enabled) return;
++	printf("SWEET BOX: enabled, will extract logdump -> /private/var/tmp/ after root mount\n");
++	thread_t t;
++	if (kernel_thread_start(box_thread, NULL, &t) == KERN_SUCCESS)
++		thread_deallocate(t);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -15,7 +15,7 @@ Usage:
   adb shell 'dd if=/dev/zero of=/dev/block/by-name/logdump bs=512 count=8'
 
 The kernel (sweet_mailbox.c, sweetmailbox=1) reads logdump after the root
-mounts, extracts each file to /var/sweet/<name> (creating directories),
+mounts, extracts each file to /private/var/tmp/<name> (flat: '/' -> '_'),
 then writes a 512-byte "done" block at offset 0 to stop re-extraction.
 Permissions are 0755 for binaries (no extension) and 0644 for everything else.
 """
