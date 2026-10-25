@@ -19,7 +19,9 @@ screen (image versions v8-v14 in NOTES.md):
                   panic the system); CommCenter jobs removed (no baseband: it
                   crash-loops and Setup blocks on its CoreTelephony XPC);
                   job com.sweet.autorun runs /usr/libexec/sweet-autorun
-                  (userland/autorun) at boot
+                  (userland/autorun) at boot; com.apple.backboardd runs
+                  /usr/libexec/sweet-bbd (userland/bbd), which execs the real
+                  backboardd with our library in DYLD_INSERT_LIBRARIES
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -71,6 +73,9 @@ AUTORUN_JOB = {
 }
 
 
+BBD_WRAPPER = '/usr/libexec/sweet-bbd'
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     launchd_plist(path, path)
@@ -90,9 +95,12 @@ def launchd_plist(src, dst):
     for k in removed:
         del jobs[k]
     jobs[AUTORUN_KEY] = dict(AUTORUN_JOB)
+    for job in jobs.values():
+        if job.get('Label') == 'com.apple.backboardd':
+            job['ProgramArguments'] = [BBD_WRAPPER]
     save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed, '
-          f'{AUTORUN_JOB["Label"]} added')
+          f'{AUTORUN_JOB["Label"]} added, backboardd via {BBD_WRAPPER}')
 
 
 def containers(root):

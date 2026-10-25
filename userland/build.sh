@@ -3,7 +3,7 @@
 # arm64e), ad-hoc signed: the kernel makes signed binaries on the root
 # volume platform binaries (patch 0035), so no other signature is needed.
 #
-#   userland/build.sh            -> userland/out/{sweet-autorun,redwood-gpu-test,osmesa-triangle}
+#   userland/build.sh            -> userland/out/ (autorun, GPU tests, backboardd wrapper)
 set -e
 cd "$(dirname "$0")"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -17,6 +17,8 @@ build() { # OUT SRC... [-- extra flags]
 }
 build sweet-autorun autorun/sweet-autorun.c
 build redwood-gpu-test gputest/redwood-gpu-test.c -framework IOKit -framework CoreFoundation
+build sweet-bbd bbd/sweet-bbd.c
+build libsweet-bbd.dylib bbd/bbd-insert.c -dynamiclib -install_name /usr/lib/libsweet-bbd.dylib
 build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_name /private/var/tmp/libsweet-insert-test.dylib
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)
 MESA=mesa/build

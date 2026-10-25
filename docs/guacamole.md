@@ -220,6 +220,12 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    @executable_path, DYLD_INSERT_LIBRARIES runs our constructor in vm_stat
    ("SWEET INSERT"), DYLD_PRINT_LIBRARIES lists the images. Other AMFI ops
    return ENOSYS (topaz answers 0: ExtensionKit/PosterBoard need that).
+   G4 step 1 (written, not yet run): com.apple.backboardd runs
+   /usr/libexec/sweet-bbd (userland/bbd), which puts
+   /usr/lib/libsweet-bbd.dylib into DYLD_INSERT_LIBRARIES and execs the
+   real backboardd (same pid and Mach services). Boot-arg sweetbbd=0 leaves
+   the library out. Installed with a ROOT/ box; rescue box = the previous
+   launchd.plist.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.
