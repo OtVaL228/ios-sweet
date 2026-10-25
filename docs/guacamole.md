@@ -18,7 +18,8 @@ as coming from a device tree (DT) or Linux.
 | Display 1125x2436 presented, scaled x1.28 to 1440x3120 | works (0083) |
 | Buttons (power, volume) | works (0084) |
 | Touch (Samsung S6SY761) | works (0085-0087) |
-| GPU (Adreno 640) | bring-up in progress, see below |
+| GPU (Adreno 640) | kernel bring-up done, IB + fence path works, redwood_gpu_* backend up; userland next |
+| File drop (SWEETBOX) | works: raw image in `rawdump` -> files in /private/var/tmp |
 | Wi-Fi, audio, RTC, CPU frequency | not started |
 
 ## Workflow
@@ -82,9 +83,11 @@ accesses. Register numbers: Linux v6.6 `a6xx.xml.h`, `a6xx_gmu.xml.h`.
 | 4 | RSC/PDC microcode, TCM blocks, boot regs, release GMU | `0xbabeface` in ~0.6 ms |
 | 5 | HFI v2: PERF_TABLE, BW_TABLE, CORE_FW_START, START | all acked |
 | 6 | GX_BW_PERF_VOTE + OOB GPU_SET, read RBBM/CP | GX on, CP halted |
-| 7 | GPU SMMU CB1, SQE/ring/shadow, hw_init registers, CP halted | pending |
-| 8 | CP_SQE_CNTL=1, CP_ME_INIT, RPTR advances | next (main risk) |
-| 9 | zap shader via SCM PAS, CP_SET_SECURE_MODE 0 | later |
+| 7 | GPU SMMU CB1, SQE/ring/shadow, hw_init registers, CP halted | ok, all readbacks match |
+| 8 | CP_SQE_CNTL=1, CP_ME_INIT + WHERE_AM_I | ok, ring drained in 1 ms |
+| 9 | zap via SCM PAS (INIT_IMAGE/MEM_SETUP/AUTH_AND_RESET), CP_SET_SECURE_MODE 0 | ok |
+| 10 | IB (CP_INDIRECT_BUFFER) + fence (CP_EVENT_WRITE CACHE_FLUSH_TS\|IRQ) | ok |
+| 11 | redwood_gpu_* backend (VA allocator, L3 tables on demand, submit/fence) + self-test | ok; RedwoodGPUStart is a weak stub |
 
 Lessons:
 - MMIO to the GPU SMMU's SMR/S2CR is trapped by the hypervisor: use single
@@ -103,6 +106,37 @@ Lessons:
   SVS_L2/NOM; GMU 200 MHz = MIN_SVS (rounds up to 64 in cx.lvl).
 - The GMU's HFI memory is cacheable for us: clean after writing, invalidate
   before reading, and only talk while nothing is outstanding.
+- SCM: PAS_IS_SUPPORTED(13) answers 0 but INIT_IMAGE works (Linux never asks).
+  The zap region must be 1 MiB aligned; kmem_alloc_contig's mask does not
+  align, so over-allocate and align by hand. Metadata (the .mdt as shipped) in
+  uncached low RAM at 0xf0000000.
+- Commands in the ring run privileged, IBs unprivileged: pages an IB reads or
+  writes need AP[1]. FSR bit 3 is a permission fault (bit 1 is translation).
+- CP_EVENT_WRITE's TIMESTAMP flag stores the CP counter; the payload fence is
+  CACHE_FLUSH_TS | IRQ. RBBM_INT_0_STATUS stays 0 while RBBM_INT_0_MASK is 0.
+- Grown L3 tables are separate pages: keep their kernel VA. Client VA from
+  0x1100000 shares 2 MB slot 8 with the stage-7 block: reuse its L3.
+
+## SWEETBOX file drop
+
+`tools/sweet-mailbox.py pack out.img NAME SRC [NAME SRC ...]`, then in TWRP
+`dd if=out.img of=/dev/block/by-name/rawdump bs=65536`; boot with
+`sweetmailbox=1 sweetboxpart=rawdump`. The kernel extracts flat into
+/private/var/tmp/ (no mkdir KPI) ~30 s after boot and stamps SWEETDNE.
+sweet_ufs only talks to UFS LUN 0 (sda): rawdump/op2/userdata live there,
+logdump does not. Reads/stamps take sweet_ufs_lock.
+
+## Next
+
+1. A launchd job in the root image that runs /private/var/tmp/autorun.sh
+   (so binaries from SWEETBOX start by themselves).
+2. G2b: port RedwoodGPU.cpp (topaz, from HackiOS, APSL) on the redwood_gpu_*
+   backend; SweetSurface fields drawn/planeCount/state only needed for G4.
+   A small userland test: open the user client, GEM_NEW, SUBMIT, WAIT_FENCE.
+3. G3: Mesa freedreno for Darwin (topaz build script), offscreen triangle.
+4. G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
+   Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
+   Bergamota has no licence file: use its notes, ask before copying code.
 
 References used for structure (no code copied): Linux msm a6xx driver,
 mxtpasontop/ios-sweet `gpu` branch (A618 on SM7150), Bergamota
