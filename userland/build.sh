@@ -3,7 +3,7 @@
 # arm64e), ad-hoc signed: the kernel makes signed binaries on the root
 # volume platform binaries (patch 0035), so no other signature is needed.
 #
-#   userland/build.sh            -> userland/out/{sweet-autorun,...}
+#   userland/build.sh            -> userland/out/{sweet-autorun,redwood-gpu-test}
 set -e
 cd "$(dirname "$0")"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -16,3 +16,4 @@ build() { # OUT SRC... [-- extra flags]
 	echo "out/$out"
 }
 build sweet-autorun autorun/sweet-autorun.c
+build redwood-gpu-test gputest/redwood-gpu-test.c -framework IOKit -framework CoreFoundation

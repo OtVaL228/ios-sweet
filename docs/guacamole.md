@@ -89,6 +89,7 @@ accesses. Register numbers: Linux v6.6 `a6xx.xml.h`, `a6xx_gmu.xml.h`.
 | 9 | zap via SCM PAS (INIT_IMAGE/MEM_SETUP/AUTH_AND_RESET), CP_SET_SECURE_MODE 0 | ok |
 | 10 | IB (CP_INDIRECT_BUFFER) + fence (CP_EVENT_WRITE CACHE_FLUSH_TS\|IRQ) | ok |
 | 11 | redwood_gpu_* backend (VA allocator, L3 tables on demand, submit/fence) + self-test | ok; RedwoodGPUStart is a weak stub |
+| G2b | RedwoodGPU.cpp user client (0117, topaz 0901 / HackiOS, APSL) on that backend; test userland/gputest | built, not yet run on the phone |
 
 Lessons:
 - MMIO to the GPU SMMU's SMR/S2CR is trapped by the hypervisor: use single
@@ -173,9 +174,15 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
 ## Next
 
 1. Done: autorun works on the phone (CI 40200983409, see Autorun).
-2. G2b: port RedwoodGPU.cpp (topaz, from HackiOS, APSL) on the redwood_gpu_*
-   backend; SweetSurface fields drawn/planeCount/state only needed for G4.
-   A small userland test: open the user client, GEM_NEW, SUBMIT, WAIT_FENCE.
+2. G2b: 0117 adds iokit/Kernel/arm/RedwoodGPU.cpp from topaz 0901 (the msm
+   DRM interface as a user client; HackiOS origin, APSL 2.0, attribution kept
+   in its header). Changes: buffers from 36-bit RAM, not contiguous (this
+   kernel's RAM is all above 4 GiB; topaz asked for < 4 GiB); SweetSurface
+   paths (surfaceBuffer, seed/drawn in submit, topaz_surface_drawn) off with
+   REDWOOD_SURFACES 0, needed for G4 (our SweetSurface has no `drawn`).
+   `userland/gputest/redwood-gpu-test.c`: GET_PARAM, GEM_NEW, map, IB with
+   CP_MEM_WRITE of 0x5eed0640, SUBMIT, WAIT_FENCE, prints "result: ... OK".
+   Run it from autorun.sh with sweetgpu=11.
 3. G3: Mesa freedreno for Darwin (topaz build script), offscreen triangle.
 4. G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
