@@ -212,8 +212,15 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    libOSMesa's install name is /private/var/tmp/libOSMesa.8.dylib: dyld
    refused `@executable_path` ("security policy does not allow @ path
    expansion"); our built-in AMFI does not answer dyld's policy query
-   (topaz 0902 does; worth doing before G4, which loads from other paths).
-4. G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
+   (topaz 0902 does). Fixed by 0121, see below.
+4. G4 prerequisite done: xnu 0121, our MAC policy is named "AMFI" and
+   answers dyld's amfi_check_dyld_policy_self (__sandbox_ms("AMFI", 90,
+   {in, *out}), checked in the IPSW's dyld) with all AMFI_DYLD_OUTPUT_*
+   flags but a custom shared cache. Phone (CI 40236282664): Mesa loads via
+   @executable_path, DYLD_INSERT_LIBRARIES runs our constructor in vm_stat
+   ("SWEET INSERT"), DYLD_PRINT_LIBRARIES lists the images. Other AMFI ops
+   return ENOSYS (topaz answers 0: ExtensionKit/PosterBoard need that).
+   G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.
 
