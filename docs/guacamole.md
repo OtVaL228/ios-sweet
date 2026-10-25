@@ -116,6 +116,11 @@ Lessons:
   writes need AP[1]. FSR bit 3 is a permission fault (bit 1 is translation).
 - CP_EVENT_WRITE's TIMESTAMP flag stores the CP counter; the payload fence is
   CACHE_FLUSH_TS | IRQ. RBBM_INT_0_STATUS stays 0 while RBBM_INT_0_MASK is 0.
+- XNU's pmap_sync_page_attributes_phys() computes `pp << PAGE_SHIFT` in 32
+  bits: any page above 4 GiB (all our RAM) whose cache mode changes (a
+  write-combined IOBufferMemoryDescriptor) panics in phystokv_range with the
+  truncated PA. Apple never hits it (coherent I/O: flush_dcache is a no-op).
+  Fixed in 0120 with ptoa().
 - Grown L3 tables are separate pages: keep their kernel VA. Client VA from
   0x1100000 shares 2 MB slot 8 with the stage-7 block: reuse its L3.
 
