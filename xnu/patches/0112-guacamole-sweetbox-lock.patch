@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c112025..278bc5c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -700,33 +700,56 @@ int
+ sweet_ufs_read_partition(const char *part, uint64_t offset, uint32_t size,
+     void **buf_out)
+ {
++	/* The root filesystem uses the same controller state and bounce buffer
++	 * (under sweet_ufs_lock): look the partition up once under the lock,
++	 * then copy chunk by chunk, each chunk under the lock with su's
++	 * partition bounds swapped in and restored before unlocking. */
++	if (size == 0 || size > 64u * 1024u * 1024u) {
++		return EINVAL;
++	}
++	vm_offset_t kva;
++	if (kmem_alloc(kernel_map, &kva, size, KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
+ 	uint64_t saved_first = su.first_block, saved_n = su.nblocks;
+ 	int err = ufs_find_partition(part);
+-	if (err) { return err; }
+ 	uint64_t part_lba = su.first_block, part_n = su.nblocks;
+-	su.first_block = saved_first; su.nblocks = saved_n;
+-	if (size == 0 || size > 64u * 1024u * 1024u) { return EINVAL; }
+-	vm_offset_t kva;
+-	if (kmem_alloc(kernel_map, &kva, size, KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
+-		return ENOMEM;
++	su.first_block = saved_first;
++	su.nblocks = saved_n;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (err) {
++		kmem_free(kernel_map, kva, size);
++		return err;
++	}
+ 	uint8_t *dst = (uint8_t *)kva;
+-	su.first_block = part_lba; su.nblocks = part_n;
+ 	uint64_t lba0 = offset / UFS_BLOCK;
+ 	uint32_t total = (size + UFS_BLOCK - 1) / UFS_BLOCK, done = 0;
+ 	while (!err && done < total) {
+ 		uint32_t n = total - done;
+-		if (n > BOUNCE_SIZE / UFS_BLOCK) n = BOUNCE_SIZE / UFS_BLOCK;
+-		if (lba0 + done + n > su.nblocks) { err = EIO; break; }
+-		err = ufs_read_blocks(su.first_block + lba0 + done, n);
+-		if (err) break;
+-		uint32_t bytes = n * UFS_BLOCK;
+-		uint32_t doff = done * UFS_BLOCK;
+-		if (doff + bytes > size) bytes = size - doff;
+-		memcpy(dst + doff, (const uint8_t *)(su.dma + DMA_BOUNCE), bytes);
++		if (n > BOUNCE_SIZE / UFS_BLOCK) {
++			n = BOUNCE_SIZE / UFS_BLOCK;
++		}
++		if (lba0 + done + n > part_n) {
++			err = EIO;
++			break;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		err = ufs_read_blocks(part_lba + lba0 + done, n);
++		if (!err) {
++			uint32_t doff = done * UFS_BLOCK, bytes = n * UFS_BLOCK;
++			if (doff + bytes > size) {
++				bytes = size - doff;
++			}
++			memcpy(dst + doff, (const uint8_t *)(su.dma + DMA_BOUNCE), bytes);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
+ 		done += n;
+ 	}
+-	su.first_block = saved_first; su.nblocks = saved_n;
+-	if (err) { kmem_free(kernel_map, kva, size); return err; }
++	if (err) {
++		kmem_free(kernel_map, kva, size);
++		return err;
++	}
+ 	*buf_out = (void *)kva;
+ 	return 0;
+ }
+@@ -734,14 +757,21 @@ sweet_ufs_read_partition(const char *part, uint64_t offset, uint32_t size,
+ int
+ sweet_ufs_stamp_partition(const char *part, const uint8_t sector[512])
+ {
++	lck_mtx_lock(&sweet_ufs_lock);
+ 	uint64_t saved_first = su.first_block, saved_n = su.nblocks;
+ 	int err = ufs_find_partition(part);
+-	if (err) return err;
+-	uint64_t lba = su.first_block;
+-	su.first_block = lba; su.nblocks = 1;
+-	memcpy((uint8_t *)(su.dma + DMA_BOUNCE), sector, UFS_BLOCK);
+-	err = ufs_write_blocks(lba, 1);
+-	su.first_block = saved_first; su.nblocks = saved_n;
++	if (!err) {
++		/* ufs_write_blocks only writes inside su's bounds: bound it to the
++		 * named partition's first block for this one write. */
++		uint64_t lba = su.first_block;
++		su.nblocks = 1;
++		bzero((uint8_t *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		memcpy((uint8_t *)(su.dma + DMA_BOUNCE), sector, 512);
++		err = ufs_write_blocks(lba, 1);
++	}
++	su.first_block = saved_first;
++	su.nblocks = saved_n;
++	lck_mtx_unlock(&sweet_ufs_lock);
+ 	return err;
+ }
+ 

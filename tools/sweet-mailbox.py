@@ -25,7 +25,8 @@ MAGIC = b'SWEETBOX'      # 8 bytes: present = extract this boot
 MAGIC_DONE = b'SWEETDNE'  # 8 bytes: already extracted, skip
 
 def cmd_pack(args):
-    if len(args) < 2 or len(args) % 2 != 0:
+    # OUT, then pairs: len(args) must be odd and >= 3
+    if len(args) < 3 or (len(args) - 1) % 2 != 0:
         sys.exit('usage: pack OUT DST1 SRC1 [DST2 SRC2 ...]')
     out_path = args[0]
     pairs = [(args[i], args[i+1]) for i in range(1, len(args), 2)]
