@@ -2,6 +2,12 @@
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
   sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sweet-root-tweaks.py --launchd-plist IN OUT
+
+The second form only applies the launchd.plist changes to a copy of the file
+(IN: /System/Library/xpc/launchd.plist from the IPSW or the phone), for
+installing it through SWEETBOX as ROOT/System/Library/xpc/launchd.plist
+(docs/guacamole.md, "Autorun").
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -11,7 +17,9 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  crash-loops and Setup blocks on its CoreTelephony XPC);
+                  job com.sweet.autorun runs /usr/libexec/sweet-autorun
+                  (userland/autorun) at boot
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -54,10 +62,24 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
+AUTORUN_KEY = '/System/Library/LaunchDaemons/com.sweet.autorun.plist'
+AUTORUN_JOB = {
+    'Label': 'com.sweet.autorun',
+    'ProgramArguments': ['/usr/libexec/sweet-autorun'],
+    'RunAtLoad': True,
+    'POSIXSpawnType': 'Interactive',
+}
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
-    st = os.stat(path)
-    plist = load(path)
+    launchd_plist(path, path)
+
+
+def launchd_plist(src, dst):
+    """launchd.plist edits; dst keeps src's owner and mode if it exists."""
+    st = os.stat(dst if os.path.exists(dst) else src)
+    plist = load(src)
     jobs = plist['LaunchDaemons']
     renamed = 0
     for job in jobs.values():
@@ -67,8 +89,10 @@ def launchd(root):
     removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
     for k in removed:
         del jobs[k]
-    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    jobs[AUTORUN_KEY] = dict(AUTORUN_JOB)
+    save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed, '
+          f'{AUTORUN_JOB["Label"]} added')
 
 
 def containers(root):
@@ -123,6 +147,9 @@ def audio(root):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--launchd-plist':
+        launchd_plist(sys.argv[2], sys.argv[3])
+        return
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]

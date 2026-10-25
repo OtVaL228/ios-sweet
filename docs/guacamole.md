@@ -126,10 +126,46 @@ Lessons:
 sweet_ufs only talks to UFS LUN 0 (sda): rawdump/op2/userdata live there,
 logdump does not. Reads/stamps take sweet_ufs_lock.
 
+### Autorun
+
+launchd here takes every system job from the cache
+`/System/Library/xpc/launchd.plist` (launchd_cache_loader, unsigned because
+of `launchd_unsecure_cache=1`; launchd's own strings: "system services must
+be in cache"). Its bootstrap paths are all on the root volume, none under
+/private/var, and the system has no `/bin/sh`. So autorun needs one change to
+the root: a job in that cache, plus the program it runs. Both go in through
+SWEETBOX instead of reflashing userdata:
+
+- 0115: entries named `ROOT/<path>` are written to `/<path>` right after the
+  root mounts (bsd_init, before launchd), with boot-arg `sweetboxroot=1`.
+  A broken launchd.plist can be replaced the same way on the next boot.
+- 0116: the kernel writes `/private/var/tmp/SWEETBOX.done` after extracting;
+  `sweet-autorun` is in the default `sweetnull` list (its stdout -> log).
+- `tools/sweet-root-tweaks.py` adds job `com.sweet.autorun`
+  (`/usr/libexec/sweet-autorun`, RunAtLoad). `userland/autorun/sweet-autorun.c`
+  waits for SWEETBOX.done of this boot, renames autorun.sh to autorun.sh.ran
+  and runs it line by line (no shell: words, quotes, `&`, builtins cd, sleep,
+  export, echo, wait, exit). Output lines appear in the log as `SWEET RUN:`.
+- The phone's launchd.plist is the IPSW one + the sweet-root-tweaks.py edits
+  (checked byte for byte in ios16-root.img, offset 0x1e025f000), so it can be
+  regenerated from the IPSW; keep `launchd.tweaked.plist` (without the job)
+  as the rescue box.
+
+One-time install:
+```
+userland/build.sh
+python3 tools/sweet-root-tweaks.py --launchd-plist IPSW_OS/System/Library/xpc/launchd.plist launchd.plist
+python3 tools/sweet-mailbox.py pack box.img \
+  ROOT/System/Library/xpc/launchd.plist launchd.plist \
+  ROOT/usr/libexec/sweet-autorun userland/out/sweet-autorun \
+  autorun.sh autorun.sh
+```
+Boot with `sweetmailbox=1 sweetboxpart=rawdump sweetboxroot=1`. Later boxes
+only carry autorun.sh and its files (no `sweetboxroot`).
+
 ## Next
 
-1. A launchd job in the root image that runs /private/var/tmp/autorun.sh
-   (so binaries from SWEETBOX start by themselves).
+1. Autorun: 0115/0116 + sweet-autorun written, not yet run on the phone (see Autorun).
 2. G2b: port RedwoodGPU.cpp (topaz, from HackiOS, APSL) on the redwood_gpu_*
    backend; SweetSurface fields drawn/planeCount/state only needed for G4.
    A small userland test: open the user client, GEM_NEW, SUBMIT, WAIT_FENCE.

@@ -17,7 +17,12 @@ Usage:
 The kernel (sweet_mailbox.c, sweetmailbox=1) reads logdump after the root
 mounts, extracts each file to /private/var/tmp/<name> (flat: '/' -> '_'),
 then writes a 512-byte "done" block at offset 0 to stop re-extraction.
-Permissions are 0755 for binaries (no extension) and 0644 for everything else.
+New files are created 0755 root:wheel; existing files keep their mode.
+
+Names starting with ROOT/ are root installs: with boot-args sweetmailbox=1
+sweetboxroot=1 the kernel writes ROOT/<path> to /<path> right after the root
+mounts, before launchd (patch 0115; the parent directory must exist). After
+each extraction the kernel writes /private/var/tmp/SWEETBOX.done (0116).
 """
 import struct, sys, os
 

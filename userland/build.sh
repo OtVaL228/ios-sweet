@@ -1,0 +1,18 @@
+#!/bin/sh
+# Build the ios-sweet userland helpers for the iOS 16 root (arm64, A11: no
+# arm64e), ad-hoc signed: the kernel makes signed binaries on the root
+# volume platform binaries (patch 0035), so no other signature is needed.
+#
+#   userland/build.sh            -> userland/out/{sweet-autorun,...}
+set -e
+cd "$(dirname "$0")"
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+CC="xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -isysroot $SDK -O2 -Wall -Wextra"
+mkdir -p out
+build() { # OUT SRC... [-- extra flags]
+	out=$1; shift
+	$CC -o "out/$out" "$@"
+	codesign -f -s - "out/$out"
+	echo "out/$out"
+}
+build sweet-autorun autorun/sweet-autorun.c

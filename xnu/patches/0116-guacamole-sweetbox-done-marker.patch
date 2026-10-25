@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 291a546..cccf127 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -158,8 +158,8 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
+  * SWEET: daemons started by launchd write stdout/stderr to /dev/null, and
+  * pointing a launchd job at /dev/console stops it from launching at all
+  * (backboardd, v8 image). Instead, what the processes named in boot-arg
+- * sweetnull (comma separated, default "backboardd,SpringBoard") write to
+- * /dev/null goes to the console (and so to the persistent log) as
++ * sweetnull (comma separated, default "backboardd,SpringBoard,sweet-autorun")
++ * write to /dev/null goes to the console (and so to the persistent log) as
+  * "|name| text". sweetnull=- turns it off.
+  */
+ static char sweet_null_names[128];
+@@ -170,7 +170,7 @@ sweet_null_tee(char *name, size_t len)
+ {
+ 	if (!sweet_null_parsed) {
+ 		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
+-			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
++			strlcpy(sweet_null_names, "backboardd,SpringBoard,sweet-autorun", sizeof(sweet_null_names));
+ 		}
+ 		sweet_null_parsed = 1;
+ 	}
+diff --git a/bsd/dev/sweet_mailbox.c b/bsd/dev/sweet_mailbox.c
+index 2891f7b..ef155f9 100644
+--- a/bsd/dev/sweet_mailbox.c
++++ b/bsd/dev/sweet_mailbox.c
+@@ -15,6 +15,10 @@
+  * the root right after it mounts (bsd_init, before launchd), so a
+  * launchd.plist from the box is used by this very boot, and a broken one
+  * can be replaced the same way. The parent directory must exist.
++ *
++ * After each extraction the thread writes BOX_DONE_FILE (its text: how many
++ * files). /usr/libexec/sweet-autorun waits for it before it runs
++ * /private/var/tmp/autorun.sh, so every file from the box is in place.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -39,6 +43,7 @@ extern int sweet_ufs_stamp_partition(const char *part, const uint8_t sector[512]
+ #define BOX_MAGIC_LEN  8
+ #define BOX_MAX_SIZE   (64u * 1024u * 1024u)
+ #define BOX_BASE_DIR   "/private/var/tmp"
++#define BOX_DONE_FILE  BOX_BASE_DIR "/SWEETBOX.done"
+ #define BOX_ROOT       "ROOT/"
+ #define BOX_ROOT_LEN   5
+ 
+@@ -217,6 +222,10 @@ box_thread(void *arg, wait_result_t wr)
+ 	unsigned root_total = nfiles - total;
+ 	printf("SWEET BOX: done, %u/%u files, %u/%u root files\n",
+ 	    extracted, total, box_root_installed, root_total);
++	char done[32];
++	int n = snprintf(done, sizeof(done), "%u/%u\n", extracted, total);
++	int derr = box_write_file(BOX_DONE_FILE, (const uint8_t *)done, (uint32_t)n, vfs_context_kernel());
++	printf("SWEET BOX: wrote " BOX_DONE_FILE ": %d\n", derr);
+ 	if (extracted == total && box_root_installed == root_total) {
+ 		uint8_t stamp[512];
+ 		bzero(stamp, sizeof(stamp));
