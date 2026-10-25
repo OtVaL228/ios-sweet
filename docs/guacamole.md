@@ -199,7 +199,15 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    Run it from autorun.sh with sweetgpu=11. Works on the phone (see table);
    the service appears ~70 s after the test starts (GPU stages begin 60 s
    after the kernel), the test waits for it.
-3. G3: Mesa freedreno for Darwin (topaz build script), offscreen triangle.
+3. G3: Mesa freedreno for Darwin, offscreen triangle. `userland/mesa/`:
+   topaz's Mesa patches and redwood-drm (HackiOS, MIT, README.md), our
+   `mk-mesa.sh` (Mesa 25.0.7, freedreno + softpipe, OSMesa; needs Homebrew
+   bison 3 for the ir3 parser). Mesa knows A640 as GPUId(640) (chip id
+   0x060400ff matches 0x06040001); the msm version 1.7 we report selects the
+   softpin path (no relocs), which RedwoodGPU requires.
+   `userland/gputest/osmesa-triangle.c`: red triangle on blue, 128x128,
+   checks pixels, prints the picture as text; softpipe first
+   (OSMESA_SOFTWARE=1), then freedreno. Built, not yet run on the phone.
 4. G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.

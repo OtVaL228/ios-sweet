@@ -10,3 +10,4 @@ xnu/out-*/
 __pycache__/
 research/gpu/fw/
 userland/out/
+userland/mesa/build/
