@@ -7,8 +7,8 @@ in for libdrm: each msm DRM request becomes a call of the user client with the
 request number as the selector.
 
 Output: `build/out/libOSMesa.8.dylib` (ad-hoc signed, install name
-`@executable_path/libOSMesa.8.dylib`, so it can sit next to the test program in
-/private/var/tmp after a SWEETBOX drop).
+`/private/var/tmp/libOSMesa.8.dylib`, where a SWEETBOX drop puts it: dyld
+refuses `@executable_path` under our built-in AMFI).
 
 ## Origin and licence
 

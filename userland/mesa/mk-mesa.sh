@@ -65,7 +65,9 @@ BUILD=build-${DRIVERS//,/-}
 ninja -C $BUILD > ninja.log
 mkdir -p out
 $(xcrun -f strip) -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
-install_name_tool -id @executable_path/libOSMesa.8.dylib out/libOSMesa.8.dylib
+# dyld refuses @executable_path here: our built-in AMFI does not allow @ path
+# expansion (amfi_check_dyld_policy_self). SWEETBOX puts files in /private/var/tmp.
+install_name_tool -id /private/var/tmp/libOSMesa.8.dylib out/libOSMesa.8.dylib
 codesign -f -s - out/libOSMesa.8.dylib
 cp mesa-$VERSION/include/GL/osmesa.h out/
 ls -l out
