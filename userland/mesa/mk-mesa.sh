@@ -65,9 +65,12 @@ BUILD=build-${DRIVERS//,/-}
 ninja -C $BUILD > ninja.log
 mkdir -p out
 $(xcrun -f strip) -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
-# dyld refuses @executable_path here: our built-in AMFI does not allow @ path
-# expansion (amfi_check_dyld_policy_self). SWEETBOX puts files in /private/var/tmp.
-install_name_tool -id /private/var/tmp/libOSMesa.8.dylib out/libOSMesa.8.dylib
+# @rpath (needs xnu 0121: our AMFI lets dyld expand @ paths): tests in
+# /private/var/tmp find it next to them, libsweet-gl in /usr/lib.
+install_name_tool -id @rpath/libOSMesa.8.dylib out/libOSMesa.8.dylib
 codesign -f -s - out/libOSMesa.8.dylib
 cp mesa-$VERSION/include/GL/osmesa.h out/
+# for userland/gpu/mkeagl.py: what the library exports, and the GL registry
+nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
+cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml out/gl.xml
 ls -l out

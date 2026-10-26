@@ -7,8 +7,8 @@ in for libdrm: each msm DRM request becomes a call of the user client with the
 request number as the selector.
 
 Output: `build/out/libOSMesa.8.dylib` (ad-hoc signed, install name
-`/private/var/tmp/libOSMesa.8.dylib`, where a SWEETBOX drop puts it: dyld
-refuses `@executable_path` under our built-in AMFI).
+`@rpath/libOSMesa.8.dylib`; @ paths need xnu 0121), plus `exported-gl.txt`
+and `gl.xml` for `userland/gpu/mkeagl.py`.
 
 ## Origin and licence
 

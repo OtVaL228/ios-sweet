@@ -220,12 +220,23 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    @executable_path, DYLD_INSERT_LIBRARIES runs our constructor in vm_stat
    ("SWEET INSERT"), DYLD_PRINT_LIBRARIES lists the images. Other AMFI ops
    return ENOSYS (topaz answers 0: ExtensionKit/PosterBoard need that).
-   G4 step 1 (written, not yet run): com.apple.backboardd runs
+   G4 step 1 works (phone: "|backboardd| SWEET BBD: library loaded into pid
+   57 (uid 501)", lock screen and touch as before): com.apple.backboardd runs
    /usr/libexec/sweet-bbd (userland/bbd), which puts
    /usr/lib/libsweet-bbd.dylib into DYLD_INSERT_LIBRARIES and execs the
    real backboardd (same pid and Mach services). Boot-arg sweetbbd=0 leaves
    the library out. Installed with a ROOT/ box; rescue box = the previous
    launchd.plist.
+   G4 step 2: eagl_slots.txt (HackiOS, read off iOS 16.5 OpenGLES) checked
+   against our 16.7.16 OpenGLES from the IPSW's dyld cache
+   (tools/check-eagl-slots.py, dsc_extractor.bundle from Xcode): all 457
+   names at the same offsets. The functions jump through [ctx + slot + 0x20],
+   ctx = [TPIDRRO_EL0 + 0xf0].
+   G4 step 3 (written, not yet run): userland/gpu (eagl.c, gl_osmesa.c,
+   mkeagl.py; README.md for origin and MIT notices) -> /usr/lib/libsweet-gl
+   .dylib on /usr/lib/libOSMesa.8.dylib (@rpath). libsweet-bbd waits in its
+   constructor (before backboardd's main) for RedwoodGPU, up to sweetglwait
+   (180 s), then dlopens it; sweetgl=0 keeps the software renderer.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.
