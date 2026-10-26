@@ -253,8 +253,15 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    state page at client+0x70 = 0. CoreAnimation had wrapped an image with
    IOSurfaceWrapClientImage (IOSurfaceRoot selector 6), our default case
    answered success with a zeroed lock result. 0123 (topaz 0131) refuses
-   such calls. Still open: 'b3a8' render target (topaz 0132 implements
-   wrap client image/memory; eagl.c wants 'BGRA').
+   such calls.
+   Third run (gl3, 0123): no more crashes, CoreAnimation renders frames
+   through Mesa (136 GL calls, 4 draws in frame 1) but "none into an
+   IOSurface that is known here": the screen surface is 'b3a8', which
+   eagl.c cannot attach, so the screen stayed black. 0124: SweetSurface
+   makes 'w30r', 'l10r', 'w30R' and 'b3a8' one-plane BGRA (from topaz 0900 /
+   HackiOS); sweetsurf10=1 keeps them. The display path already copies
+   plane 0 as 4-byte BGRA. Later: topaz 0132 (wrap client image/memory) for
+   speed.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.

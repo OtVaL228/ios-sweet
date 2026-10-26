@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 16aaf1e..1e26edb 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -288,6 +288,32 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * 10-bit wide-colour formats the iPhone X userland asks for ('w30r',
++	 * 'l10r', 'w30R', and 'b3a8' with its separate alpha plane) become
++	 * one-plane BGRA: the panel is 8-bit sRGB, the display path copies 4-byte
++	 * BGRA pixels, and the GL renderer (userland/gpu/eagl.c) can only draw
++	 * into BGRA. The client reads the format back from the lock result and
++	 * draws accordingly. G4 run gl3: CoreAnimation's screen surface was
++	 * 'b3a8', eagl.c could not attach it, every frame went nowhere (black).
++	 * From topaz (MakrSas/ios-topaz) 0900, which took it from HackiOS; APSL.
++	 * Boot-arg sweetsurf10=1 keeps the formats as asked.
++	 */
++	bool one_plane = false;
++	static int keep10 = -1;
++	if (keep10 < 0) {
++		int v = 0;
++		keep10 = PE_parse_boot_argn("sweetsurf10", &v, sizeof(v)) && v != 0;
++	}
++	if (!keep10) {
++		if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u ||
++		    s->pixelFormat == 0x77333052u) {
++			s->pixelFormat = 0x42475241u;           /* 'BGRA' */
++		} else if (s->pixelFormat == 0x62336138u) {
++			s->pixelFormat = 0x42475241u;
++			one_plane = true;
++		}
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -301,7 +327,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
