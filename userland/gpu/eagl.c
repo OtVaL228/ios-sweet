@@ -58,6 +58,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -325,6 +326,8 @@ static int trace_look;                          /* boot-arg gltrace_look=1: ... 
 static float trace_middle[2];                   /* ... which is here, as CoreAnimation counts */
 static int trace_listed;                        /* the draw at hand is one of them */
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
+static int who_lines;                           /* ios-sweet, boot-arg glwho=1: see who_made() */
+static void who_made(const char *how, IOSurfaceRef surface, GLint texture);
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
@@ -697,6 +700,13 @@ surface_changed(struct eagl *e, struct image *image)
 	if (sum == image->sum) {
 		image->quiet++;
 		return false;
+	}
+	if (who_lines && image->sum != 0 && IOSurfaceGetPixelFormat(surface) == 0) {
+		static unsigned changes;
+		if (changes++ < 40) {
+			say("redwood-gl: who: surface %u (%zu x %zu, no format) changed, frame %u\n", IOSurfaceGetID(surface),
+			    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), e->frames);
+		}
 	}
 	image->sum = sum;
 	image->quiet = 0;
@@ -3524,6 +3534,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 		    height, plane, invert ? ", inverted" : "");
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
+	who_made("-texImageIOSurface:", surface, texture);
 	began = now_us();
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
@@ -3532,6 +3543,48 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
 	return YES;
+}
+
+/*
+ * ios-sweet (glwho=1): for a surface with no pixel format given to a texture, who in
+ * CoreAnimation does it (return addresses, unslid by the dyld cache's slide, for symbolication
+ * against the IPSW's cache), how much of its memory is not zero then, and its seed. G4 run gl7:
+ * the home screen's app icons are drawn from 180 x 180 such surfaces whose textures are empty.
+ */
+static void
+who_made(const char *how, IOSurfaceRef surface, GLint texture)
+{
+	static unsigned told;
+	static intptr_t slide = -1;
+	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	size_t size = IOSurfaceGetBytesPerRow(surface) * IOSurfaceGetHeight(surface), set = 0;
+	uintptr_t *fp = __builtin_frame_address(0);
+	char chain[256];
+	size_t used = 0;
+
+	if (!who_lines || told >= 40 || IOSurfaceGetPixelFormat(surface) != 0) {
+		return;
+	}
+	told++;
+	if (slide == -1) {
+		for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+			const char *name = _dyld_get_image_name(i);
+			if (name != NULL && strstr(name, "/QuartzCore.framework/QuartzCore") != NULL) {
+				slide = _dyld_get_image_vmaddr_slide(i);
+			}
+		}
+	}
+	for (size_t at = 0; base != NULL && at < size; at++) {
+		set += base[at] != 0;
+	}
+	chain[0] = 0;
+	for (unsigned depth = 0; depth < 6 && fp != NULL && used < sizeof(chain); depth++) {
+		used += (size_t)snprintf(chain + used, sizeof(chain) - used, " %#lx", (unsigned long)(fp[1] - (uintptr_t)slide));
+		fp = (uintptr_t *)fp[0];
+	}
+	say("redwood-gl: who: %s surface %u (%zu x %zu, no format) texture %d: %zu of %zu bytes set, seed %u; from%s\n", how,
+	    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), texture, set, size,
+	    IOSurfaceGetSeed(surface), chain);
 }
 
 /* (the "image" is the target, GL_TEXTURE_2D, and means the texture bound to it) */
@@ -3579,6 +3632,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * there being no pixel format.
 	 */
 	image->wrapped = image->alpha_first = pixels == 0;
+	who_made("-attachImage:", surface, texture);
 	note_format("IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width, image->height);
 	/*
 	 * What is attached is as often read as drawn into (a picture CoreAnimation has made a surface
@@ -3701,6 +3755,7 @@ install(void)
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
+		who_lines = strstr(arguments, "glwho=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {

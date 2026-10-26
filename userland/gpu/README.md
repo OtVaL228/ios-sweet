@@ -16,6 +16,9 @@ the kernel has published RedwoodGPU.
   `gl.xml` and the list of functions libOSMesa exports.
 - `gl_osmesa.c`, `redwood_gl.h`: the OSMesa side.
 
+Changes of ours in `eagl.c`: the glwho=1 debug lines (`who_made()`, and a
+line when a surface with no pixel format changes), marked "ios-sweet".
+
 ## Origin and licence
 
 `eagl.c`, `gl_osmesa.c` and `redwood_gl.h` are taken from
