@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..16aaf1e 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -773,6 +773,22 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
++		/*
++		 * A call that answers with a lock result (wrap client image 6 and
++		 * memory 7) must not succeed with zeroes: IOSurface.framework builds
++		 * a client from it with no shared state page, and CoreAnimation's
++		 * GL renderer then reads the EDR factor there
++		 * (IOSurfaceClientGetBulkAttachments, client+0x70 = 0): backboardd
++		 * crashed at 0x30, 108 times (G4 run gl2). Refused, the framework
++		 * returns NULL and CoreAnimation takes its other path. From topaz
++		 * (MakrSas/ios-topaz) 0131, same SweetSurface lineage, APSL 2.0.
++		 */
++		if ((args->structureOutputDescriptor != NULL &&
++		    args->structureOutputDescriptor->getLength() >= SWEET_SURFACE_RESULT_SIZE) ||
++		    (args->structureOutput != NULL && args->structureOutputSize >= SWEET_SURFACE_RESULT_SIZE)) {
++			sweet_surf_log_once("sel (refused: lock result)", selector);
++			return kIOReturnUnsupported;
++		}
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;

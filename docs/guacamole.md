@@ -243,6 +243,18 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    flushed before the submit and the poll did not invalidate the fence page
    (cached stale 0); the backend start had the same order bug. 0122 fixes
    both.
+   Second run (gl2, 0122): stage 10 ok, RedwoodGPU after 94 s, libsweet-gl
+   loaded, CoreAnimation made an OpenGL ES 3.2 context on FD640 (7/7
+   EAGLContext methods ours, first shaders compiled). Then: the screen
+   surface is 'b3a8' (2 planes, 10-bit wide colour), which eagl.c cannot
+   attach ("not done", glDrawElements 0x506), and backboardd crashed 108
+   times (SIGSEGV at 0x30): render_contents_background -> wrap_buffer ->
+   iosurface_get_edr_factor -> IOSurfaceClientGetBulkAttachments reads the
+   state page at client+0x70 = 0. CoreAnimation had wrapped an image with
+   IOSurfaceWrapClientImage (IOSurfaceRoot selector 6), our default case
+   answered success with a zeroed lock result. 0123 (topaz 0131) refuses
+   such calls. Still open: 'b3a8' render target (topaz 0132 implements
+   wrap client image/memory; eagl.c wants 'BGRA').
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.
