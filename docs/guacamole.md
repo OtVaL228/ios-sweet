@@ -272,6 +272,14 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    reach eagl.c -> libsweet-bbd hooks GLESContext function_supported /
    function_uniform (vtable 0x1d5b2f6e8 +0x10 +0x378/+0x388, checked in our
    cache; scheme from HackiOS inject.c); sweetglfn=0 turns that off.
+   gl5-gl9: red veil gone (hooks on); icons still missing. Traced: each icon
+   is drawn from a 180x180 surface with no pixel format that backboardd
+   makes for a CoreAnimation deferred image slot
+   (DeferredImageSlotIOSurface::realize_buffer); GLESContext::
+   attach_surface_texture gives it to -texImageIOSurface: all zero. Only
+   backboardd touches it (sweetsurflog, 0126): create, lock for writing,
+   unlock (seed 1), then eagl.c reads zeros. 0127 counts the bytes set at
+   each event to tell "nothing was written" from "eagl.c reads elsewhere".
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.

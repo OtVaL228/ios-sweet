@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 008546c..9902635 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -489,9 +489,18 @@ sweet_surf_watch(const char *what, SweetSurface *s, uint64_t extra)
+ 	lines++;
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET SURF: watch %s %s id %u seed %u %#llx\n", name, what, s->id,
++	/* 0127: how much of the pixels is not zero now (what a lock for writing left there) */
++	uint64_t set = 0, size = (uint64_t)s->bytesPerRow * s->height;
++	const uint8_t *pixels = (const uint8_t *)s->kernelAddress();
++	if (pixels != NULL && s->memory != NULL && size <= s->memory->getLength()) {
++		pixels += s->wrapDelta;
++		for (uint64_t i = 0; i < size; i++) {
++			set += pixels[i] != 0;
++		}
++	}
++	IOLog("SWEET SURF: watch %s %s id %u seed %u %#llx: %llu of %llu bytes set\n", name, what, s->id,
+ 	    s->state != NULL ? *(uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0,
+-	    (unsigned long long)extra);
++	    (unsigned long long)extra, (unsigned long long)set, (unsigned long long)size);
+ }
+ 
+ static void
