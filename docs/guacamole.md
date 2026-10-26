@@ -260,8 +260,18 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    eagl.c cannot attach, so the screen stayed black. 0124: SweetSurface
    makes 'w30r', 'l10r', 'w30R' and 'b3a8' one-plane BGRA (from topaz 0900 /
    HackiOS); sweetsurf10=1 keeps them. The display path already copies
-   plane 0 as 4-byte BGRA. Later: topaz 0132 (wrap client image/memory) for
-   speed.
+   plane 0 as 4-byte BGRA.
+   Fourth run (gl4, 0124): first UI drawn by the Adreno 640 (lock screen,
+   home screen, touch), no crashes. Three faults: (1) frames take 166-195
+   ms, ~155-160 of them copying the 11 MB frame out of the GPU's texture
+   into the screen surface ("a copy"), plus a 10.8 MB texture refilled from
+   an IOSurface each frame -> zero-copy (REDWOOD_SURFACES) next; (2) app
+   icons missing: CoreAnimation wraps images with IOSurfaceWrapClientImage,
+   refused since 0123 -> 0125 implements selectors 6/7 (topaz 0132);
+   (3) red lock screen: the vibrantColorMatrix filter's numbers never
+   reach eagl.c -> libsweet-bbd hooks GLESContext function_supported /
+   function_uniform (vtable 0x1d5b2f6e8 +0x10 +0x378/+0x388, checked in our
+   cache; scheme from HackiOS inject.c); sweetglfn=0 turns that off.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.
