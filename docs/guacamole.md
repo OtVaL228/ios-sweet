@@ -236,7 +236,13 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    mkeagl.py; README.md for origin and MIT notices) -> /usr/lib/libsweet-gl
    .dylib on /usr/lib/libOSMesa.8.dylib (@rpath). libsweet-bbd waits in its
    constructor (before backboardd's main) for RedwoodGPU, up to sweetglwait
-   (180 s), then dlopens it; sweetgl=0 keeps the software renderer.
+   (120 s), then dlopens it; sweetgl=0 keeps the software renderer.
+   First run (gl1): no GL, because stage 10 failed for the first time (IB
+   ran, fence read as 0 for 500 ms) and RedwoodGPU was not published; boot
+   stalled 180 s in backboardd. Cause: the zeroed fence/scratch were never
+   flushed before the submit and the poll did not invalidate the fence page
+   (cached stale 0); the backend start had the same order bug. 0122 fixes
+   both.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.

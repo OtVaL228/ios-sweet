@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 2f615a4..2be2a8f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1793,6 +1793,17 @@ gpu_stage10(void)
+ 	scratch[0] = 0;
+ 	scratch[1] = 0;
+ 	*fence = 0;
++	/*
++	 * 0122: these zeroes must reach RAM before the GPU writes there, and
++	 * the polls below must not read (or write back) cached copies. Until
++	 * now neither page was flushed here and the poll only covered scratch
++	 * (0x50000..0x51fff), not the fence at 0x60000: one boot (gl1) read
++	 * scratch right and the fence as 0 for 500 ms, and RedwoodGPU was not
++	 * published.
++	 */
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_SCRATCH), 0x1000u, FALSE);
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCE), 0x1000u, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+ 	/* IB body: two CP_MEM_WRITE (opcode 61, 3 dwords: addr_lo, addr_hi, val). */
+ 	uint32_t *ib = (uint32_t *)(gpumem + GPUMEM_IB);
+@@ -1830,7 +1841,8 @@ gpu_stage10(void)
+ 	unsigned ms = 0;
+ 	uint32_t fv = 0, s0 = 0, s1 = 0;
+ 	for (; ms < 500; ++ms) {
+-		flush_dcache64((addr64_t)(gpumem + GPUMEM_SCRATCH), 0x2000u, FALSE);
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_SCRATCH), 0x1000u, FALSE);
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCE), 0x1000u, FALSE);
+ 		fv = *fence;
+ 		s0 = scratch[0];
+ 		s1 = scratch[1];
+@@ -2193,9 +2205,11 @@ gpu_backend_start(void)
+ 	uint64_t *l3 = (uint64_t *)(gpumem + 0x2000u);
+ 	l3[(GVA_FENCEMEM >> 12) & 0x1ffu] = (gpumem_pa + GPUMEM_FENCEMEM) | PTE_AF | PTE_SH_OS |
+ 	    PTE_AP_UNPRIV | PTE_PAGE;
+-	flush_dcache64((addr64_t)gpumem, GPUMEM_SIZE, FALSE);
+ 	be_fence = (volatile uint32_t *)(gpumem + GPUMEM_FENCEMEM);
+ 	*be_fence = 0;
++	/* 0122: flush after the zero, or redwood_gpu_done()'s first clean +
++	 * invalidate could write a stale 0 over the GPU's first fence. */
++	flush_dcache64((addr64_t)gpumem, GPUMEM_SIZE, FALSE);
+ 	/* 0109: the self-test IB at 0x1100000 shares 2 MB slot 8 with the
+ 	 * stage-7 kernel block (0x1000000..: SQE, ring, shadow, IB test, fence).
+ 	 * be_l3_for() saw no L3 recorded for slot 8, allocated a fresh one and

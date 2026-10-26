@@ -11,7 +11,7 @@
  * backboardd's main(), waits for the service and then loads the library.
  *
  * Boot-args: sweetgl=0 never loads it (software rendering as before),
- * sweetglwait=N waits at most N seconds (default 180).
+ * sweetglwait=N waits at most N seconds (default 120).
  *
  * backboardd's stdout/stderr go to /dev/null, which the kernel copies to the
  * console log for it (sweetnull, xnu 0048): lines show as
@@ -58,7 +58,7 @@ sweet_bbd_loaded(void)
 		fprintf(stderr, "SWEET BBD: no " GL_LIBRARY ": software renderer\n");
 		return;
 	}
-	long patience = boot_arg("sweetglwait", 180);
+	long patience = boot_arg("sweetglwait", 120);
 	long waited = 0;
 	io_service_t gpu;
 	while (!(gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU")))) {
