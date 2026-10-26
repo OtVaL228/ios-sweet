@@ -1,0 +1,83 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 325a4b7..008546c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -463,6 +463,37 @@ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+ 
+ static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+ 
++/*
++ * Boot-arg sweetsurflog=WxH: what every task does with surfaces of that size
++ * (mapped by create/lookup/wrap, port made, lock, unlock), at most 200 lines.
++ * G4 run gl8: the home screen's icons are 180 x 180 surfaces backboardd makes
++ * for CoreAnimation's deferred image slots, and they stay all zero.
++ */
++static void
++sweet_surf_watch(const char *what, SweetSurface *s, uint64_t extra)
++{
++	static int parsed;
++	static uint32_t want_w, want_h, lines;
++	if (!parsed) {
++		char spec[32] = "";
++		parsed = 1;
++		if (PE_parse_boot_arg_str("sweetsurflog", spec, sizeof(spec))) {
++			const char *x = strchr(spec, 'x');
++			want_w = (uint32_t)strtoul(spec, NULL, 10);
++			want_h = x != NULL ? (uint32_t)strtoul(x + 1, NULL, 10) : 0;
++		}
++	}
++	if (want_w == 0 || s == NULL || s->width != want_w || s->height != want_h || lines >= 200) {
++		return;
++	}
++	lines++;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: watch %s %s id %u seed %u %#llx\n", name, what, s->id,
++	    s->state != NULL ? *(uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0,
++	    (unsigned long long)extra);
++}
++
+ static void
+ sweet_surf_log_once(const char *what, uint32_t n)
+ {
+@@ -661,6 +692,7 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
++	sweet_surf_watch(existing ? "map (already)" : "map", s, ref->data->getAddress());
+ 	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
+ 	if (out == NULL) {
+ 		ret = kIOReturnNoMemory;
+@@ -895,6 +927,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		}
+ 		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
+ 		args->scalarOutputCount = 1;
++		sweet_surf_watch("port", s, args->scalarOutput[0]);
+ 		s->release();
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+@@ -965,7 +998,7 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+@@ -973,6 +1006,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++	sweet_surf_watch("lock", s, (uintptr_t)options);
+ 	s->release();
+ 	return ret;
+ }
+@@ -987,6 +1021,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	sweet_surf_watch("unlock", s, (uintptr_t)options);
+ 	s->release();
+ 	return ret;
+ }
