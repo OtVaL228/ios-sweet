@@ -18,7 +18,7 @@ build() { # OUT SRC... [-- extra flags]
 build sweet-autorun autorun/sweet-autorun.c
 build redwood-gpu-test gputest/redwood-gpu-test.c -framework IOKit -framework CoreFoundation
 build sweet-bbd bbd/sweet-bbd.c
-build libsweet-bbd.dylib bbd/bbd-insert.c -dynamiclib -install_name /usr/lib/libsweet-bbd.dylib \
+build libsweet-bbd.dylib bbd/bbd-insert.c -dynamiclib -install_name /usr/lib/libsweet-bbd.dylib -framework IOSurface -Wl,-not_for_dyld_shared_cache \
 	-framework IOKit -framework CoreFoundation
 build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_name /private/var/tmp/libsweet-insert-test.dylib
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)

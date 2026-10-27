@@ -19,6 +19,7 @@
  * "|backboardd| SWEET BBD: ...".
  */
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
@@ -30,6 +31,70 @@
 #include <unistd.h>
 
 #define GL_LIBRARY "/usr/lib/libsweet-gl.dylib"
+
+static long boot_arg(const char *name, long dfault);
+static intptr_t quartzcore_slide(void);
+
+/*
+ * Boot-arg sweetlockwho=1 (debug): who in backboardd locks and unlocks IOSurfaces that have no
+ * pixel format, and how many of their bytes are set by the unlock. G4 runs gl9/gl10: the home
+ * screen's icons are 180 x 180 such surfaces (CoreAnimation's deferred image slots) that
+ * backboardd locks for writing and unlocks with nothing written. IOSurfaceLock/Unlock are
+ * interposed (dyld allows it since xnu 0121); the chain is unslid by QuartzCore's slide.
+ */
+static int lock_who = -1;
+
+static void
+lock_report(const char *what, IOSurfaceRef surface, uint32_t options)
+{
+	static unsigned told;
+	if (lock_who < 0) {
+		lock_who = boot_arg("sweetlockwho", 0) != 0;
+	}
+	if (!lock_who || surface == NULL || IOSurfaceGetPixelFormat(surface) != 0 || told >= 60) {
+		return;
+	}
+	told++;
+	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	size_t size = IOSurfaceGetBytesPerRow(surface) * IOSurfaceGetHeight(surface), set = 0;
+	for (size_t i = 0; base != NULL && i < size; i++) {
+		set += base[i] != 0;
+	}
+	intptr_t slide = quartzcore_slide();
+	uintptr_t *fp = __builtin_frame_address(0);
+	char chain[256];
+	size_t used = 0;
+	chain[0] = 0;
+	for (unsigned depth = 0; depth < 8 && fp != NULL && used < sizeof(chain); depth++) {
+		used += (size_t)snprintf(chain + used, sizeof(chain) - used, " %#lx", (unsigned long)(fp[1] - (uintptr_t)slide));
+		fp = (uintptr_t *)fp[0];
+	}
+	fprintf(stderr, "SWEET BBD: %s surface %u %zux%zu options %#x: %zu of %zu bytes set; from%s\n", what,
+	    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), options, set, size, chain);
+}
+
+static kern_return_t
+my_IOSurfaceLock(IOSurfaceRef surface, IOSurfaceLockOptions options, uint32_t *seed)
+{
+	kern_return_t ret = IOSurfaceLock(surface, options, seed);
+	lock_report("lock", surface, options);
+	return ret;
+}
+
+static kern_return_t
+my_IOSurfaceUnlock(IOSurfaceRef surface, IOSurfaceLockOptions options, uint32_t *seed)
+{
+	lock_report("unlock", surface, options);
+	return IOSurfaceUnlock(surface, options, seed);
+}
+
+__attribute__((used)) static const struct {
+	const void *replacement;
+	const void *replacee;
+} interposers[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)my_IOSurfaceLock, (const void *)IOSurfaceLock },
+	{ (const void *)my_IOSurfaceUnlock, (const void *)IOSurfaceUnlock },
+};
 
 /*
  * CoreAnimation's OpenGL ES renderer gives a "function" (a filter such as
