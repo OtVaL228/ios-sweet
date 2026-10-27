@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 9902635..2535d84 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -38,6 +38,7 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
++#include <kern/backtrace.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -501,6 +502,23 @@ sweet_surf_watch(const char *what, SweetSurface *s, uint64_t extra)
+ 	IOLog("SWEET SURF: watch %s %s id %u seed %u %#llx: %llu of %llu bytes set\n", name, what, s->id,
+ 	    s->state != NULL ? *(uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0,
+ 	    (unsigned long long)extra, (unsigned long long)set, (unsigned long long)size);
++	/*
++	 * 0128: and for a lock or unlock, who in the task asked (its user stack, raw addresses:
++	 * subtract the dyld cache slide libsweet-bbd logs). Interposing IOSurfaceLock in
++	 * backboardd did not catch CoreAnimation's write lock of the icon surfaces (gl11).
++	 */
++	if (strncmp(what, "lock", 4) == 0 || strncmp(what, "unlock", 6) == 0) {
++		uintptr_t frames[10];
++		struct backtrace_user_info info = BTUINFO_INIT;
++		unsigned int n = backtrace_user(frames, 10, NULL, &info);
++		char chain[200];
++		size_t used = 0;
++		chain[0] = 0;
++		for (unsigned int i = 0; i < n && used < sizeof(chain); i++) {
++			used += (size_t)snprintf(chain + used, sizeof(chain) - used, " %#lx", (unsigned long)frames[i]);
++		}
++		IOLog("SWEET SURF: watch %s %s id %u from%s\n", name, what, s->id, chain);
++	}
+ }
+ 
+ static void
