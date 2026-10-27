@@ -280,6 +280,14 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    backboardd touches it (sweetsurflog, 0126): create, lock for writing,
    unlock (seed 1), then eagl.c reads zeros. 0127 counts the bytes set at
    each event to tell "nothing was written" from "eagl.c reads elsewhere".
+   gl10: nothing written (0 bytes after the write lock); without GL no such
+   surfaces exist. gl12 (0128, user stack at the lock trap): the lock and
+   unlock come from CA::Render::Image::retain_iosurface(). For an image whose
+   CA format has an IOSurface pixel format it calls IOSurfaceWrapClientImage
+   (selector 6, 0125); for one without (the icons) it calls IOSurfaceCreate
+   with "IOSurfaceAddress" = the image's data in backboardd, then only locks
+   and unlocks. SweetSurface ignored that key and made fresh zeroed memory.
+   0129 wraps the caller's memory at IOSurfaceAddress instead.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.

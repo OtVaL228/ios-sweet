@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2535d84..2e7a6f9 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -776,7 +776,42 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	/*
++	 * 0129: "IOSurfaceAddress" asks for a surface around the caller's own memory.
++	 * CoreAnimation's GL renderer makes one so for an image whose format has no IOSurface
++	 * pixel format (CA::Render::Image::retain_iosurface: IOSurfaceCreate with the image's
++	 * data address, then only a lock and an unlock): the home screen's app icons. This used
++	 * to get fresh zeroed memory instead, and the icons were drawn from zeros (G4 runs
++	 * gl8-gl12). The range is wired for the surface's life, as for selectors 6 and 7.
++	 */
++	OSNumber *address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && address != NULL && address->unsigned64BitValue() != 0) {
++		uint64_t at = address->unsigned64BitValue();
++		uint64_t need = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		if (need == 0) {
++			need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		}
++		uint64_t first = trunc_page_64(at);
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(first,
++		    round_page_64(at + need) - first, kIODirectionInOut, fTask);
++		if (md != NULL && md->prepare() == kIOReturnSuccess) {
++			s->memory = md;
++			s->wrapped = true;
++			s->wrapDelta = (uint32_t)(at - first);
++			s->mapCache = kIOMapDefaultCache;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		} else {
++			OSSafeReleaseNULL(md);
++			IOLog("SWEET SURF: create: IOSurfaceAddress %#llx (%llu bytes) not wired: fresh memory instead\n",
++			    (unsigned long long)at, (unsigned long long)need);
++			address = NULL;
++		}
++	} else {
++		address = NULL;
++	}
++	if (ret == kIOReturnSuccess && address == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
