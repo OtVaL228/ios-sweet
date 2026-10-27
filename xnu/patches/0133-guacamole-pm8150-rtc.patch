@@ -1,0 +1,182 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 19838cc..91b6dc1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_mailbox.c			standard
++bsd/dev/sweet_rtc.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
+new file mode 100644
+index 0000000..e5257ef
+--- /dev/null
++++ b/bsd/dev/sweet_rtc.c
+@@ -0,0 +1,136 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Wall clock from the PM8150 RTC (guacamole).
++ *
++ * The PMIC's RTC (SPMI SID 0, peripheral 0x60; live DT qcom,pm8150_rtc_rw@6000)
++ * keeps counting seconds while the phone is off, but not from 1970: Android
++ * set its clock to "1970-04-22 01:34:15 UTC (9596055)" from it and kept the
++ * offset to real time in userdata (QTI time_daemon), which iOS has replaced.
++ * So the time is RTC + an offset of ours, kept in OFFSET_FILE on the iOS root.
++ *
++ * Boot-arg sweettime=<unix seconds> (tools/guac-mkboot.sh puts the Mac's time
++ * there when it builds an image) gives the offset afresh when it is later
++ * than what the stored offset says; then it is stored. Without either, the
++ * clock stays as it was (1970).
++ *
++ * Registers (Linux drivers/rtc/qpnp-rtc.c): RTC_CTRL +0x46 (bit 7 enabled),
++ * RTC_READ +0x48..0x4b, little endian; the low byte is read again and the four
++ * read anew if it moved on in between.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++#define RTC_BASE        0x6000u
++#define RTC_CTRL        (RTC_BASE + 0x46u)
++#define RTC_READ        (RTC_BASE + 0x48u)
++#define OFFSET_FILE     "/private/var/db/sweet-rtc-offset"
++#define SANE_TIME       1600000000ll    /* 2020: anything earlier is not the time */
++
++void sweet_rtc_init(void);
++
++static int
++rtc_read(uint32_t *secs)
++{
++	uint8_t b[4], again;
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, RTC_READ + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		if (sweet_spmi_read(0, RTC_READ, &again) != 0) {
++			return -1;
++		}
++		if (again == b[0]) {
++			*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++offset_load(int64_t *offset)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode *vp = NULLVP;
++	char text[32];
++	if (vnode_open(OFFSET_FILE, FREAD, 0, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	uio_addiov(uio, (user_addr_t)(uintptr_t)text, sizeof(text) - 1);
++	int err = VNOP_READ(vp, uio, 0, ctx);
++	size_t got = sizeof(text) - 1 - (size_t)uio_resid(uio);
++	uio_free(uio);
++	vnode_close(vp, FREAD, ctx);
++	if (err != 0 || got == 0) {
++		return -1;
++	}
++	text[got] = 0;
++	*offset = (int64_t)strtoq(text, NULL, 10);
++	return 0;
++}
++
++static void
++offset_store(int64_t offset)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode *vp = NULLVP;
++	char text[32];
++	int n = snprintf(text, sizeof(text), "%lld\n", (long long)offset);
++	int err = vnode_open(OFFSET_FILE, FWRITE | O_CREAT, 0644, 0, &vp, ctx);
++	if (err == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_data_size, 0);       /* vnode_open does not truncate (0119) */
++		err = vnode_setattr(vp, &va, ctx);
++		if (err == 0) {
++			uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++			uio_addiov(uio, (user_addr_t)(uintptr_t)text, (user_size_t)n);
++			err = VNOP_WRITE(vp, uio, 0, ctx);
++			uio_free(uio);
++		}
++		vnode_close(vp, FWRITE, ctx);
++	}
++	printf("SWEET RTC: offset %lld stored in " OFFSET_FILE ": %d\n", (long long)offset, err);
++}
++
++/* bsd_init, after the root is mounted (the offset file lives there). */
++void
++sweet_rtc_init(void)
++{
++	uint8_t ctrl = 0;
++	uint32_t rtc;
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(0, RTC_CTRL, &ctrl) != 0 || rtc_read(&rtc) != 0) {
++		printf("SWEET RTC: PM8150 RTC not readable\n");
++		return;
++	}
++	int64_t offset = 0;
++	bool stored = offset_load(&offset) == 0;
++	long long given = 0;
++	char arg[24] = "";
++	if (PE_parse_boot_arg_str("sweettime", arg, sizeof(arg))) {
++		given = strtoq(arg, NULL, 10);
++	}
++	const char *from = stored ? "file" : "none";
++	if (given >= SANE_TIME && (!stored || given > (long long)rtc + offset)) {
++		offset = (int64_t)given - (int64_t)rtc;
++		offset_store(offset);
++		from = "boot-arg sweettime";
++	}
++	int64_t now = (int64_t)rtc + offset;
++	printf("SWEET RTC: PM8150 RTC %u s (ctrl %#x), offset %lld (%s), time %lld\n", rtc, ctrl,
++	    (long long)offset, from, (long long)now);
++	if (now >= SANE_TIME) {
++		clock_set_calendar_microtime((clock_sec_t)now, 0);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..d7bf1bc 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -90,7 +90,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 &&
++	    peripheral != 0x60)) {          /* 0133: PM8150 RTC (sweet_rtc.c), read only */
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 5e6527a..07842d5 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -954,6 +954,9 @@ bsd_init(void)
+ 	/* SWEETBOX ROOT/ entries (boot-args sweetmailbox=1 sweetboxroot=1), before launchd. */
+ 	extern void sweet_mailbox_root_install(void);
+ 	sweet_mailbox_root_install();
++	/* Wall clock from the PM8150 RTC + our offset file on the root (0133). */
++	extern void sweet_rtc_init(void);
++	sweet_rtc_init();
+ #endif
+ 
+ 

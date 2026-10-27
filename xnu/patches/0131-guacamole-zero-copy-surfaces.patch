@@ -1,0 +1,58 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 93189d7..d8f312b 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -12,8 +12,9 @@
+  *  - buffers from any RAM the 36-bit SMMU reaches (this kernel's RAM is all above 4 GiB,
+  *    --highmem), and not physically contiguous: newBuffer() maps them page by page;
+  *  - the SweetSurface paths (surfaceBuffer(), surfaces' seed and drawn fence in submit(),
+- *    topaz_surface_drawn()) are off, REDWOOD_SURFACES 0: our SweetSurface has no drawn
+- *    fence and its state page layout is not checked yet (G4);
++ *    topaz_surface_drawn()) were off until 0131 (REDWOOD_SURFACES): SweetSurface now has
++ *    the drawn fence, its seed is at +0xc of the state page as here, and the display
++ *    (SweetFramebuffer) drops its cached copy of a surface the GPU drew before it shows it;
+  *  - redwood_tl() lines go to IOLog; gpu_log is the boot-arg of that name.
+  *
+  * RedwoodGPU: the phone's Adreno for programs to draw with.
+@@ -62,7 +63,7 @@
+ 
+ #include "SweetSurface.h"
+ 
+-#define REDWOOD_SURFACES        0               /* guacamole: IOSurfaces as GPU buffers, later (G4) */
++#define REDWOOD_SURFACES        1               /* guacamole 0131: IOSurfaces as GPU buffers (no copies) */
+ #define redwood_tl(...)         IOLog(__VA_ARGS__)
+ static TUNABLE(uint32_t, gpu_log, "gpu_log", 0);
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bb72c6f..ed7a96e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -476,6 +476,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (s->drawn != 0 && s->memory != NULL) {
++			/*
++			 * 0131: the GPU draws into surfaces (RedwoodGPU) past this processor's cache;
++			 * what the cache still holds of this one is older than the memory.
++			 */
++			s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
++		}
+ 		if (fScaleUp) {
+ 			presentScaled(s, sx, sy, dx, dy, w, h);
+ 			s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 8c44a61..5ae37fb 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -42,8 +42,9 @@ public:
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 	bool                      readOnly;     /* ... that the task may only read: mapped read-only */
++	uint32_t                  drawn;        /* RedwoodGPU: the last submission naming it (0: none) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { wrapDelta = 0; wrapped = false; readOnly = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapDelta = 0; wrapped = false; readOnly = false; drawn = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

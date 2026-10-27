@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index d8f312b..66fddf9 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -824,7 +824,11 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		s->release();
+ 		return kIOReturnUnsupported;
+ 	}
+-	size = round_page_64(s->allocSize);
++	/* 0132: a surface around a task's memory starts wrapDelta bytes into its first page */
++	size = round_page_64((uint64_t)s->wrapDelta + s->allocSize);
++	if (size > s->memory->getLength()) {
++		size = s->memory->getLength();
++	}
+ 	memory = IOSubMemoryDescriptor::withSubRange(s->memory, 0, size, kIODirectionInOut);
+ 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
+ 		OSSafeReleaseNULL(memory);
+@@ -832,7 +836,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	request->size = size;
+-	request->offset = s->offset;
++	request->offset = s->offset + s->wrapDelta;
+ 	request->rowBytes = s->bytesPerRow;
+ 	request->width = s->width;
+ 	request->height = s->height;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ed7a96e..2b40e40 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -276,18 +276,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/*
++		 * Black, once. 0132: the fade (halving every pixel on 7 vsyncs) read back the
++		 * write-combined panel memory, slowly enough to be seen frame by frame.
++		 */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
+-		}
++		fb->fFadeStep = 1;
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+-				}
++				bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
+ 			}
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -304,8 +302,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		/* 0132: what showing a frame costs (sweetfb_hz: can the CPU keep up at 60?) */
++		static uint64_t shown, spent;
++		uint64_t began = mach_absolute_time();
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		spent += mach_absolute_time() - began;
++		if (++shown % 300 == 0) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(spent, &ns);
++			IOLog("SWEET FB: %llu frames shown, %llu us each (last 300), every %u vsync(s)\n", shown,
++			    ns / 1000 / 300, fb->fFlushTicks);
++			spent = 0;
++		}
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }

@@ -15,17 +15,27 @@ as coming from a device tree (DT) or Linux.
 | XNU kernel, 8 CPUs (4x A55 + 3x A76 + 1x A76 prime) | works |
 | UFS root from `userdata`, persistent log ring | works |
 | iOS userland: lock screen, home screen, apps | works (CPU rendering) |
-| Display 1125x2436 presented, scaled x1.28 to 1440x3120 | works (0083) |
+| Display 1125x2436 presented, scaled x1.28 to 1440x3120 | works (0083); 60 Hz with sweetfb_hz=60 (gl16, 0132) |
 | Buttons (power, volume) | works (0084) |
 | Touch (Samsung S6SY761) | works (0085-0087) |
-| GPU (Adreno 640) | kernel bring-up done; RedwoodGPU user client (G2b); Mesa freedreno draws offscreen under iOS (G3: FD640, GL 4.6 compat); presentation (G4) next |
+| GPU (Adreno 640) | kernel bring-up, RedwoodGPU (G2b), Mesa freedreno (G3), CoreAnimation in backboardd on the GPU drawing straight into IOSurfaces at 60 Hz (G4: 0117-0132, userland/gpu, userland/bbd) |
 | File drop (SWEETBOX) | works: raw image in `rawdump` -> files in /private/var/tmp |
 | Autorun of /private/var/tmp/autorun.sh | works (0115/0116, userland/autorun) |
-| Wi-Fi, audio, RTC, CPU frequency | not started |
+| Wall clock | PM8150 RTC + offset file on the root, sweettime= (0133) |
+| Wi-Fi, audio, CPU frequency | not started |
 
 ## Workflow
 
 - Kernel: GitHub Actions on this fork, `gh workflow run xnu.yml --ref guacamole`.
+- Kernel on this Mac (when GitHub's macOS arm64 runners have no capacity:
+  "The job was not acquired by Runner of type hosted"): `tools/xnu-local-build.sh --full`
+  once (~20 min: blacktop build.sh at the CI commit, KDK 13.5 unpacked under
+  ../xnu-local without sudo), then `tools/xnu-local-build.sh` applies new
+  xnu/patches and makes incrementally. It uses this Mac's Xcode (27): its iig
+  needs IORPC.kernelContent, added only for local builds by
+  xnu/local/0001-iorpc-kernelcontent.patch (as in xnu-12377). guac-mkboot.sh
+  takes the kernel's path instead of a run id. First local kernel: same
+  symbols as CI's plus 0128/0129, 3% smaller (other clang).
 - Boot image (macOS or Linux, python3 + gh):
   `TOUCH=1 CPUS=8 tools/guac-mkboot.sh RUN_ID STOCK_boot.img shim-guacamole.Image out.img "boot-args"`.
   `TOUCH/KEYS/USB/CPUS` are environment variables of the script; kernel boot-args
@@ -288,6 +298,21 @@ only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
    with "IOSurfaceAddress" = the image's data in backboardd, then only locks
    and unlocks. SweetSurface ignored that key and made fresh zeroed memory.
    0129 wraps the caller's memory at IOSurfaceAddress instead.
+   gl13 (first local kernel): "not wired": the image data is mapped
+   read-only in backboardd. 0130 wires such ranges for reading only and maps
+   the surface read-only. gl14: app icons are back.
+   Lags: 0131 turns on REDWOOD_SURFACES (IOSurface memory as GPU buffers,
+   eagl.c's "drawn in place" instead of a CPU copy of every frame), adds
+   SweetSurface::drawn, and the display invalidates its cache of a surface
+   the GPU drew before showing it.
+   gl15 (0131): frames "1 in place, 0 copied", visibly smoother; ~22 frames
+   a second with sweetfb_hz=30 (the panel is refreshed every 2nd vsync, by
+   a CPU nearest-neighbour scale 1125x2436 -> 1440x3120). Settings' small
+   icons sliced: surfaceBuffer() ignored wrapDelta (0132 fixes). Screen-off
+   went frame by frame: the fade read back write-combined panel memory
+   (0132: one black fill). 0132 also logs the cost of showing a frame
+   every 300 frames, to decide between sweetfb_hz=60 and moving the
+   scaling to the display hardware.
    G4: EAGL shim + backboardd hook (topaz, iOS 16), surfaces, presentation.
    Later: Metal via ry-diffusion/Chlorophyll (MIT; A630 = closest sibling).
    Bergamota has no licence file: use its notes, ask before copying code.

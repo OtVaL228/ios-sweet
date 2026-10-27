@@ -6,6 +6,10 @@ This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generati
 
 As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
 
+**Branch `guacamole`: the same on the OnePlus 7 Pro** (SM8150), now with the **Adreno 640 GPU**:
+CoreAnimation draws the iOS interface through Mesa's freedreno at the panel's 60 Hz. See
+[OnePlus 7 Pro (guacamole)](#oneplus-7-pro-guacamole) below and [`docs/guacamole.md`](docs/guacamole.md).
+
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
 
 ## What works
@@ -156,11 +160,52 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
 | `tools/sweet-crash.py` | Symbolicate console crash reports |
 | `tools/xnu-cc.py` | Local single-file compile check from a CI log |
+| `tools/xnu-local-build.sh`, `xnu/local/` | Build the kernel on a Mac (guacamole) |
+| `tools/guac-mkboot.sh`, `tools/sweet-mailbox.py` | guacamole boot image; SWEETBOX file drop |
+| `userland/` | autorun, backboardd wrapper and library, GPU tests, Mesa build, EAGL on Mesa |
 | `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
 | `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
 
 Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
+
+## OnePlus 7 Pro (guacamole)
+
+Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM8150, 8 GB, UFS 3.0,
+1440×3120 AMOLED). The engineering log, board facts and the GPU bring-up are in
+[`docs/guacamole.md`](docs/guacamole.md).
+
+| Area | State |
+| --- | --- |
+| Boot, CPU | Stock OnePlus ABL → `fastboot boot` of the shim; all 8 cores (4× A55, 3× A76, 1× A76 prime) |
+| Display | 1125×2436 presented, scaled to the 1440×3120 panel, 60 Hz (`sweetfb_hz=60`) |
+| Touch, buttons | Samsung S6SY761 over I²C (QUP SE17); power and volume over SPMI |
+| GPU | Adreno 640 brought up from the kernel (GMU, HFI, zap shader, ring, fences); `RedwoodGPU` user client speaking Linux msm's DRM requests |
+| Graphics | Mesa 25.0.7 freedreno (OpenGL ES 3.2, FD640) behind iOS's `EAGLContext`: CoreAnimation in backboardd renders on the GPU, drawing straight into IOSurfaces |
+| Clock | Wall time from the PM8150 RTC plus an offset kept on the root (`sweettime=` sets it) |
+| File drop, autorun | SWEETBOX: a raw image in the `rawdump` partition is unpacked into `/private/var/tmp` (and `ROOT/` entries onto the root); `/private/var/tmp/autorun.sh` runs at boot |
+| Not yet | Wi-Fi, audio, sensors, cellular; Metal |
+
+### Building for guacamole
+
+- **Kernel:** `gh workflow run xnu.yml --ref guacamole` on GitHub, or on a Mac with
+  `tools/xnu-local-build.sh --full` once and `tools/xnu-local-build.sh` afterwards (uses the Mac's
+  Xcode; `xnu/local/` adapts xnu to a newer iig).
+- **Boot image:** `TOUCH=1 CPUS=8 tools/guac-mkboot.sh RUN_ID_OR_KERNEL_PATH stock_boot_b.img
+  shim-guacamole.Image out.img "<boot-args>"`; it prints the final `boot-args:` line.
+- **Userland:** `userland/build.sh` (autorun helper, backboardd wrapper, GPU tests, the EAGL library);
+  Mesa first with `userland/mesa/mk-mesa.sh` (needs Homebrew's bison 3).
+- **Getting files onto the phone:** `tools/sweet-mailbox.py pack box.img NAME FILE ...`, write it to
+  `rawdump` from recovery, boot with `sweetmailbox=1 sweetboxpart=rawdump` (`sweetboxroot=1` for
+  `ROOT/` entries).
+
+| Boot-arg | Effect |
+| --- | --- |
+| `sweetgpu=11` | Bring up the Adreno 640 and publish `RedwoodGPU` |
+| `sweetgl=0` | Keep CoreAnimation on its software renderer |
+| `sweetfb_hz=60` | Panel refresh rate |
+| `sweetmailbox=1 sweetboxpart=rawdump sweetboxroot=1` | Unpack a SWEETBOX drop (and its `ROOT/` entries) |
+| `sweettime=SECONDS` | Unix time now, for the RTC offset (added by `guac-mkboot.sh`) |
 
 ## Kernel patches
 
@@ -186,6 +231,15 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0066–0067 | Fault-region crash info; console mute |
 | 0068 | IOSurface lookup semantics for already-mapped surfaces |
 | 0069 | Batched persistent-log flushes |
+| 0082–0087 | guacamole: framebuffer geometry, 1125×2436 scaled to 1440×3120, PM8150 keys, S6SY761 touch |
+| 0088–0114 | Adreno 640 bring-up in stages (clocks, GMU, HFI, GX, hw init, CP, zap, IB + fence), the `redwood_gpu_*` backend; SWEETBOX file drop |
+| 0115–0119 | SWEETBOX `ROOT/` installs before launchd, autorun marker, file truncation |
+| 0117 | `RedwoodGPU` user client (from topaz / HackiOS) |
+| 0120 | 64-bit physical address in `pmap_sync_page_attributes_phys` |
+| 0121 | AMFI answers dyld's policy query (@ paths, `DYLD_INSERT_LIBRARIES`) |
+| 0122 | GPU fence cache maintenance |
+| 0123–0132 | IOSurface work for the GPU renderer: wrapped client memory, 10-bit formats as BGRA, `IOSurfaceAddress`, surfaces as GPU buffers, display cache invalidation, instant screen-off |
+| 0133 | PM8150 RTC wall clock |
 
 ## Key hardware facts
 
@@ -201,3 +255,5 @@ More in [`NOTES.md`](NOTES.md).
 ## Credits
 
 Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+
+The guacamole GPU work also builds on [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (kernel APSL 2.0, user space MIT) and [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz): `RedwoodGPU.cpp`, several SweetSurface changes, the Mesa patches, `redwood-drm` and the EAGL library come from there (origins and licences in the files and in `userland/*/README.md`); on [Mesa](https://mesa3d.org) (freedreno, MIT) and the Linux msm driver for register sequences; and on [dortania/KdkSupportPkg](https://github.com/dortania/KdkSupportPkg) for local kernel builds.
