@@ -1,0 +1,84 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -313,10 +313,22 @@
+  * expansion ("security policy does not allow @ path expansion", G3 run),
+  * DYLD_* variables ignored. Answer with the AMFI_DYLD_OUTPUT_* flags of
+  * dyld's ProcessConfig::Security (open-source dyld): everything except a
+- * custom shared cache. Other AMFI operations stay unsupported (ENOSYS); the
+- * first use of each is logged.
++ * custom shared cache.
++ *
++ * installd (InstalledContentLibrary, -[MIDaemonConfiguration
++ * codeSigningEnforcementIsDisabled]) and FrontBoardServices ask for the
++ * boot-arg state: amfi_interface_query_bootarg_state() in libmis is
++ * __sandbox_ms("AMFI", 96, u64 *flags), and installd takes code signing
++ * enforcement as disabled when (flags & 0x86) != 0. Otherwise it checks each
++ * app's signature with libmis, whose trust cache query (op 95) we cannot
++ * answer, and system apps (/private/var/staged_system_apps) never install.
++ * Boot-arg sweetcsoff=1 answers op 96 with SWEET_AMFI_BOOTARG_CS_OFF.
++ *
++ * Other AMFI operations stay unsupported (ENOSYS); the first use of each is
++ * logged.
+  */
+ #define SWEET_AMFI_CHECK_DYLD_POLICY    90
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  96
+ #define SWEET_AMFI_DYLD_ALLOW_AT_PATH           (1ULL << 0)
+ #define SWEET_AMFI_DYLD_ALLOW_PATH_VARS         (1ULL << 1)
+ #define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    (1ULL << 3)
+@@ -324,32 +336,40 @@
+ #define SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION  (1ULL << 5)
+ #define SWEET_AMFI_DYLD_ALLOW_INTERPOSING       (1ULL << 6)
+ #define SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS     (1ULL << 7)
++#define SWEET_AMFI_BOOTARG_CS_OFF               (1ULL << 1)     /* one of installd's 0x86 */
+ 
+-static uint64_t sweet_amfi_syscall_seen;
++static TUNABLE(uint32_t, sweet_cs_off, "sweetcsoff", 0);
+ 
++static uint64_t sweet_amfi_syscall_seen[2];     /* AMFI's ops go past 64 (90, 95, 96) */
++
+ static int
+ sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+-	if (call >= 0 && call < 64 && call != SWEET_AMFI_CHECK_DYLD_POLICY &&
+-	    !(sweet_amfi_syscall_seen & (1ULL << call))) {
+-		sweet_amfi_syscall_seen |= 1ULL << call;
++	if (call == SWEET_AMFI_CHECK_DYLD_POLICY) {
++		uint64_t args[2];               /* in_flags, user address of out_flags */
++		int error = copyin(arg, args, sizeof(args));
++		if (error) {
++			return error;
++		}
++		uint64_t allow = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_PATH_VARS |
++		    SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS | SWEET_AMFI_DYLD_ALLOW_PRINT_VARS |
++		    SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION | SWEET_AMFI_DYLD_ALLOW_INTERPOSING |
++		    SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS;
++		return copyout(&allow, (user_addr_t)args[1], sizeof(allow));
++	}
++	bool answered = call == SWEET_AMFI_QUERY_BOOTARG_STATE && sweet_cs_off;
++	if (call >= 0 && call < 128 && !(sweet_amfi_syscall_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_syscall_seen[call / 64] |= 1ULL << (call % 64);
+ 		char name[32];
+ 		proc_name(proc_pid(p), name, sizeof(name));
+-		printf("SWEET AMFI: %s op %d unsupported\n", name, call);
++		printf("SWEET AMFI: %s op %d %s\n", name, call,
++		    answered ? "answered: code signing enforcement off (sweetcsoff=1)" : "unsupported");
+ 	}
+-	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++	if (!answered) {
+ 		return ENOSYS;
+ 	}
+-	uint64_t args[2];               /* in_flags, user address of out_flags */
+-	int error = copyin(arg, args, sizeof(args));
+-	if (error) {
+-		return error;
+-	}
+-	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_PATH_VARS |
+-	    SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS | SWEET_AMFI_DYLD_ALLOW_PRINT_VARS |
+-	    SWEET_AMFI_DYLD_ALLOW_FAILED_INSERTION | SWEET_AMFI_DYLD_ALLOW_INTERPOSING |
+-	    SWEET_AMFI_DYLD_ALLOW_EMBEDDED_VARS;
+-	return copyout(&allow, (user_addr_t)args[1], sizeof(allow));
++	uint64_t flags = SWEET_AMFI_BOOTARG_CS_OFF;
++	return copyout(&flags, arg, sizeof(flags));
+ }
+ 
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {

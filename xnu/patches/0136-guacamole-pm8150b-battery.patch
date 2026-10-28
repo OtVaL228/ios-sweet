@@ -1,0 +1,227 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,10 +88,11 @@
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 &&
+-	    peripheral != 0x60)) {          /* 0133: PM8150 RTC (sweet_rtc.c), read only */
++	bool charger = peripheral >= 0x10 && peripheral <= 0x13;       /* SMB5 CHGR, DCDC, BATIF, USBIN */
++	bool allowed = sid == 0 ? charger || peripheral == 0x48 ||     /* PM6150 QG */
++	    peripheral == 0x60 :                                        /* 0133: PM8150 RTC (sweet_rtc.c) */
++	    sid == 2 && (charger || peripheral == 0x40 || peripheral == 0x41); /* 0136: PM8150B FG gen4 */
++	if (!sp_ready || !out || !allowed || addr > 0xffffu) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,17 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * sweetbattery=2 (guacamole, OnePlus 7 Pro): read-only PM8150B (SPMI SID 2)
++ * polling every 30 seconds. The state of charge is the fuel gauge's own
++ * (FG gen4, which runs on the battery profile Android loaded into it), so it
++ * is the phone's real percentage, not an estimate. Registers and scales from
++ * Linux drivers/power/supply/qcom (fg-reg.h, fg-util.c, smb5-reg.h of the
++ * OnePlus SM8150 kernel): monotonic SOC 0x4009 (copy 0x400a), raw 0..255;
++ * VBATT 0x41a0 (copy 0x41a6), 122.070 uV; IBATT 0x41a2 (copy 0x41a8),
++ * signed, 488.281 uA, positive = discharging. The SMB5 charger registers are
++ * those of PM6150 above, on SID 2. Temperature: BATT_INFO_BATT_TEMP 0x4150
++ * (11 bits, quarter kelvin, fg-gen3's formula); used only when plausible.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -27,12 +38,16 @@
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+-	int fLastMode;
++	int fLastMode, fKind;           /* sweetbattery: 1 PM6150, 2 PM8150B */
++	unsigned fDesign, fPolls;       /* design capacity (mAh); polls so far */
++	unsigned fTemperature;          /* centidegrees C */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void pollFuelGauge(void);
++	static bool readShadow(unsigned address, unsigned copy, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -72,6 +87,10 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fKind = 0;
++	fDesign = 5020;
++	fPolls = 0;
++	fTemperature = 2500;
+ 	return true;
+ }
+ 
+@@ -101,11 +120,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (fDesign). powerd computes C*100/M. */
++	const unsigned capacity = (fDesign * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesign);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,15 +138,15 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesign);
++	putNumber("DesignCapacity", fDesign);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; 25 C unless measured (fKind 2). */
++	putNumber("Temperature", fTemperature);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", fTemperature == 2500);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +156,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesign, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -151,11 +170,12 @@
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+-	int mode = measured ? 1 : 0;
+-	if (mode != fLastMode) {
+-		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++	int mode = measured ? fKind : 0;
++	/* Every change of source, and every 10th poll (5 min) for the fuel gauge. */
++	if (mode != fLastMode || (mode == 2 && fPolls % 10 == 0)) {
++		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA %u.%02uC external=%d charging=%d full=%d\n",
++		    mode == 2 ? "PM8150B fuel gauge" : measured ? "PM6150 / estimated SOC" : "static fallback",
++		    percent, mv, ma, fTemperature / 100, fTemperature % 100, external, charging, full);
+ 		fLastMode = mode;
+ 	}
+ }
+@@ -201,11 +221,83 @@
+ 		}
+ 	}
+ 	return 100;
++}
++
++/* A 16-bit little-endian FG value and its shadow copy, read until they agree. */
++bool
++SweetBattery::readShadow(unsigned address, unsigned copy, uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t lo, hi, lo2, hi2;
++		if (sweet_spmi_read(2, address, &lo) || sweet_spmi_read(2, address + 1, &hi) ||
++		    sweet_spmi_read(2, copy, &lo2) || sweet_spmi_read(2, copy + 1, &hi2)) {
++			return false;
++		}
++		if (lo == lo2 && hi == hi2) {
++			*value = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++			return true;
++		}
++	}
++	return false;
+ }
+ 
+ void
++SweetBattery::pollFuelGauge(void)
++{
++	uint8_t soc = 0, socCopy = 1, usb, path, charger, error, limits, tlo, thi;
++	uint16_t rawVoltage, rawCurrent;
++	for (unsigned attempt = 0; attempt < 4 && soc != socCopy; ++attempt) {
++		if (sweet_spmi_read(2, 0x4009, &soc) || sweet_spmi_read(2, 0x400a, &socCopy)) {
++			break;
++		}
++	}
++	bool valid = soc == socCopy && readShadow(0x41a0, 0x41a6, &rawVoltage) &&
++	    !sweet_spmi_read(2, 0x1310, &usb) &&
++	    !sweet_spmi_read(2, 0x110b, &path) &&
++	    !sweet_spmi_read(2, 0x1006, &charger) &&
++	    !sweet_spmi_read(2, 0x1007, &error) &&
++	    !sweet_spmi_read(2, 0x100d, &limits);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
++	valid = valid && mv >= 2800 && mv <= 4600;
++	fPolls++;
++	if (!valid) {
++		fTemperature = 2500;
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	/* fg_get_msoc(): 255 is full, 0 empty, 1..254 scaled to 1..99. */
++	unsigned percent = soc == 255 ? 100 : soc == 0 ? 0 : ((soc - 1u) * 98u + 126u) / 253u + 1u;
++	int ma = 0;
++	bool currentValid = readShadow(0x41a2, 0x41a8, &rawCurrent);
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* FG: positive = discharging; IOPMPowerSource: positive = charging. */
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++	fTemperature = 2500;
++	if (!sweet_spmi_read(2, 0x4150, &tlo) && !sweet_spmi_read(2, 0x4151, &thi)) {
++		int kelvin4 = (int)(((unsigned)(thi & 7u) << 8) | tlo);
++		int centi = kelvin4 * 25 - 27315;
++		if (centi >= 0 && centi <= 7000) {     /* below 0 C: left at 25 C */
++			fTemperature = (unsigned)centi;
++		}
++	}
++	bool external = (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 &&
++	    !(error & 2u) && !(limits & 0x0cu);
++	bool full = external && (state == 5 || percent == 100) && !(error & 2u);
++	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
++}
++
++void
+ SweetBattery::poll(void)
+ {
++	if (fReal && fKind == 2) {
++		pollFuelGauge();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -264,7 +356,11 @@
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fReal = (real == 1 || real == 2) && sweet_spmi_init() == 0;
++	fKind = fReal ? real : 0;
++	if (fKind == 2) {
++		fDesign = 4000;         /* OnePlus 7 Pro: 4000 mAh (no capacity in its DT) */
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

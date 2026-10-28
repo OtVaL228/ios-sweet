@@ -21,6 +21,10 @@ build sweet-bbd bbd/sweet-bbd.c
 build libsweet-bbd.dylib bbd/bbd-insert.c -dynamiclib -install_name /usr/lib/libsweet-bbd.dylib -framework IOSurface -Wl,-not_for_dyld_shared_cache \
 	-framework IOKit -framework CoreFoundation
 build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_name /private/var/tmp/libsweet-insert-test.dylib
+# removable system apps: runs SystemAppMigrator; signed again with the entitlements it needs
+build sweet-sysapps sysapps/sweet-sysapps.m -fobjc-arc -framework Foundation
+codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
+build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)
 MESA=mesa/build
 if [ -f $MESA/out/libOSMesa.8.dylib ]; then

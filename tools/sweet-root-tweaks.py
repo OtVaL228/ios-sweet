@@ -18,6 +18,10 @@ screen (image versions v8-v14 in NOTES.md):
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
                   crash-loops and Setup blocks on its CoreTelephony XPC);
+                  com.apple.fairplayd.H2 removed (no FairPlay kext: it exits
+                  and KeepAlive restarts it, while Photos' checkpointd, passd
+                  and Settings wait forever for its replies; with the job gone
+                  their lookups fail at once);
                   job com.sweet.autorun runs /usr/libexec/sweet-autorun
                   (userland/autorun) at boot; com.apple.backboardd runs
                   /usr/libexec/sweet-bbd (userland/bbd), which execs the real
@@ -74,6 +78,7 @@ AUTORUN_JOB = {
 
 
 BBD_WRAPPER = '/usr/libexec/sweet-bbd'
+REMOVED_JOBS = ('com.apple.CommCenter', 'com.apple.fairplayd.H2')
 
 
 def launchd(root):
@@ -91,7 +96,7 @@ def launchd_plist(src, dst):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    removed = [k for k, j in jobs.items() if j.get('Label') in REMOVED_JOBS]
     for k in removed:
         del jobs[k]
     jobs[AUTORUN_KEY] = dict(AUTORUN_JOB)
@@ -99,7 +104,7 @@ def launchd_plist(src, dst):
         if job.get('Label') == 'com.apple.backboardd':
             job['ProgramArguments'] = [BBD_WRAPPER]
     save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed, '
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed ({", ".join(REMOVED_JOBS)}), '
           f'{AUTORUN_JOB["Label"]} added, backboardd via {BBD_WRAPPER}')
 
 

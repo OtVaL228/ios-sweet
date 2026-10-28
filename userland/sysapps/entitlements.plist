@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- sweet-sysapps: the install-related entitlements that datamigrator's plug-in
+     host (com.apple.migrationpluginwrapper) has, so SystemAppMigrator's calls to
+     installd, installcoordinationd, containermanagerd and LaunchServices pass. -->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>com.apple.DataMigrator</string>
+	<key>com.apple.appstored.private</key>
+	<true/>
+	<key>com.apple.private.appstored</key>
+	<array>
+		<string>Install</string>
+	</array>
+	<key>com.apple.lsapplicationworkspace.rebuildappdatabases</key>
+	<true/>
+	<key>com.apple.private.InstallCoordination.allowed</key>
+	<true/>
+	<key>com.apple.private.MobileContainerManager.allowed</key>
+	<true/>
+	<key>com.apple.private.amfi.can-check-trust-cache</key>
+	<true/>
+	<key>com.apple.private.mobileinstall.allowedSPI</key>
+	<array>
+		<string>DataMigratorUpdateDataProtection</string>
+		<string>InstallForDataMigrator</string>
+		<string>InstallForLaunchServices</string>
+		<string>RegisterSafeHarbor</string>
+		<string>ProcessRestoredContainer</string>
+		<string>UninstallForLaunchServices</string>
+		<string>LookupSystemAppState</string>
+		<string>UpdateSystemAppState</string>
+		<string>SetSystemAppMigrationComplete</string>
+	</array>
+</dict>
+</plist>

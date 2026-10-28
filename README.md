@@ -183,8 +183,10 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | GPU | Adreno 640 brought up from the kernel (GMU, HFI, zap shader, ring, fences); `RedwoodGPU` user client speaking Linux msm's DRM requests |
 | Graphics | Mesa 25.0.7 freedreno (OpenGL ES 3.2, FD640) behind iOS's `EAGLContext`: CoreAnimation in backboardd renders on the GPU, drawing straight into IOSurfaces |
 | Clock | Wall time from the PM8150 RTC plus an offset kept on the root (`sweettime=` sets it) |
+| Battery | Percentage, voltage and current from the PM8150B fuel gauge, charger state from its SMB5 (`sweetbattery=2`) |
+| Apps | The stock removable apps (Calculator, Weather, Notes, Maps, ...) installed from `staged_system_apps`; Photos and Wallet open |
 | File drop, autorun | SWEETBOX: a raw image in the `rawdump` partition is unpacked into `/private/var/tmp` (and `ROOT/` entries onto the root); `/private/var/tmp/autorun.sh` runs at boot |
-| Not yet | Wi-Fi, audio, sensors, cellular; Metal |
+| Not yet | Wi-Fi, audio, sensors, cellular; Metal; the wallpaper picker |
 
 ### Building for guacamole
 
@@ -206,6 +208,8 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | `sweetfb_hz=60` | Panel refresh rate |
 | `sweetmailbox=1 sweetboxpart=rawdump sweetboxroot=1` | Unpack a SWEETBOX drop (and its `ROOT/` entries) |
 | `sweettime=SECONDS` | Unix time now, for the RTC offset (added by `guac-mkboot.sh`) |
+| `sweetbattery=2` | Real battery state from the PM8150B fuel gauge and charger (default: static 100 %) |
+| `sweetcsoff=1` | Tell installd and FrontBoard that code signing enforcement is off (only needed to install the staged system apps; makes driverkitd crash-loop) |
 
 ## Kernel patches
 
@@ -240,6 +244,9 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | 0122 | GPU fence cache maintenance |
 | 0123–0132 | IOSurface work for the GPU renderer: wrapped client memory, 10-bit formats as BGRA, `IOSurfaceAddress`, surfaces as GPU buffers, display cache invalidation, instant screen-off |
 | 0133 | PM8150 RTC wall clock |
+| 0134 | AMFI boot-arg state query (`sweetcsoff`), every unsupported AMFI op logged once |
+| 0135 | Sandbox extension tokens (tccd grants: Photos) |
+| 0136 | PM8150B fuel gauge battery (`sweetbattery=2`) |
 
 ## Key hardware facts
 

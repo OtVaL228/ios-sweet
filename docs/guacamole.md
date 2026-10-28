@@ -22,7 +22,11 @@ as coming from a device tree (DT) or Linux.
 | File drop (SWEETBOX) | works: raw image in `rawdump` -> files in /private/var/tmp |
 | Autorun of /private/var/tmp/autorun.sh | works (0115/0116, userland/autorun) |
 | Wall clock | PM8150 RTC + offset file on the root, sweettime= (0133) |
-| Wi-Fi, audio, CPU frequency | not started |
+| Battery | PM8150B fuel gauge SOC, voltage, current; charger state (0136, sweetbattery=2) |
+| Stock removable apps (Calculator, Weather, Notes, ...) | installed from staged_system_apps (userland/sysapps, sweetcsoff=1 once) |
+| Photos, Settings > About, Wallet | work (0135 sandbox extensions; fairplayd job removed) |
+| Wallpaper picker | PosterBoard crash-loops: LaunchServices registers no system poster extensions (fix known from ios-flame: AMFI trust stand-in + ADT MACs) |
+| Wi-Fi, audio, CPU frequency | not started (Wi-Fi: port of ios-flame's wland, same SM8150/WCN3990) |
 
 ## Workflow
 
