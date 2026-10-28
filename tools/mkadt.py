@@ -150,6 +150,14 @@ def build(seed=None, qemu=False, highmem=False):
         # of the A11 that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        # MobileGestalt's WifiAddress/BluetoothAddress/EthernetAddress come
+        # from these; without mac-address-wifi0 it waits 5 s for a Wi-Fi
+        # IONetworkController on every query, and installd asks once per
+        # bundle, so LaunchServices' rebuild crawls (ios-flame's finding,
+        # HANDOFF "Black wallpaper fixed"). Locally administered, ours.
+        ('mac-address-wifi0', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])),
+        ('mac-address-ethernet0', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x03])),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state

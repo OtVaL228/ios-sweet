@@ -184,9 +184,9 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | Graphics | Mesa 25.0.7 freedreno (OpenGL ES 3.2, FD640) behind iOS's `EAGLContext`: CoreAnimation in backboardd renders on the GPU, drawing straight into IOSurfaces |
 | Clock | Wall time from the PM8150 RTC plus an offset kept on the root (`sweettime=` sets it) |
 | Battery | Percentage, voltage and current from the PM8150B fuel gauge, charger state from its SMB5 (`sweetbattery=2`) |
-| Apps | The stock removable apps (Calculator, Weather, Notes, Maps, ...) installed from `staged_system_apps`; Photos and Wallet open |
+| Apps | The stock removable apps (Calculator, Weather, Notes, Maps, ...) installed from `staged_system_apps`; Photos and Wallet open; app extensions register, so the wallpaper picker and its posters work |
 | File drop, autorun | SWEETBOX: a raw image in the `rawdump` partition is unpacked into `/private/var/tmp` (and `ROOT/` entries onto the root); `/private/var/tmp/autorun.sh` runs at boot |
-| Not yet | Wi-Fi, audio, sensors, cellular; Metal; the wallpaper picker |
+| Not yet | Wi-Fi, audio, sensors, cellular; Metal |
 
 ### Building for guacamole
 
@@ -247,6 +247,7 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 | 0134 | AMFI boot-arg state query (`sweetcsoff`), every unsupported AMFI op logged once |
 | 0135 | Sandbox extension tokens (tccd grants: Photos) |
 | 0136 | PM8150B fuel gauge battery (`sweetbattery=2`) |
+| 0137 | `AppleMobileFileIntegrity` stand-in answering trust cache queries (ios-flame 0103), so LaunchServices registers app extensions |
 
 ## Key hardware facts
 

@@ -25,6 +25,11 @@ build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_nam
 build sweet-sysapps sysapps/sweet-sysapps.m -fobjc-arc -framework Foundation
 codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
 build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
+# from ios-flame (userland/flame/README.md): LaunchServices registration, unified log stream
+build lsreg flame/lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
+codesign -f -s - --entitlements flame/lsreg-ents.plist out/lsreg
+build oslog flame/oslog.m -fobjc-arc -framework Foundation
+codesign -f -s - --entitlements flame/oslog-ents.plist out/oslog
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)
 MESA=mesa/build
 if [ -f $MESA/out/libOSMesa.8.dylib ]; then
