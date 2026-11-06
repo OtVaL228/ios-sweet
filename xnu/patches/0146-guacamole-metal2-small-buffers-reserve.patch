@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index bf1a71cbc..d37c79d45 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -150,6 +150,15 @@ SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
+ 	if (fSystem) {
+ 		return sweet_gpu_pool_avail() >= len;
+ 	}
++	/*
++	 * 0146: Turnip's command streams and small state buffers (1 MB or less) may use the reserve:
++	 * Turnip does not check them (tu_cs_reserve asserts) and wrote through NULL when one was refused
++	 * (mtl2 run 8: web.telegram.org's WebContent at 224 MB, "the compositor's reserve", SIGSEGV in
++	 * tu_init_hw). Textures, which metal2vulkan refuses cleanly, still keep out of it.
++	 */
++	if (len <= (1ULL << 20) && sweet_gpu_pool_avail() >= len + (16ULL << 20)) {
++		return true;
++	}
+ 	const char *why = NULL;
+ 	if (fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
+ 		why = "its cap";

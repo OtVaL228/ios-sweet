@@ -1,0 +1,217 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a543b996a..4ce4792f5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -75,6 +75,8 @@ extern lck_grp_t *lck_grp_alloc_init(const char *, lck_grp_attr_t *);
+ extern lck_mtx_t *lck_mtx_alloc_init(lck_grp_t *, lck_attr_t *);
+ extern void lck_mtx_lock(lck_mtx_t *);
+ extern void lck_mtx_unlock(lck_mtx_t *);
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++static void gpu_ddr_vote(void);
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA            0x00100000u
+@@ -1025,7 +1027,17 @@ gpu_stage6(void)
+ 	printf("SWEET GPU: before: GX GDSC %#010x RPMH_POWER_STATE %#x SPTPRAC %#x AHB_FENCE %#x\n",
+ 	    rd(gpucc, 0x100c), rd(gmu, GMU_R(0x50ec)), rd(gmu, GMU_R(0x50d0)), rd(gmu, GMU_R(0x9310)));
+ 	wr(gmu, GMU_R(0x9310), 0);                        /* AO_AHB_FENCE_CTRL: allow */
+-	uint32_t vote[4] = {0, 1, 1, 0};                  /* hdr, ack_type blocking, perf index 1 (257 MHz), bw 0 */
++	/*
++	 * 0147: the top level (5: 585 MHz, NOM) instead of 1 (257 MHz, LOW_SVS); boot-arg sweetgpufreq=1..5
++	 * picks another (ios-flame 0107 did the same, at 499 MHz).
++	 */
++	uint32_t level = 5;
++	(void)PE_parse_boot_argn("sweetgpufreq", &level, sizeof(level));
++	if (level < 1 || level > 5) {
++		level = 5;
++	}
++	uint32_t vote[4] = {0, 1, level, 0};              /* hdr, ack_type blocking, perf index, bw 0 */
++	printf("SWEET GPU: GX perf vote: level %u\n", level);
+ 	if (hfi_send(gmu, 30, vote, 4, NULL)) {
+ 		printf("SWEET GPU: GX_BW_PERF_VOTE failed\n");
+ 		return false;
+@@ -2224,20 +2236,54 @@ redwood_gpu_stop(void)
+  */
+ extern void IOSleep(unsigned milliseconds);
+ #define GPU_POOL_CHUNK    0x10000ull
++/*
++ * 0147: and 2 GB above XNU's window: --highmem gives XNU 0x1_00000000 + 0xfcc00000, while DDR goes
++ * on to 0x2_7fffffff (Android's iomem: 0xc0000000-0x27fffffff System RAM, no carve-out) and the
++ * GPU's context outputs 36 bits (TCR2 PASIZE). mtl2 run 8: web.telegram.org's WebContent was
++ * refused at 224 MB of the 688. Boot-arg sweetgpuhigh=0 keeps to the low ranges.
++ */
+ static const struct { uint64_t start, end; } gpu_pool_ranges[] = {
+ 	{ 0xc4000000ull, 0xe0000000ull },
+ 	{ 0xe1000000ull, 0xf0000000ull },
++	{ 0x200000000ull, 0x280000000ull },
+ };
+-#define GPU_POOL_CHUNKS   ((0xe0000000ull - 0xc4000000ull + 0xf0000000ull - 0xe1000000ull) / GPU_POOL_CHUNK)
++#define GPU_POOL_RANGES   (sizeof(gpu_pool_ranges) / sizeof(gpu_pool_ranges[0]))
++#define GPU_POOL_CHUNKS   ((0xe0000000ull - 0xc4000000ull + 0xf0000000ull - 0xe1000000ull + \
++	    0x280000000ull - 0x200000000ull) / GPU_POOL_CHUNK)
+ static uint8_t gpu_pool_used[GPU_POOL_CHUNKS];
+ static uint64_t gpu_pool_free_bytes = GPU_POOL_CHUNKS * GPU_POOL_CHUNK;
++static bool gpu_pool_ready;
+ 
+ static uint64_t
+ gpu_pool_pa(uint64_t chunk)
+ {
+-	uint64_t first = (gpu_pool_ranges[0].end - gpu_pool_ranges[0].start) / GPU_POOL_CHUNK;
+-	return chunk < first ? gpu_pool_ranges[0].start + chunk * GPU_POOL_CHUNK :
+-	       gpu_pool_ranges[1].start + (chunk - first) * GPU_POOL_CHUNK;
++	for (unsigned r = 0; r < GPU_POOL_RANGES; r++) {
++		uint64_t n = (gpu_pool_ranges[r].end - gpu_pool_ranges[r].start) / GPU_POOL_CHUNK;
++		if (chunk < n) {
++			return gpu_pool_ranges[r].start + chunk * GPU_POOL_CHUNK;
++		}
++		chunk -= n;
++	}
++	return 0;
++}
++
++/* With gpu_be_lock held: once, sweetgpuhigh=0 takes the last range away */
++static void
++gpu_pool_setup(void)
++{
++	if (gpu_pool_ready) {
++		return;
++	}
++	gpu_pool_ready = true;
++	uint32_t high = 1;
++	(void)PE_parse_boot_argn("sweetgpuhigh", &high, sizeof(high));
++	uint64_t n = (gpu_pool_ranges[GPU_POOL_RANGES - 1].end - gpu_pool_ranges[GPU_POOL_RANGES - 1].start) /
++	    GPU_POOL_CHUNK;
++	if (!high) {
++		memset(&gpu_pool_used[GPU_POOL_CHUNKS - n], 1, n);
++		gpu_pool_free_bytes -= n * GPU_POOL_CHUNK;
++	}
++	printf("SWEET GPU: pool %llu MB%s\n", gpu_pool_free_bytes >> 20, high ? " (with 2 GB above XNU)" : "");
+ }
+ 
+ int
+@@ -2248,8 +2294,9 @@ sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(gpu_be_lock);
++	gpu_pool_setup();
+ 	for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
+-		/* a buffer must not straddle the two ranges */
++		/* a buffer must not straddle two ranges */
+ 		if (gpu_pool_used[c] || (run != 0 && gpu_pool_pa(c) != gpu_pool_pa(c - 1) + GPU_POOL_CHUNK)) {
+ 			run = 0;
+ 			if (gpu_pool_used[c]) {
+@@ -2291,6 +2338,9 @@ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
+ uint64_t
+ sweet_gpu_pool_avail(void)
+ {
++	lck_mtx_lock(gpu_be_lock);
++	gpu_pool_setup();
++	lck_mtx_unlock(gpu_be_lock);
+ 	return gpu_pool_free_bytes;
+ }
+ 
+@@ -2568,12 +2618,36 @@ gpu_thread(void *arg, wait_result_t result)
+ 	    gpu_stage >= 9 && gpu_stage9() && gpu_stage >= 10 && gpu_stage10() &&
+ 	    gpu_stage >= 11) {
+ 		gpu_backend_start();
++		gpu_ddr_vote();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 0147: DDR (BCM "MC0") and the memory NoC ("SH0") voted to the top once the GPU runs, as ios-flame's
++ * 0122 (8-thread CPU bandwidth 13.7 -> 19 GB/s, its compositor ~20% faster there). Linux's msm driver
++ * votes the GPU's bandwidth through the interconnect framework (qcom/icc-bcm-voter.c, BCM_TCS_CMD:
++ * commit bit 30, valid bit 29, vote_x << 14, vote_y); nobody votes here, so DDR runs at whatever the
++ * boot left. Boot-arg sweetddr=0 leaves it so.
++ */
++static void
++gpu_ddr_vote(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetddr", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	static const char *const bcm[] = { "MC0", "SH0" };
++	for (unsigned i = 0; i < 2; i++) {
++		const uint32_t offset = 0, vote = (1u << 30) | (1u << 29) | (0x3fffu << 14) | 0x3fffu;
++		int error = sweet_rpmh_write(bcm[i], 1, &offset, &vote);
++		printf("SWEET GPU: %s voted to the top: %d\n", bcm[i], error);
++	}
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 82be4e125..c9594c916 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -46,6 +46,7 @@ int sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *cou
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
+ #define RH_ARC          3u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -188,9 +189,10 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if ((slave != RH_VRM && slave != RH_ARC) || (addr >> 16) != slave || (addr & 15u) ||
+-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM/ARC entry for %s\n", res);
++			/* 0147: BCM (bus clock manager) resources too: the GPU's DDR vote (sweet_gpu.c) */
++			if ((slave != RH_VRM && slave != RH_ARC && slave != RH_BCM) || (addr >> 16) != slave ||
++			    (addr & 15u) || !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
++				printf("SWEET RPMH: invalid VRM/ARC/BCM entry for %s\n", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index d37c79d45..3d9e388e2 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -141,9 +141,10 @@ SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
+ {
+ 	static uint32_t cap_mb, reserve_mb;
+ 	if (cap_mb == 0) {
+-		uint32_t v = 192;
++		/* 0147: the pool is 2.7 GB with the range above XNU (was 688 MB): 768 MB a process, 256 kept */
++		uint32_t v = 768;
+ 		PE_parse_boot_argn("sweetgpucap", &v, sizeof(v));
+-		reserve_mb = 128;
++		reserve_mb = 256;
+ 		PE_parse_boot_argn("sweetgpureserve", &reserve_mb, sizeof(reserve_mb));
+ 		cap_mb = v ? v : 0xffffffffu;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 94016bf9d..568fcf312 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -284,10 +284,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/*
++	 * 0147: the refresh period after the vsync time: CoreAnimation's IOMFBServer::vsync_callback takes
++	 * the next vsync as time + period, and with 0 every frame deadline was already past (ios-flame 0121:
++	 * 15.8 -> 21 fps there).
++	 */
++	static uint64_t period;
++	if (period == 0) {
++		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);

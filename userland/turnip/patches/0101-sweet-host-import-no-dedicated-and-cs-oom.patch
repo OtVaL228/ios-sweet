@@ -1,0 +1,35 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..da75353 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -4381,6 +4381,12 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   /* ios-sweet: the command stream's first BO up front, so that a refused one (the kernel's GPU pool full,
++    * guacamole mtl2 run 8) fails here instead of tu_init_hw writing through a NULL cur */
++   result = tu_cs_reserve_space(&cmd_buffer->cs, 1024);
++   if (result != VK_SUCCESS)
++      return vk_command_buffer_set_error(&cmd_buffer->vk, result);
++
+    /* setup initial configuration into command buffer */
+    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       switch (cmd_buffer->queue_family_index) {
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index fa2ca90..cb98841 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -1169,8 +1169,12 @@ tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *req =
+             (VkMemoryDedicatedRequirements *) ext;
++         /* ios-sweet: an image over imported host memory (an IOSurface's pages, metal2vulkan's no-copy textures)
++          * binds at an offset of that import; requiring a dedicated allocation made the runtime shadow every such
++          * texture with a copy (twice the GPU pool for WebKit's page tiles, guacamole mtl2 run 6) */
+          req->requiresDedicatedAllocation =
+-            image->vk.external_handle_types != 0;
++            (image->vk.external_handle_types &
++             ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0;
+          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
+          break;
+       }

@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4ce4792f5..a25091c1f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1274,7 +1274,7 @@ gpu_smmu_gpu_context(void)
+ 	wr(smmu, SMMU_CB1 + 0x010, (7u << 15) | (1u << 4) | 1u);
+ 	wr64(smmu, SMMU_CB1 + 0x020, gpumem_pa);
+ 	wr64(smmu, SMMU_CB1 + 0x028, 0);
+-	wr(smmu, SMMU_CB1 + 0x030, 32u | (2u << 12) | (1u << 23));
++	wr(smmu, SMMU_CB1 + 0x030, 28u | (2u << 12) | (1u << 23));             /* 0148: T0SZ 28, 64 GB */
+ 	wr(smmu, SMMU_CB1 + 0x034, 0);
+ 	wr(smmu, SMMU_CB1 + 0x038, 0xf404ff44u);
+ 	wr(smmu, SMMU_CB1 + 0x03c, 0);
+@@ -1895,7 +1895,12 @@ gpu_stage10(void)
+ #define GPUMEM_FENCEMEM   0x70000u
+ #define GVA_USER_START    0x01100000ull    /* VA given to clients starts here */
+ #define GVA_WIN_START     0x40000000ull    /* 0144: Turnip clients' windows, up to GVA_USER_END */
+-#define GVA_USER_END      0xf0000000ull
++/*
++ * 0148: 64 GB of GPU VA (CB1 TCR T0SZ 28, was 32: 4 GB). backboardd imports every app's layer
++ * surfaces into its window; at 512 MB of 2.75 GB it was refused (OutOfMemory(Device), mtl2 run 9:
++ * Telegram's layers never composited, backboardd at 100% CPU retrying).
++ */
++#define GVA_USER_END      0x1000000000ull
+ #define RB_DWORDS         (RB_SIZE / 4u)
+ 
+ /* Prototypes: RedwoodGPU.cpp calls these (extern "C"). */
+@@ -1931,7 +1936,7 @@ static unsigned be_va_count;
+ static uint64_t be_l3_pa[GVA_USER_END >> 21];      /* 0 = none; one L3 covers 2 MB */
+ static vm_offset_t be_l3_kva[GVA_USER_END >> 21];  /* kernel VA of that L3 page */
+ /* 0144: the L2 table of each GB of GPU VA (TCR T0SZ 32: four L1 entries); [0] is the stage-7 one */
+-static uint64_t *be_l2[4];
++static uint64_t *be_l2[GVA_USER_END >> 30];
+ 
+ static uint64_t *
+ be_l3_for(uint64_t va, bool create)
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 3d9e388e2..770e9b733 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -49,9 +49,10 @@ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
+ #define SWEET_V2_TUNNEL         0x4e544e4cu     /* 'NTNL' */
+ #define SWEET_V2_MAX_BOS        65536
+ #define SWEET_V2_PAGEBUF        1024            /* 4K pages per sweet_gpu_map_at call */
+-#define SWEET_V2_WIN_SYSTEM     0x20000000ull   /* backboardd, SpringBoard: 512 MB of GPU VA */
+-#define SWEET_V2_WIN_WEBKIT     0x20000000ull   /* WebKit's processes: 512 MB (pool buffers plus every imported page tile) */
+-#define SWEET_V2_WIN_CLIENT     0x10000000ull   /* everyone else: 256 MB */
++/* 0148: GPU VA is 64 GB now (sweet_gpu.c GVA_USER_END) */
++#define SWEET_V2_WIN_SYSTEM     0x100000000ull  /* backboardd, SpringBoard: 4 GB (every app's layers) */
++#define SWEET_V2_WIN_WEBKIT     0x80000000ull   /* WebKit's processes: 2 GB (pool buffers plus every imported page tile) */
++#define SWEET_V2_WIN_CLIENT     0x40000000ull   /* everyone else: 1 GB */
+ 
+ /* One buffer object (slot + 1 = handle = CPU-map token) */
+ struct SweetV2BO {
+@@ -389,7 +390,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 	case NativeAdrenoMethodQuery: {
+ 		V2_OUT(NativeAdrenoAbiParams);
+ 		rp->abi_version = NativeAdrenoAbiVersion;
+-		rp->input_bits = 32;            /* the GPU context's TCR T0SZ = 32 (sweet_gpu.c stage 7) */
++		rp->input_bits = 36;            /* the GPU context's TCR T0SZ = 28 (sweet_gpu.c stage 7, 0148) */
+ 		rp->output_bits = 36;
+ 		rp->flags = NativeAdrenoParamsHostImport;
+ 		rp->max_bo_bytes = 1ULL << NativeAdrenoAbiMaxBoBytesShift;

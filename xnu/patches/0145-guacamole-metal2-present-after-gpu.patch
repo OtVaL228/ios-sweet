@@ -1,0 +1,71 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2266dfdb5..94016bf9d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" uint32_t redwood_gpu_last(void);                                     /* bsd/dev/sweet_gpu.c */
++extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);   /* 0144 */
++static bool sweet_fb_metal;     /* 0145: sweetmtl=2 */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -120,6 +123,8 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	uint32_t      fPendingFence;  /* 0145: the GPU's last submit when that swap came */
++	uint32_t      fFenceTicks;    /* 0145: vsyncs it has waited for that fence */
+ 	bool          fScaleUp;       /* panel > logical: scale layers up */
+ 	uint16_t     *fColMap;        /* panel x -> logical x (fScaleUp) */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+@@ -256,6 +261,7 @@ AppleCLCD::start(IOService *provider)
+ 		uint32_t mtl = 0;
+ 		(void)PE_parse_boot_argn("sweetmtl", &mtl, sizeof(mtl));
+ 		if (mtl == 2) {
++			sweet_fb_metal = true;
+ 			accel->setProperty("MetalPluginName", "SweetMetal2");
+ 			accel->setProperty("MetalPluginClassName", "SweetMTL2Device");
+ 			accel->setProperty("IOGLBundleName", "SweetMetal2");
+@@ -307,6 +313,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	/*
++	 * 0145: with Metal (sweetmtl=2) backboardd swaps once CoreAnimation has submitted a frame, not once
++	 * the GPU has drawn it (eagl.c finished every frame first): the copy below showed frames half drawn
++	 * (mtl2 run 7: flicker whenever something moves). The frame waits for the GPU's last submit at its
++	 * swap, the previous one staying on the panel; after 6 vsyncs it is shown anyway (a hung GPU).
++	 */
++	if (flush && fb->fPendingFence != 0 && sweet_gpu_wait_fence_ns(fb->fPendingFence, 0) != 0 &&
++	    ++fb->fFenceTicks < 6) {
++		flush = false;
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -377,6 +393,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fPendingFence = redwood_gpu_last();
++	fFenceTicks = 0;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -500,10 +518,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
+-		if (s->drawn != 0 && s->memory != NULL) {
++		if ((s->drawn != 0 || sweet_fb_metal) && s->memory != NULL) {
+ 			/*
+ 			 * 0131: the GPU draws into surfaces (RedwoodGPU) past this processor's cache;
+-			 * what the cache still holds of this one is older than the memory.
++			 * what the cache still holds of this one is older than the memory. 0145: Metal's
++			 * draws (Turnip, through 0144's imports) do not mark the surface: every one then.
+ 			 */
+ 			s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
+ 		}

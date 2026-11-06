@@ -11,3 +11,8 @@ __pycache__/
 research/gpu/fw/
 userland/out/
 userland/mesa/build/
+userland/turnip/out/
+userland/metal2/out/
+userland/metal2/test/mtltest
+userland/metal2/test/surftest
+userland/metal2/test/cgtest

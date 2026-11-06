@@ -179,6 +179,48 @@ wrap/unwrap (keychain items, wifid's passwords) and drops IOKit's busy
 hold for an IOKit daemon that never reports (configd's InterfaceNamer and
 wifid waited for it).
 
+## Metal (metal2vulkan + Turnip, sweetmtl=2)
+
+From ios-flame's SweetMetal2: `userland/metal2` (SweetMetal2.bundle: UniXNU's
+frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
+85fda3b3 + UniXNU's darwin backend) over the kernel's NativeAdreno user client
+(0144). Host builds: `tools/build-m2v-bridge.sh`, `tools/build-turnip-ios.sh`
+(sources fetched into ../metal-work, never stored here), then
+`userland/metal2/build.sh`; install the bundle into /System/Library/Extensions.
+
+- Who gets a device: `/var/local/mtl2-clients` (names, `*`, `-NAME`). Now
+  `backboardd com.apple.WebKit.GPU com.apple.WebKit.WebContent Telegram` and
+  the tests. backboardd on Metal needs the global prefs CAEnableDeepFramebuffer,
+  CAEnableFramebufferCompression, CAEnableIOSurfaceCompression = NO
+  (`userland/jb/prefs.c`); then CoreAnimation draws every filter itself
+  (methaneos.dev's blur(130px) and backdrop-filter were streaks on eagl.c).
+- Safari: WebKit2GPUProcessForDOMRendering = NO (pages drawn in WebContent,
+  as ios-flame); no `sweetsurf10=3` (10-bit tiles stay one-plane BGRA; the
+  bridge maps the XR formats 550-555 to BGRA8 in textures and pipelines).
+- Kernel: 0144 user client + GPU pool + client VA windows (and the L2-per-GB
+  fix: VA above 1 GB aliased), 0145 a swap is shown only after the GPU's
+  last submit (half-drawn frames) and surfaces are always cache-flushed,
+  0146 small buffers may use the compositor's reserve (Turnip writes through
+  NULL when a command stream BO is refused), 0147 GPU 585 MHz
+  (`sweetgpufreq`), DDR/SH0 BCM votes (`sweetddr`), pool +2 GB above XNU's
+  window (`sweetgpuhigh`; 0x2_0000_0000-0x2_8000_0000 is RAM per Android's
+  iomem), vsync period in the notification; 0148 64 GB of GPU VA (backboardd
+  ran out of 512 MB importing every app's layers: Telegram stayed black).
+- Turnip patch 0101: no dedicated allocation for host imports (no shadow copy
+  per IOSurface texture, half the pool) and a refused command stream fails
+  vkBeginCommandBuffer instead of crashing.
+- Tests (`userland/turnip/out`, `userland/metal2/test`): v2test (kernel ABI),
+  vktest (Turnip), m2vtest (bridge), mtltest/surftest/cgtest (Metal.framework,
+  IOSurface textures, CGIOSurfaceContext against the CPU).
+- Decrypted IPAs: re-sign every framework/dylib ad hoc (their decrypted pages
+  no longer match Apple's page hashes, the kernel drops CS_VALID, and then
+  entitlements, app group containers and keychain all fail), and the main
+  binary with the IPA's original entitlements (Telegram 10.2.6 crashes in
+  CloudKit without icloud-services, stays black without its app group).
+- Open: the present is a CPU copy + scale (21 ms a frame, ~45 fps max): move
+  it to the GPU's 2D engine as ios-flame 0111. web.telegram.org restarts
+  itself when its shared worker dies (not a GPU error).
+
 ## SWEETBOX file drop
 
 `tools/sweet-mailbox.py pack out.img NAME SRC [NAME SRC ...]`, then in TWRP
