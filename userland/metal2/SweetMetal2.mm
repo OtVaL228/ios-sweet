@@ -94,6 +94,29 @@ static void missing(const char *cls, const char *sel)
 @interface NBDeviceMethods (SweetMetal2)
 @end
 @implementation NBDeviceMethods (SweetMetal2)
+/*
+ * CoreImage's CIMetalDeviceGetLimits asks it (private: the memory the GPU shares with the CPU) inside a dispatch_once:
+ * unanswered, the exception left that once unfinished and every later CoreImage user waited on it (Telegram's photo
+ * editor and its chat videos hung, mtl2 run 10). What a client may hold of the kernel's GPU pool (0147: 768 MB a
+ * process) rounded to 1 GB; CoreImage sizes its caches by it.
+ */
+- (NSUInteger)sharedMemorySize
+{
+	return 1ull << 30;
+}
+/* The same probe asks these next: no memory of the GPU's own (unified), and the kernel's per-process pool cap */
+- (NSUInteger)dedicatedMemorySize
+{
+	return 0;
+}
+- (uint64_t)recommendedMaxWorkingSetSize
+{
+	return 768ull << 20;
+}
+- (NSUInteger)currentAllocatedSize
+{
+	return 0;
+}
 - (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error
 {
 	if (error)
