@@ -1,0 +1,72 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 739660a39..32396e50e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,9 @@ static bool sweet_fb_metal;     /* 0145: sweetmtl=2 */
+ static struct {
+ 	uint64_t window_start, last_swap, max_gap;
+ 	uint32_t swaps, at_swap, at_vsync, busy;
++	/* 0153: what CoreAnimation does between frames: vsyncs delivered, gaps between swaps, every selector */
++	uint32_t vsync_sent, gap17, gap34, gap50, gap_more;
++	uint32_t sel[128];
+ } sweet_fb_stats;
+ 
+ #if defined(SWEET)
+@@ -311,6 +314,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			    sweet_fb_stats.swaps, (uint32_t)(sweet_fb_stats.swaps * 10ull * 1000000000ull / window_ns) / 10,
+ 			    (uint32_t)(sweet_fb_stats.swaps * 10ull * 1000000000ull / window_ns) % 10, sweet_fb_stats.at_swap,
+ 			    sweet_fb_stats.at_vsync, sweet_fb_stats.busy, gap_us / 1000000);
++			char sels[256];
++			int at = 0;
++			for (unsigned i = 0; i < 128 && at < (int)sizeof(sels) - 16; i++) {
++				if (sweet_fb_stats.sel[i] != 0) {
++					at += snprintf(sels + at, sizeof(sels) - (size_t)at, " %u:%u", i, sweet_fb_stats.sel[i]);
++				}
++			}
++			sels[at] = 0;
++			IOLog("SWEET FB: 5s: vsyncs sent %u; swap gaps <17 ms %u, <34 %u, <50 %u, more %u; selectors%s\n",
++			    sweet_fb_stats.vsync_sent, sweet_fb_stats.gap17, sweet_fb_stats.gap34, sweet_fb_stats.gap50,
++			    sweet_fb_stats.gap_more, sels);
+ 		}
+ 		uint64_t keep = sweet_fb_stats.last_swap;
+ 		bzero(&sweet_fb_stats, sizeof(sweet_fb_stats));
+@@ -465,6 +479,19 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if (sweet_fb_stats.last_swap != 0 && now - sweet_fb_stats.last_swap > sweet_fb_stats.max_gap) {
+ 		sweet_fb_stats.max_gap = now - sweet_fb_stats.last_swap;
+ 	}
++	if (sweet_fb_stats.last_swap != 0) {
++		uint64_t gap_ns = 0;
++		absolutetime_to_nanoseconds(now - sweet_fb_stats.last_swap, &gap_ns);
++		if (gap_ns < 17000000ull) {
++			sweet_fb_stats.gap17++;
++		} else if (gap_ns < 34000000ull) {
++			sweet_fb_stats.gap34++;
++		} else if (gap_ns < 50000000ull) {
++			sweet_fb_stats.gap50++;
++		} else {
++			sweet_fb_stats.gap_more++;
++		}
++	}
+ 	sweet_fb_stats.last_swap = now;
+ 	sweet_fb_stats.swaps++;
+ 	/*
+@@ -1035,6 +1062,9 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 		return;
+ 	}
+ 	bzero(ref, sizeof(ref));
++	if (type == SWEET_FB_NOTIFY_VSYNC) {
++		sweet_fb_stats.vsync_sent++;
++	}
+ 	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
+ 	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+ 	    kIOUserNotifyOptionCanDrop);
+@@ -1047,6 +1077,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
++	if (selector < 128) {
++		sweet_fb_stats.sel[selector]++;           /* 0153 */
++	}
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;

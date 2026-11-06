@@ -1,0 +1,61 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 20bbccd08..23d99ed0b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -123,6 +123,7 @@ public:
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
++	IOLock       *fPresentLock;     /* 0150: one GPU present at a time (swap and vsync both present) */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+@@ -228,6 +229,7 @@ AppleCLCD::start(IOService *provider)
+ 	fOffX = fScaleUp ? 0 : (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = fScaleUp ? 0 : (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -352,7 +354,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		/* 0132: what showing a frame costs (sweetfb_hz: can the CPU keep up at 60?) */
+ 		static uint64_t shown, spent;
+ 		uint64_t began = mach_absolute_time();
+-		int gpu = fb->presentGPU(rec);
++		int gpu = -1;
++		if (fb->fPresentLock == NULL || IOLockTryLock(fb->fPresentLock)) {
++			gpu = fb->presentGPU(rec);
++			if (fb->fPresentLock != NULL) {
++				IOLockUnlock(fb->fPresentLock);
++			}
++		}
+ 		if (gpu < 0) {
+ 			/* 0149: the GPU's previous blit still runs: this frame waits for the next vsync */
+ 			IOLockLock(fb->fLock);
+@@ -427,6 +435,25 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
++	/*
++	 * 0150: the GPU present right away. The blit goes on the ring behind the frame's own drawing, which
++	 * CoreAnimation submitted before this swap, so the GPU orders them and nothing waits here; the vsync
++	 * timer waited for the next tick and then for the fence (0145), and a frame whose GPU work missed a
++	 * tick waited a whole one more: 30 fps with backboardd and SpringBoard both idle 2/3 of the time
++	 * (mtl2 run 12, tsample). The panel refreshes on its own clock anyway. A busy blit slot (or another
++	 * present under way) leaves the frame to the vsync timer, as before.
++	 */
++	if (sweet_fb_metal && !fPowerOff && fPresentLock != NULL && IOLockTryLock(fPresentLock)) {
++		int shown = presentGPU(rec);
++		IOLockUnlock(fPresentLock);
++		if (shown > 0) {
++			IOLockLock(fLock);
++			if (memcmp(fPending, rec, SWEET_FB_SWAP_REC_SIZE) == 0) {
++				fDirty = false;
++			}
++			IOLockUnlock(fLock);
++		}
++	}
+ }
+ 
+ /*

@@ -1,0 +1,380 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 568fcf312..20bbccd08 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,11 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" uint32_t redwood_gpu_last(void);                                     /* bsd/dev/sweet_gpu.c */
++extern "C" bool redwood_gpu_ready(void);
++extern "C" int sweet_gpu_window_alloc(uint64_t bytes, uint64_t *base);         /* 0144 */
++extern "C" int sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages);
++extern "C" uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy);
++extern "C" int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);   /* 0144 */
+ static bool sweet_fb_metal;     /* 0145: sweetmtl=2 */
+ 
+@@ -136,6 +141,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	int presentGPU(const uint8_t *rec);
++	void pauseConsole(void);
+ 	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+ 	    int32_t w, int32_t h);
+ };
+@@ -345,7 +352,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		/* 0132: what showing a frame costs (sweetfb_hz: can the CPU keep up at 60?) */
+ 		static uint64_t shown, spent;
+ 		uint64_t began = mach_absolute_time();
+-		fb->present(rec);
++		int gpu = fb->presentGPU(rec);
++		if (gpu < 0) {
++			/* 0149: the GPU's previous blit still runs: this frame waits for the next vsync */
++			IOLockLock(fb->fLock);
++			fb->fDirty = true;
++			IOLockUnlock(fb->fLock);
++			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
++		}
++		if (gpu == 0) {
++			fb->present(rec);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		spent += mach_absolute_time() - began;
+ 		if (++shown % 300 == 0) {
+@@ -476,12 +495,172 @@ AppleCLCD::presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, in
+ 	}
+ }
+ 
+-void
+-AppleCLCD::present(const uint8_t *rec)
++/*
++ * 0149: the present on the GPU's 2D engine (CP_BLIT, BLIT_OP_SCALE: bilinear scale of CoreAnimation's
++ * 1125x2436 surface onto the 1440x3120 panel), queued behind the frame's own drawing on the same ring.
++ * The CPU copy (present/presentScaled) took 21 ms a frame (mtl2 run 9: cache flush of 11 MB, nearest-
++ * neighbour scale, 18 MB into write-combined panel memory), more than a 60 Hz vsync. Register values:
++ * ios-flame's a6_blit_ib (NWylynko/ios-flame, MIT: turnip's r2d path for vkCmdBlitImage captured on the
++ * same A640), field layouts in Mesa's a6xx.xml. Only for one enabled BGRA layer with 64-byte rows while
++ * Metal draws (sweetmtl=2); anything else takes the CPU path. Boot-arg sweetfbgpu=0 keeps the CPU path.
++ *
++ * GPU VA: one 256 MB window of 0144's: +0 the command buffers and scratch (64 KB of the pool),
++ * +16 MB the panel memory, +64 MB four 16 MB slots for CoreAnimation's surfaces (it rotates three).
++ */
++#define FBGPU_IB_BYTES          0x4000u
++#define FBGPU_PANEL_OFF         0x1000000ull
++#define FBGPU_SLOT_OFF          0x4000000ull
++#define FBGPU_SLOT_BYTES        0x1000000ull
++#define FBGPU_SLOTS             4
++
++static struct {
++	bool tried, ok;
++	uint64_t win;
++	uint32_t *ib[2];                /* CPU view (write-combined) */
++	uint32_t fence[2];
++	unsigned next;
++	struct { uint32_t id; uint64_t pa0, len; } slot[FBGPU_SLOTS];
++	unsigned victim;
++	uint64_t *pages;                /* FBGPU_SLOT_BYTES / 4K */
++} sweet_fbgpu;
++
++static uint32_t
++fbgpu_parity(uint32_t v)
+ {
+-	uint32_t mask = get32(rec, 0x104);
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	    (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++fbgpu_pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | (fbgpu_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (fbgpu_parity(reg) << 27);
++}
++
++static uint32_t
++fbgpu_pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (fbgpu_parity(cnt) << 15) | ((op & 0x7fu) << 16) | (fbgpu_parity(op) << 23);
++}
++
++/* Map n bytes of physically contiguous memory at iova */
++static bool
++fbgpu_map_contig(uint64_t iova, uint64_t pa, uint64_t bytes)
++{
++	for (uint64_t off = 0; off < bytes;) {
++		uint32_t n = 0;
++		uint64_t start = off;
++		for (; n < FBGPU_SLOT_BYTES / 4096 && off < bytes; n++, off += 4096) {
++			sweet_fbgpu.pages[n] = pa + off;
++		}
++		if (sweet_gpu_map_at(iova + start, sweet_fbgpu.pages, n)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Once: the window, the command buffers, the panel mapping */
++static bool
++fbgpu_setup(uint64_t panel_pa, uint64_t panel_bytes)
++{
++	if (sweet_fbgpu.tried) {
++		return sweet_fbgpu.ok;
++	}
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetfbgpu", &on, sizeof(on));
++	if (!on || !redwood_gpu_ready()) {
++		if (!on) {
++			sweet_fbgpu.tried = true;
++		}
++		return false;
++	}
++	sweet_fbgpu.tried = true;
++	uint64_t pa = 0;
++	sweet_fbgpu.pages = IONew(uint64_t, FBGPU_SLOT_BYTES / 4096);
++	IOMemoryDescriptor *md = NULL;
++	IOMemoryMap *map = NULL;
++	if (sweet_fbgpu.pages == NULL || panel_bytes > FBGPU_SLOT_OFF - FBGPU_PANEL_OFF ||
++	    sweet_gpu_window_alloc(0x10000000ull, &sweet_fbgpu.win) || sweet_gpu_pool_alloc(0x10000, &pa) ||
++	    (md = IOMemoryDescriptor::withPhysicalAddress(pa, 0x10000, kIODirectionInOut)) == NULL ||
++	    (map = md->map(kIOMapWriteCombineCache)) == NULL ||
++	    !fbgpu_map_contig(sweet_fbgpu.win, pa, 0x10000) ||
++	    !fbgpu_map_contig(sweet_fbgpu.win + FBGPU_PANEL_OFF, panel_pa, round_page_64(panel_bytes))) {
++		IOLog("SWEET FB: GPU present unavailable: the CPU copies frames\n");
++		return false;
++	}
++	uint8_t *cpu = (uint8_t *)map->getVirtualAddress();
++	bzero(cpu, 0x10000);
++	sweet_fbgpu.ib[0] = (uint32_t *)cpu;
++	sweet_fbgpu.ib[1] = (uint32_t *)(cpu + FBGPU_IB_BYTES);
++	sweet_fbgpu.ok = true;
++	IOLog("SWEET FB: GPU present: window %#llx, panel at +%#llx (%llu KB)\n", sweet_fbgpu.win, FBGPU_PANEL_OFF,
++	    panel_bytes >> 10);
++	return true;            /* md and map stay for good */
++}
++
++/*
++ * The slot holding this surface (mapped now if it is new): the GPU VA of its byte 0, or 0. A slot is
++ * remapped only while no blit of ours is queued (busy: *busy, the frame waits a vsync).
++ */
++static uint64_t
++fbgpu_surface_va(SweetSurface *s, bool *busy)
++{
++	IOByteCount seg = 0;
++	uint64_t len = round_page_64(s->memory->getLength());
++	uint64_t pa0 = s->memory->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++	if (pa0 == 0 || len > FBGPU_SLOT_BYTES) {
++		return 0;
++	}
++	for (unsigned i = 0; i < FBGPU_SLOTS; i++) {
++		if (sweet_fbgpu.slot[i].id == s->id && sweet_fbgpu.slot[i].pa0 == pa0 && sweet_fbgpu.slot[i].len == len) {
++			return sweet_fbgpu.win + FBGPU_SLOT_OFF + i * FBGPU_SLOT_BYTES;
++		}
++	}
++	for (unsigned k = 0; k < 2; k++) {
++		if (sweet_fbgpu.fence[k] != 0 && sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 0) != 0) {
++			*busy = true;
++			return 0;
++		}
++	}
++	unsigned i = sweet_fbgpu.victim++ % FBGPU_SLOTS;
++	uint32_t n = 0;
++	for (uint64_t off = 0; off < len; off += 4096, n++) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || (pa & 4095)) {
++			return 0;
++		}
++		sweet_fbgpu.pages[n] = pa;
++	}
++	uint64_t va = sweet_fbgpu.win + FBGPU_SLOT_OFF + i * FBGPU_SLOT_BYTES;
++	sweet_fbgpu.slot[i].id = 0;
++	if (sweet_gpu_map_at(va, sweet_fbgpu.pages, n)) {
++		return 0;
++	}
++	sweet_fbgpu.slot[i].id = s->id;
++	sweet_fbgpu.slot[i].pa0 = pa0;
++	sweet_fbgpu.slot[i].len = len;
++	return va;
++}
+ 
++/* The A640 state turnip writes before any work (tu6_init_hw), as ios-flame captured it */
++static const uint32_t fbgpu_init[][2] = {
++	{ 0x9804, 0x1f }, { 0x9805, 1 }, { 0xa0f8, 1 }, { 0xb600, 0x8000 }, { 0x8600, 0 },
++	{ 0xae03, 0x420 }, { 0xae00, 0 }, { 0xbe04, 0 }, { 0x9600, 0x2000000 }, { 0x0e12, 1 },
++	{ 0x8e01, 1 }, { 0x8e04, 0x4100000 }, { 0xae04, 0 }, { 0xae0f, 0x3f }, { 0xb605, 0x44 },
++	{ 0xbe00, 0x80 }, { 0xbe01, 0 }, { 0xab20, 0 }, { 0xb182, 0 }, { 0xbb11, 0 }, { 0xa9a8, 0 },
++	{ 0xab00, 5 }, { 0xa009, 3 }, { 0x8811, 0x10 }, { 0x8110, 0 }, { 0x8818, 0 }, { 0x8819, 0 },
++	{ 0x881a, 0 }, { 0x881b, 0 }, { 0x881c, 0 }, { 0x881d, 0 }, { 0x881e, 0 }, { 0x88f0, 0 },
++	{ 0x9236, 0 }, { 0x9300, 0 }, { 0x9306, 1 }, { 0xb183, 0 }, { 0x80af, 0 }, { 0x8099, 0 },
++	{ 0x980a, 0 }, { 0x9210, 0 }, { 0x9211, 0 }, { 0x9602, 0 }, { 0x9e72, 0 }, { 0xb309, 0xa2 },
++	{ 0xb986, 0xfc }, { 0xa007, 0 }, { 0x8864, 0 }, { 0xb800, 0x102 },
++	{ 0x8e07, 0x10000000 },         /* RB_CCU_CNTL: sysmem, full CCU */
++};
+ 
++/* From the first frame shown on: the kernel console stops drawing over the GUI (sweetfb_noconsole) */
++void
++AppleCLCD::pauseConsole(void)
++{
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -491,6 +670,157 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++}
++
++/* 1 shown (queued on the GPU), 0 not for the GPU (the CPU path shows it), -1 the GPU is busy: next vsync */
++int
++AppleCLCD::presentGPU(const uint8_t *rec)
++{
++	if (!sweet_fb_metal || !fScaleUp || !fbgpu_setup(fPhys, (uint64_t)fRowBytes * fHeight)) {
++		return 0;
++	}
++	pauseConsole();
++	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
++			if (layer != SWEET_FB_LAYERS) {
++				return 0;               /* two layers: the CPU path composes them */
++			}
++			layer = l;
++		}
++	}
++	if (layer == SWEET_FB_LAYERS) {
++		return 0;
++	}
++	unsigned k = sweet_fbgpu.next;
++	if (sweet_fbgpu.fence[k] != 0 && sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 0) != 0) {
++		return -1;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (s == NULL || s == fSurface || s->memory == NULL || s->pixelFormat != 0x42475241u ||
++	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerRow & 63) ||
++	    (s->offset & 63)) {
++		OSSafeReleaseNULL(s);
++		return 0;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer;
++	const uint8_t *b = rec + 0xc4 + 16 * layer;
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++	int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++	int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++	if (w <= 0 || h <= 0) {
++		w = (int32_t)s->width;
++		h = (int32_t)s->height;
++	}
++	if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || w > (int32_t)s->width - sx || h > (int32_t)s->height - sy ||
++	    w > (int32_t)fLogicalW - dx || h > (int32_t)fLogicalH - dy) {
++		OSSafeReleaseNULL(s);
++		return 0;
++	}
++	bool busy = false;
++	uint64_t src = fbgpu_surface_va(s, &busy);
++	uint32_t sw = s->width, sh = s->height, spitch = s->bytesPerRow;
++	src += src ? s->offset : 0;
++	s->release();
++	if (src == 0) {
++		return busy ? -1 : 0;
++	}
++	/* the panel rectangle the logical one covers (presentScaled's rounding) */
++	uint32_t px0 = (uint32_t)(((uint64_t)dx * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t px1 = (uint32_t)(((uint64_t)(dx + w) * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t py0 = (uint32_t)(((uint64_t)dy * fHeight + fLogicalH - 1) / fLogicalH);
++	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH);
++	px1 = px1 > fWidth ? fWidth : px1;
++	py1 = py1 > fHeight ? fHeight : py1;
++	if (px1 <= px0 || py1 <= py0) {
++		return 0;
++	}
++	uint64_t dst = sweet_fbgpu.win + FBGPU_PANEL_OFF;
++	uint64_t border = sweet_fbgpu.win + 2 * FBGPU_IB_BYTES, ts = border + 0x100;
++	uint32_t *dw = sweet_fbgpu.ib[k], n = 0;
++#define EV(e)           do { dw[n++] = fbgpu_pkt7(0x46, 1); dw[n++] = (e); } while (0)
++#define EV_TS(e)        do { dw[n++] = fbgpu_pkt7(0x46, 4); dw[n++] = (e); dw[n++] = (uint32_t)ts; \
++	                     dw[n++] = (uint32_t)(ts >> 32); dw[n++] = 0; } while (0)
++#define REG(r, v)       do { dw[n++] = fbgpu_pkt4((r), 1); dw[n++] = (v); } while (0)
++	EV(0x31);                               /* CACHE_INVALIDATE */
++	REG(0xbb08, 0xfffff);                   /* SP_UPDATE_CNTL */
++	dw[n++] = fbgpu_pkt7(0x26, 0);          /* CP_WAIT_FOR_IDLE */
++	for (unsigned i = 0; i < sizeof(fbgpu_init) / sizeof(fbgpu_init[0]); i++) {
++		REG(fbgpu_init[i][0], fbgpu_init[i][1]);
++	}
++	dw[n++] = fbgpu_pkt4(0xb302, 2);        /* TPL1_GFX_BORDER_COLOR_BASE */
++	dw[n++] = (uint32_t)border;
++	dw[n++] = (uint32_t)(border >> 32);
++	dw[n++] = fbgpu_pkt4(0xb180, 2);        /* TPL1_CS_BORDER_COLOR_BASE */
++	dw[n++] = (uint32_t)border;
++	dw[n++] = (uint32_t)(border >> 32);
++	EV_TS(0x1d);                            /* PC_CCU_FLUSH_COLOR_TS */
++	EV(0x19);                               /* PC_CCU_INVALIDATE_COLOR */
++	EV(0x31);
++	dw[n++] = fbgpu_pkt7(0x26, 0);
++	REG(0x8c01, 0);                         /* RB_A2D_PIXEL_CNTL: no blend */
++	REG(0x8c00, 0x00f03000);                /* RB_A2D_BLT_CNTL: 8888 UNORM, mask f */
++	REG(0x8400, 0x00f03000);                /* GRAS_A2D_BLT_CNTL */
++	REG(0xacc0, 0xf180);                    /* SP_A2D_OUTPUT_INFO */
++	dw[n++] = fbgpu_pkt4(0x8405, 2);        /* GRAS_A2D_DEST_TL, _BR (inclusive) */
++	dw[n++] = px0 | (py0 << 16);
++	dw[n++] = (px1 - 1) | ((py1 - 1) << 16);
++	dw[n++] = fbgpu_pkt4(0x8401, 4);        /* GRAS_A2D_SRC_XMIN..YMAX, 24.8 fixed, inclusive */
++	dw[n++] = (uint32_t)sx << 8;
++	dw[n++] = (uint32_t)(sx + w - 1) << 8;
++	dw[n++] = (uint32_t)sy << 8;
++	dw[n++] = (uint32_t)(sy + h - 1) << 8;
++	dw[n++] = fbgpu_pkt4(0xb4c0, 5);        /* TPL1_A2D_SRC_TEXTURE_INFO, SIZE, BASE, PITCH */
++	dw[n++] = 0x00500430 | 0x10000;         /* 8888, linear, WXYZ; bilinear */
++	dw[n++] = sw | (sh << 15);
++	dw[n++] = (uint32_t)src;
++	dw[n++] = (uint32_t)(src >> 32);
++	dw[n++] = spitch << 3;
++	dw[n++] = fbgpu_pkt4(0xb4ca, 3);        /* TPL1_A2D_SRC_TEXTURE_FLAG_BASE, _PITCH */
++	dw[n++] = (uint32_t)src;
++	dw[n++] = (uint32_t)(src >> 32);
++	dw[n++] = 0;
++	dw[n++] = fbgpu_pkt4(0x8c17, 4);        /* RB_A2D_DEST_BUFFER_INFO, BASE, PITCH (64 B units) */
++	dw[n++] = 0x430;
++	dw[n++] = (uint32_t)dst;
++	dw[n++] = (uint32_t)(dst >> 32);
++	dw[n++] = fRowBytes >> 6;
++	dw[n++] = fbgpu_pkt4(0x8c20, 3);        /* RB_A2D_DEST_FLAG_BUFFER_BASE, _PITCH */
++	dw[n++] = (uint32_t)dst;
++	dw[n++] = (uint32_t)(dst >> 32);
++	dw[n++] = 0;
++	dw[n++] = fbgpu_pkt7(0x2c, 1);          /* CP_BLIT */
++	dw[n++] = 3;                            /* BLIT_OP_SCALE */
++	EV_TS(0x1d);                            /* PC_CCU_FLUSH_COLOR_TS */
++	EV_TS(0x1c);                            /* PC_CCU_FLUSH_DEPTH_TS */
++	EV_TS(0x04);                            /* CACHE_FLUSH_TS */
++#undef EV
++#undef EV_TS
++#undef REG
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t iova = sweet_fbgpu.win + (uint64_t)k * FBGPU_IB_BYTES;
++	uint32_t fence = sweet_gpu_submit_v2(&iova, &n, 1, &busy);
++	if (fence == 0) {
++		return busy ? -1 : 0;
++	}
++	sweet_fbgpu.fence[k] = fence;
++	sweet_fbgpu.next = k ^ 1;
++	static bool said;
++	if (!said) {
++		said = true;
++		IOLog("SWEET FB: first GPU present: %ux%u -> panel %u,%u-%u,%u (%u dwords, fence %u)\n", sw, sh,
++		    px0, py0, px1, py1, n, fence);
++	}
++	return 1;
++}
++
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++
++
++	pauseConsole();
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);

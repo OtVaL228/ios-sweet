@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
+#include <os/lock.h>
 #import <objc/runtime.h>
 #include <algorithm>
 #include <atomic>
@@ -263,12 +264,25 @@ NB_RESOURCE_SPI
 // owners keep the mapping live through this phase. Maintain each exact CPU
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
+// guacamole: a surface is cleaned only when the CPU wrote it since its last clean (IOSurface's seed moves on every unlock after a
+// write lock) or never was: cleaning every surface of every command buffer (the 11 MB framebuffer, each app layer) took ~10% of
+// backboardd's render thread (tsample, mtl2 run 11), and most are written by the GPU alone.
+static std::unordered_map<uint32_t,uint32_t> gSurfaceSeeds;
+static os_unfair_lock gSurfaceSeedsLock=OS_UNFAIR_LOCK_INIT;
 static void flushSurfaces(NSMutableSet *surfaces) {
  if(!surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
- for(NBTexture *texture in surfaces)if(texture.surface)
+ os_unfair_lock_lock(&gSurfaceSeedsLock);
+ for(NBTexture *texture in surfaces)if(texture.surface) {
+  const uint32_t id=IOSurfaceGetID(texture.surface),seed=IOSurfaceGetSeed(texture.surface);
+  auto it=gSurfaceSeeds.find(id);
+  if(it!=gSurfaceSeeds.end() && it->second==seed)continue;
+  gSurfaceSeeds[id]=seed;
   ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
+ }
+ if(gSurfaceSeeds.size()>4096)gSurfaceSeeds.clear();     // ids of surfaces long gone: clean them all once more
+ os_unfair_lock_unlock(&gSurfaceSeedsLock);
  std::sort(ranges.begin(),ranges.end());
  const auto last=std::unique(ranges.begin(),ranges.end());
  gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
@@ -1543,9 +1557,24 @@ static char sweetMemoryOwnerKey;
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
+// guacamole: answers with an argument are the device's too and never change; asking the runtime each call cost 29% of backboardd's
+// render thread (supportsFamily: per draw, each a full family audit cloning the format tables: tsample, mtl2 run 11). Remembered per
+// (selector, argument), refusals included (logged once).
+struct NBAnswerKey {SEL sel;NSUInteger arg;bool operator==(const NBAnswerKey &o) const {return sel==o.sel && arg==o.arg;}};
+struct NBAnswerHash {size_t operator()(const NBAnswerKey &k) const {return std::hash<void *>()((void *)k.sel)^(std::hash<NSUInteger>()(k.arg)*31);}};
+static std::unordered_map<NBAnswerKey,uint64_t,NBAnswerHash> gArgAnswers;
+static os_unfair_lock gArgAnswersLock=OS_UNFAIR_LOCK_INIT;
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ const NBAnswerKey key={cmd,arg};
+ os_unfair_lock_lock(&gArgAnswersLock);
+ auto it=gArgAnswers.find(key);
+ if(it!=gArgAnswers.end()){uint64_t value=it->second;os_unfair_lock_unlock(&gArgAnswersLock);return value;}
+ os_unfair_lock_unlock(&gArgAnswersLock);
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ os_unfair_lock_lock(&gArgAnswersLock);
+ gArgAnswers[key]=value;
+ os_unfair_lock_unlock(&gArgAnswersLock);
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}

@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 760d23d9f..391594a32 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -496,8 +496,20 @@ touch_se_init(void)
+ 	touch_wr(st.se, 0x24, 0x7f);
+ 	touch_wr(st.se, 0x20, 1);
+ 	touch_wr(st.se, SE_CLK_SEL, st.clk_sel);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	/*
++	 * 0152: 400 kHz, as Android ran it (no clock-frequency in the live DT: downstream i2c-qcom-geni's
++	 * default); Linux geni_i2c_clk_map for 19.2 MHz: div 2, t_high 5, t_low 12, t_cycle 24 (100 kHz:
++	 * 7, 10, 11, 26). Boot-arg sweettouchkhz=100 keeps the old speed.
++	 */
++	uint32_t khz = 400;
++	(void)PE_parse_boot_argn("sweettouchkhz", &khz, sizeof(khz));
++	if (khz == 100) {
++		touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++		touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);
++	} else {
++		touch_wr(st.se, SE_MCLK, (2u << 4) | 1u);
++		touch_wr(st.se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	}
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+ 	touch_wr(st.se, 0x254, 0);
+ 	touch_wr(st.se, 0x260, SE_PACK0);
+@@ -596,16 +608,26 @@ touch_thread(void *arg, wait_result_t result)
+ 	const uint8_t on = SY_SENSE_ON;
+ 	int w1 = touch_write(func, sizeof(func));
+ 	int w2 = touch_write(&on, 1);
+-	printf("SWEET TOUCH: touch-function=%d sense-on=%d; polling 10 ms, %ux%u irq-hint=%d\n",
+-	    w1, w2, TP_W, TP_H, st.irq_hint);
++	/*
++	 * 0152: every 4 ms (was 10): in a swipe CoreAnimation draws a frame when a touch sample has come, so
++	 * the sample rate is the swipe's frame rate (mtl2 run 13: 22-26 frames a second, every frame shown at
++	 * once, GPU never busy; hakios measured the same and went to 4 ms). Boot-arg sweettouchms.
++	 */
++	uint32_t poll_ms = 4;
++	(void)PE_parse_boot_argn("sweettouchms", &poll_ms, sizeof(poll_ms));
++	if (poll_ms < 1 || poll_ms > 50) {
++		poll_ms = 4;
++	}
++	printf("SWEET TOUCH: touch-function=%d sense-on=%d; polling %u ms, %ux%u irq-hint=%d\n",
++	    w1, w2, poll_ms, TP_W, TP_H, st.irq_hint);
+ 	if (w2) {
+ 		goto out;
+ 	}
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+-		/* Optional IRQ hint (active low) still reads every 100 ms and while down. */
++		/* Optional IRQ hint (active low) still reads every ~100 ms and while down. */
+ 		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(TP_IRQ)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
++		    (++ticks % (100u / poll_ms)) == 0) {
+ 			int err = touch_s6sy();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+@@ -618,7 +640,7 @@ touch_thread(void *arg, wait_result_t result)
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(10);
++		touch_wait(poll_ms);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:

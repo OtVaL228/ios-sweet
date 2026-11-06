@@ -217,9 +217,26 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   entitlements, app group containers and keychain all fail), and the main
   binary with the IPA's original entitlements (Telegram 10.2.6 crashes in
   CloudKit without icloud-services, stays black without its app group).
-- Open: the present is a CPU copy + scale (21 ms a frame, ~45 fps max): move
-  it to the GPU's 2D engine as ios-flame 0111. web.telegram.org restarts
-  itself when its shared worker dies (not a GPU error).
+- Frame rate (swipes, `SWEET FB: 5s:` lines of 0151/0153/0155): 25 -> 37-44
+  fps. 0149 presents on the GPU's 2D engine (CP_BLIT scale, 18 us of CPU
+  instead of 21 ms), 0150 at the swap (the GPU orders the blit behind the
+  frame), bridge answers cached (supportsFamily: was 29% of backboardd's render
+  thread) and surfaces cleaned only when their seed moved, bridge built with
+  LTO and cortex-a76; 0156 puts perf threads on idle A76s (the SMP scheduler
+  took the lowest idle CPU, an A55) and with `sweetcpufreq=2` asks the A76 OSM
+  domains for their top row (the kernel never set CPU clocks). iOS 16's window
+  server never asks for vsync notifications (0 sent, selector 72 never called):
+  it clocks itself by IOMFBDisplayRefresh (0154, as hakios). vmd (visual
+  voicemail) spun a whole core without CoreTelephony: `launchctl disable`
+  system/ and user/501/com.apple.voicemail.vmd.
+- Profiling: `userland/jb/tsample` (task_for_pid, frame-pointer samples of the
+  busiest thread; symbolicate the bridge with its dSYM) and `exports` (a shared
+  cache library's exports and code, read in place).
+- Open: GPU now 55-82% busy in swipes (585 MHz); next: render at @2x (hakios:
+  750x1624, 107-120 fps) and UniXNU/sheng's metal2vulkan per-draw patches.
+  Chat videos hang: mediaserverd waits for an audio device at start
+  (vaemGetVirtualAudioDeviceIDs). web.telegram.org restarts itself when its
+  shared worker dies (not a GPU error).
 
 ## SWEETBOX file drop
 

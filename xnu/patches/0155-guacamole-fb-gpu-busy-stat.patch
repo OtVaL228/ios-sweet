@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c940c7b56..53e26b0c2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,7 @@ static struct {
+ 	uint32_t swaps, at_swap, at_vsync, busy;
+ 	/* 0153: what CoreAnimation does between frames: vsyncs delivered, gaps between swaps, every selector */
+ 	uint32_t vsync_sent, gap17, gap34, gap50, gap_more;
++	uint32_t ticks, gpu_busy_ticks;         /* 0155: vsync ticks, and those with GPU work still running */
+ 	uint32_t sel[128];
+ } sweet_fb_stats;
+ 
+@@ -306,6 +307,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (sweet_fb_stats.window_start == 0) {
+ 		sweet_fb_stats.window_start = now;
+ 	}
++	/* 0155: is the GPU still on what was last submitted (anyone's)? Sampled 60 times a second */
++	sweet_fb_stats.ticks++;
++	{
++		uint32_t last = redwood_gpu_last();
++		if (last != 0 && sweet_gpu_wait_fence_ns(last, 0) != 0) {
++			sweet_fb_stats.gpu_busy_ticks++;
++		}
++	}
+ 	uint64_t window_ns = 0;
+ 	absolutetime_to_nanoseconds(now - sweet_fb_stats.window_start, &window_ns);
+ 	if (window_ns >= 5000000000ull) {
+@@ -324,9 +333,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 			sels[at] = 0;
+-			IOLog("SWEET FB: 5s: vsyncs sent %u; swap gaps <17 ms %u, <34 %u, <50 %u, more %u; selectors%s\n",
++			IOLog("SWEET FB: 5s: vsyncs sent %u; swap gaps <17 ms %u, <34 %u, <50 %u, more %u; GPU busy at %u%% of vsyncs; selectors%s\n",
+ 			    sweet_fb_stats.vsync_sent, sweet_fb_stats.gap17, sweet_fb_stats.gap34, sweet_fb_stats.gap50,
+-			    sweet_fb_stats.gap_more, sels);
++			    sweet_fb_stats.gap_more, sweet_fb_stats.ticks ? sweet_fb_stats.gpu_busy_ticks * 100 / sweet_fb_stats.ticks : 0,
++			    sels);
+ 		}
+ 		uint64_t keep = sweet_fb_stats.last_swap;
+ 		bzero(&sweet_fb_stats, sizeof(sweet_fb_stats));

@@ -44,8 +44,19 @@ sha2 = { version = "0.10", features = ["asm"] }
 [profile.release]
 panic = "unwind"
 debug = 1
+# guacamole: the bridge is most of backboardd's render thread (tsample, mtl2 run 15: 75% of its busy time, in every
+# draw's recording, binding and tracking): whole-program optimisation
+lto = "fat"
+codegen-units = 1
 EOT
-if [ "$target" = ios ]; then triple=aarch64-apple-ios; else triple=aarch64-apple-darwin; fi
+if [ "$target" = ios ]; then
+	triple=aarch64-apple-ios
+	# SM8150's Kryo 485 cores are Cortex-A76/A55 (ARMv8.2: LSE atomics, for the runtime's mutexes and Arcs); the
+	# target's default CPU is Apple A7's (ARMv8.0)
+	export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C target-cpu=cortex-a76"
+else
+	triple=aarch64-apple-darwin
+fi
 NMB_FIXTURE_AIR=$OUT/runtime_examples.air NMB_FC_AIR=$OUT/function_constant.air IPHONEOS_DEPLOYMENT_TARGET=16.0 \
 	MACOSX_DEPLOYMENT_TARGET=14.0 cargo +1.98.0 build --release --manifest-path "$OUT/Cargo.toml" --target $triple \
 	--target-dir "$OUT/target" > "$OUT/build-$target.log" 2>&1 || { grep -E "^(error|warning: unused)" -A6 "$OUT/build-$target.log" | head -60; exit 1; }

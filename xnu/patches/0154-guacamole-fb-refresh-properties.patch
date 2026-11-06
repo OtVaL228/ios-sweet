@@ -1,0 +1,112 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 32396e50e..c940c7b56 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -152,6 +152,7 @@ public:
+ 	void present(const uint8_t *rec);
+ 	int presentGPU(const uint8_t *rec);
+ 	void pauseConsole(void);
++	void publishRefresh(void);
+ 	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+ 	    int32_t w, int32_t h);
+ };
+@@ -260,6 +261,7 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
++	publishRefresh();
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+@@ -744,6 +746,91 @@ static const uint32_t fbgpu_init[][2] = {
+ 	{ 0x8e07, 0x10000000 },         /* RB_CCU_CNTL: sysmem, full CCU */
+ };
+ 
++static void
++sweet_fb_number(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 64);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++/*
++ * 0154: the refresh CoreAnimation clocks its frames by. iOS 16's window server never asks this driver for vsync
++ * notifications (mtl2 run 14: selector 72 never called, 0 vsyncs sent; per frame SwapBegin, SwapEnd, two
++ * SwapWait); it runs a clock of its own at the rate it reads from the property IOMFBDisplayRefresh
++ * (displayMinRefreshInterval, displayMaxRefreshInterval, displayRefreshStep in 2^-32 s; displayRefreshStepMachTime
++ * in mach_absolute_time ticks), and takes the display's modes from TimingElements/ColorElements (SyncRate 16.16 Hz).
++ * We published neither, and swaps came 34-50 ms apart with the CPU and the GPU idle. What hakios's
++ * MiniIOMobileFramebuffer found for the same userland (oosexgang/hakios-xnu-kernel, publishRefresh/publishModes,
++ * APSL), written here for this driver. Boot-arg sweetfb_refresh=N (default 60).
++ */
++void
++AppleCLCD::publishRefresh(void)
++{
++	uint32_t hz = 60;
++	(void)PE_parse_boot_argn("sweetfb_refresh", &hz, sizeof(hz));
++	if (hz < 1 || hz > 240) {
++		hz = 60;
++	}
++	uint64_t ticks = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &ticks);
++	const uint64_t interval = (1ULL << 32) / hz;
++	OSDictionary *refresh = OSDictionary::withCapacity(4);
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	if (refresh != NULL && timing != NULL && horizontal != NULL && vertical != NULL && color != NULL &&
++	    timings != NULL && colors != NULL) {
++		sweet_fb_number(refresh, "displayMinRefreshInterval", interval);
++		sweet_fb_number(refresh, "displayMaxRefreshInterval", interval);
++		sweet_fb_number(refresh, "displayRefreshStep", interval);
++		sweet_fb_number(refresh, "displayRefreshStepMachTime", ticks);
++		setProperty("IOMFBDisplayRefresh", refresh);
++
++		sweet_fb_number(color, "ID", 1);
++		sweet_fb_number(color, "PixelEncoding", 0);     /* RGB 4:4:4 */
++		sweet_fb_number(color, "Depth", 8);
++		sweet_fb_number(color, "Colorimetry", 1);
++		sweet_fb_number(color, "EOTF", 1);
++		sweet_fb_number(color, "DynamicRange", 0);
++		sweet_fb_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_fb_number(horizontal, "Active", fLogicalW);
++		sweet_fb_number(horizontal, "Total", fLogicalW);
++		sweet_fb_number(horizontal, "SyncRate", (uint64_t)hz << 16);
++		sweet_fb_number(horizontal, "PreciseSyncRate", (uint64_t)hz << 16);
++		sweet_fb_number(vertical, "Active", fLogicalH);
++		sweet_fb_number(vertical, "Total", fLogicalH);
++		sweet_fb_number(vertical, "SyncRate", (uint64_t)hz << 16);
++		sweet_fb_number(vertical, "PreciseSyncRate", (uint64_t)hz << 16);
++		sweet_fb_number(timing, "ID", 1);
++		sweet_fb_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		IOLog("SWEET FB: IOMFBDisplayRefresh %u Hz (interval %llu of 2^-32 s, %llu ticks), one %ux%u mode\n", hz,
++		    interval, ticks, fLogicalW, fLogicalH);
++	}
++	OSSafeReleaseNULL(refresh);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++}
++
+ /* From the first frame shown on: the kernel console stops drawing over the GUI (sweetfb_noconsole) */
+ void
+ AppleCLCD::pauseConsole(void)

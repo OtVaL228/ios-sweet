@@ -1,0 +1,251 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 99a268996..db1a52d6e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_pmem.c			standard
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+new file mode 100644
+index 000000000..5b2145486
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,95 @@
++/*
++ * SWEET (guacamole, SM8150) CPU clocks: the OSM (operating state manager) of each CPU domain.
++ *
++ * Nothing here ran the CPU clocks: every core stayed at what the boot left. On SM8150 the OSM picks a domain's
++ * frequency and voltage from a table it was given by the boot; the OS asks for a row of it. Android's DT
++ * ("qcom,clk-cpu-osm"): pwrcl 0x18323000 (cpu 0-3, Cortex-A55, up to 1785.6 MHz), perfcl 0x18325800 (cpu 4-6,
++ * Cortex-A76, 2419.2 MHz), perfpcl 0x18327800 (cpu 7, 2956.8 MHz). Registers as Linux's qcom-cpufreq-hw "v1" and
++ * the downstream clk-cpu-osm.c have them: the table from 0x110 in rows of 32 bytes (FREQ: bits 31:30 clock source,
++ * 0 = the 300 MHz init rate, else 7:0 = multiple of 19.2 MHz; bits 18:16 core count), the requested row at 0x920
++ * (DCVS_PERF_STATE_DESIRED). Thermal limits stay with the hardware (LMh), as under Linux.
++ *
++ * Boot-arg sweetcpufreq: 1 (default) reads and logs the tables and the requested rows; 2 asks the A76 domains for
++ * their top row; 3 the A55 domain as well; 0 leaves the block alone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define OSM_SIZE                0x1400u
++#define OSM_FREQ_LUT            0x110u
++#define OSM_LUT_ROW             32u
++#define OSM_LUT_ROWS            40u
++#define OSM_PERF_STATE          0x920u
++#define OSM_XO_KHZ              19200u
++
++static const struct {
++	const char *name;
++	uint64_t pa;
++	unsigned first_cpu, last_cpu;
++	bool big;
++} sweet_osm[] = {
++	{ "pwrcl (A55, cpu 0-3)", 0x18323000ull, 0, 3, false },
++	{ "perfcl (A76, cpu 4-6)", 0x18325800ull, 4, 6, true },
++	{ "perfpcl (A76, cpu 7)", 0x18327800ull, 7, 7, true },
++};
++
++static inline uint32_t
++osm_rd(vm_offset_t b, uint32_t off)
++{
++	return *(volatile uint32_t *)(b + off);
++}
++
++static inline void
++osm_wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	uint32_t mode = 1;
++	(void)PE_parse_boot_argn("sweetcpufreq", &mode, sizeof(mode));
++	if (mode == 0) {
++		printf("SWEET CPUFREQ: off (sweetcpufreq=0)\n");
++		return;
++	}
++	for (unsigned d = 0; d < sizeof(sweet_osm) / sizeof(sweet_osm[0]); d++) {
++		vm_offset_t b = ml_io_map(sweet_osm[d].pa, OSM_SIZE);
++		if (b == 0) {
++			continue;
++		}
++		/* the table's rows up to the first repeated one (the rest of the 40 repeat the top) */
++		uint32_t khz[OSM_LUT_ROWS], rows = 0;
++		char line[400];
++		int at = 0;
++		for (uint32_t i = 0; i < OSM_LUT_ROWS; i++) {
++			uint32_t f = osm_rd(b, OSM_FREQ_LUT + i * OSM_LUT_ROW);
++			uint32_t k = (f >> 30) == 0 ? 300000u : (f & 0xffu) * OSM_XO_KHZ;
++			if (i > 0 && k == khz[i - 1]) {
++				break;
++			}
++			khz[rows++] = k;
++			if (at < (int)sizeof(line) - 12) {
++				at += snprintf(line + at, sizeof(line) - (size_t)at, " %u", k / 1000);
++			}
++		}
++		line[at] = 0;
++		uint32_t cur = osm_rd(b, OSM_PERF_STATE);
++		printf("SWEET CPUFREQ: %s: %u rows (MHz)%s; requested row %u (%u MHz)\n", sweet_osm[d].name, rows, line, cur,
++		    cur < rows ? khz[cur] / 1000 : 0);
++		if (rows > 1 && ((mode >= 2 && sweet_osm[d].big) || mode >= 3)) {
++			osm_wr(b, OSM_PERF_STATE, rows - 1);
++			printf("SWEET CPUFREQ: %s: asked row %u (%u MHz), reads back %u\n", sweet_osm[d].name, rows - 1,
++			    khz[rows - 1] / 1000, osm_rd(b, OSM_PERF_STATE));
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 278bc5c58..bc713c781 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_cpufreq_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_probe(void);
+ extern void sweet_mailbox_probe(void);
+@@ -661,6 +662,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_cpufreq_init();                   /* 0156 */
+ 	sweet_usb_probe();
+ 	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
+ 	sweet_mailbox_probe();	/* GUACAMOLE: boot-arg sweetmailbox=1 */
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e2958646..856b16346 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5009,6 +5009,72 @@ choose_next_pset(
+ 	return nset;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++/*
++ * 0156: core placement on SM8150 (guacamole). This kernel runs the SMP Clutch scheduler, one pset: the ADT gives every
++ * CPU cluster-type 0 (tools/mkadt.py), there is no AMP/Edge scheduler, and choose_processor() takes the lowest idle
++ * CPU, so a woken thread lands on a Cortex-A55 (cpu 0-3, 1.79 GHz) whenever one is idle, the A76s (cpu 4-6 2.42 GHz,
++ * 7 2.96 GHz) only when all four are busy. backboardd's render thread, busy ~26 ms a frame (mtl2 run 15), was among
++ * them. Only which idle CPU is taken changes: a perf thread (realtime, or a user thread at base priority
++ * BASEPRI_USER_INITIATED and up: QoS user-initiated/interactive, foreground main threads, the render server) takes an
++ * idle A76 first, any other an idle A55 first; with none of its kind idle it takes any idle CPU, as before.
++ * The same as iOSPlus10's 0395 placement on SM8450 (akshaynexus/iOSPlus10), written for this kernel.
++ * Boot-arg sweetplace=0 keeps the old rule.
++ */
++static cpumap_t sweet_sched_pmask = 0xf0;               /* cpu 4-7 */
++static int sweet_sched_place = -1;
++
++static inline cpumap_t
++sweet_sched_big(void)
++{
++	if (sweet_sched_place < 0) {
++		int on = 1;
++		(void)PE_parse_boot_argn("sweetplace", &on, sizeof(on));
++		sweet_sched_place = on ? 1 : 0;
++	}
++	return sweet_sched_place ? sweet_sched_pmask : 0;
++}
++
++static inline bool
++sweet_thread_wants_big(thread_t thread)
++{
++	if (get_threadtask(thread) == kernel_task) {
++		return false;
++	}
++	return thread->sched_pri >= BASEPRI_RTQUEUES || thread->base_pri >= BASEPRI_USER_INITIATED;
++}
++
++/* The CPU of map this thread takes: its kind first, else any; -1 when map is empty */
++static int
++sweet_pick_cpu(thread_t thread, cpumap_t map)
++{
++	cpumap_t big = sweet_sched_big();
++	if (big == 0 || map == 0) {
++		return lsb_first(map);
++	}
++	cpumap_t pref = sweet_thread_wants_big(thread) ? (map & big) : (map & ~big);
++	return lsb_first(pref ? pref : map);
++}
++
++/* An idle hint (the thread's last CPU) of the wrong kind gives way to an idle CPU of the right kind */
++static processor_t
++sweet_check_idle_hint(processor_set_t pset, processor_t hint, thread_t thread)
++{
++	cpumap_t big = sweet_sched_big();
++	if (big == 0) {
++		return hint;
++	}
++	bool want_big = sweet_thread_wants_big(thread);
++	if (bit_test(big, hint->cpu_id) == want_big) {
++		return hint;
++	}
++	cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask;
++	cpumap_t pref = want_big ? (idle & big) : (idle & ~big);
++	return pref ? processor_array[lsb_first(pref)] : hint;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  *	choose_processor:
+  *
+@@ -5083,6 +5149,11 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				if (thread->sched_pri < BASEPRI_RTQUEUES) {
++					return sweet_check_idle_hint(pset, processor, thread);     /* 0156 */
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5246,7 +5317,11 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		int cpuid = sweet_pick_cpu(thread, idle_primary_map);          /* 0156: A76 first for a perf thread */
++#else
+ 		int cpuid = lsb_first(idle_primary_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+@@ -8308,6 +8383,16 @@ try_again:
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 0156: a realtime thread takes an idle A76, else any idle CPU, before it preempts a busy one */
++	if (sweet_sched_big() != 0 && !avoid_cpu0) {
++		cpumap_t sw_idle = primary_map & pset->cpu_state_map[PROCESSOR_IDLE];
++		cpumap_t sw_pick = (sw_idle & sweet_sched_big()) ? (sw_idle & sweet_sched_big()) : sw_idle;
++		if (sw_pick != 0) {
++			return processor_array[lsb_first(sw_pick)];
++		}
++	}
++#endif
+ 	int rotid = lsb_first(primary_map);
+ 	if (rotid >= 0) {
+ 		int cpuid = avoid_cpu0 ? ((rotid + 1) & 63) : rotid;

@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 23d99ed0b..739660a39 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,6 +45,11 @@ extern "C" uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dw
+ extern "C" int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);   /* 0144 */
+ static bool sweet_fb_metal;     /* 0145: sweetmtl=2 */
++/* 0151: frame statistics, logged every 5 s while frames come (swaps; shown at the swap, at a vsync; GPU busy) */
++static struct {
++	uint64_t window_start, last_swap, max_gap;
++	uint32_t swaps, at_swap, at_vsync, busy;
++} sweet_fb_stats;
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -293,6 +298,25 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (sweet_fb_stats.window_start == 0) {
++		sweet_fb_stats.window_start = now;
++	}
++	uint64_t window_ns = 0;
++	absolutetime_to_nanoseconds(now - sweet_fb_stats.window_start, &window_ns);
++	if (window_ns >= 5000000000ull) {
++		if (sweet_fb_stats.swaps != 0) {
++			uint64_t gap_us = 0;
++			absolutetime_to_nanoseconds(sweet_fb_stats.max_gap, &gap_us);
++			IOLog("SWEET FB: 5s: %u swaps (%u.%u/s), shown at swap %u, at vsync %u, GPU busy %u; longest gap %llu ms\n",
++			    sweet_fb_stats.swaps, (uint32_t)(sweet_fb_stats.swaps * 10ull * 1000000000ull / window_ns) / 10,
++			    (uint32_t)(sweet_fb_stats.swaps * 10ull * 1000000000ull / window_ns) % 10, sweet_fb_stats.at_swap,
++			    sweet_fb_stats.at_vsync, sweet_fb_stats.busy, gap_us / 1000000);
++		}
++		uint64_t keep = sweet_fb_stats.last_swap;
++		bzero(&sweet_fb_stats, sizeof(sweet_fb_stats));
++		sweet_fb_stats.window_start = now;
++		sweet_fb_stats.last_swap = keep;
++	}
+ 	/*
+ 	 * 0147: the refresh period after the vsync time: CoreAnimation's IOMFBServer::vsync_callback takes
+ 	 * the next vsync as time + period, and with 0 every frame deadline was already past (ios-flame 0121:
+@@ -362,6 +386,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 		}
+ 		if (gpu < 0) {
++			sweet_fb_stats.busy++;
+ 			/* 0149: the GPU's previous blit still runs: this frame waits for the next vsync */
+ 			IOLockLock(fb->fLock);
+ 			fb->fDirty = true;
+@@ -373,6 +398,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (gpu == 0) {
+ 			fb->present(rec);
+ 		}
++		sweet_fb_stats.at_vsync++;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		spent += mach_absolute_time() - began;
+ 		if (++shown % 300 == 0) {
+@@ -435,6 +461,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
++	uint64_t now = mach_absolute_time();
++	if (sweet_fb_stats.last_swap != 0 && now - sweet_fb_stats.last_swap > sweet_fb_stats.max_gap) {
++		sweet_fb_stats.max_gap = now - sweet_fb_stats.last_swap;
++	}
++	sweet_fb_stats.last_swap = now;
++	sweet_fb_stats.swaps++;
+ 	/*
+ 	 * 0150: the GPU present right away. The blit goes on the ring behind the frame's own drawing, which
+ 	 * CoreAnimation submitted before this swap, so the GPU orders them and nothing waits here; the vsync
+@@ -447,6 +479,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		int shown = presentGPU(rec);
+ 		IOLockUnlock(fPresentLock);
+ 		if (shown > 0) {
++			sweet_fb_stats.at_swap++;
+ 			IOLockLock(fLock);
+ 			if (memcmp(fPending, rec, SWEET_FB_SWAP_REC_SIZE) == 0) {
+ 				fDirty = false;
