@@ -466,8 +466,10 @@ static struct edge_chan chans[] = {
 	{ .name = "IPCRTR" },
 	{ .name = "apr_audio_svc" },
 	{ .name = "apr_apps2" },
+	{ .name = "fastrpcglink-apps-dsp" },
 };
-#define NCHAN	3
+#define NCHAN	4
+#define CH_RPC	(&chans[3])
 #define CH_QRTR (&chans[0])
 static struct edge_chan *CH_APR = &chans[1];	/* where APR commands go (aprch) */
 
@@ -827,6 +829,243 @@ static void apr_rx_apps2(const uint8_t *d, uint32_t n)
 	apr_rx(d, n);
 }
 
+/*
+ * ---- apps SMMU for the ADSP's DMA (as userland/wland/radio.c does for WLAN) ----
+ * The ADSP reaches host memory through the apps SMMU (adsp_tbu, streams 0x1800-0x1bff): FastRPC sessions
+ * 0x1b23-0x1b25 ("adsprpc-smd" context banks of the live DT), audio ION buffers 0x1b21, USB audio 0x1b2f.
+ * sCR0.USFCFG is set and nothing matches those streams after ABL: the first CREATE_STATIC (physical
+ * addresses, no stream set up) put the SoC into crashdump. Each stream goes to a context bank with
+ * translation off, so the ADSP's DMA uses physical addresses.
+ */
+#define SMMU_PA		0x15000000ull
+#define SMMU_SIZE	0x00100000u
+#define CB_CBAR		0x0001f000u	/* S1 translation, S2 bypass, as ABL's banks */
+#define CB_CBA2R	0x00000001u	/* AArch64 */
+#define CB_SCTLR	0x000000e0u	/* CFCFG | CFIE | CFRE, M = 0: no translation */
+
+static int smmu_done;
+
+static int sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
+{
+	uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
+	return ((id ^ sid) & ~(m | mask) & 0x7fff) == 0;
+}
+
+/*
+ * the streams, one SMR each: the hypervisor takes only the HLOS streams of the live DT (FastRPC 0x1b23-0x1b25,
+ * audio ION 0x1b21, USB audio 0x1b2f); an SMR with a mask, or any other 0x1b2x, reads back 0
+ */
+static const uint16_t adsp_sids[] = { 0x1b21, 0x1b23, 0x1b24, 0x1b25, 0x1b2f };
+
+static int smmu_adsp_identity(void)
+{
+	uint64_t s = SMMU_PA;
+	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
+	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	uint32_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
+	uint64_t gr1 = s + psize;
+	unsigned nsid = sizeof(adsp_sids) / sizeof(adsp_sids[0]), ok = 0;
+	int cb = -1;
+	/* a bank already ours (our CBAR and SCTLR, M off), else the lowest free one */
+	for (uint32_t c = 0; c < ncb && c < 256 && cb < 0; c++) {
+		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
+		if (rd32(gr1 + 4 * c) == CB_CBAR && rd32(cbp) == CB_SCTLR && c >= 5)
+			cb = (int)c;
+	}
+	uint64_t used[4] = { 0 };
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
+		if ((smr >> 31) && ((s2cr >> 16) & 3) == 0)
+			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
+	}
+	for (uint32_t c = 0; c < ncb && c < 256 && cb < 0; c++) {
+		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
+		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) && rd32(gr1 + 4 * c) == 0)
+			cb = (int)c;
+	}
+	if (cb < 0 || (uint64_t)(npage + cb + 1) * psize > SMMU_SIZE) {
+		printf("smmu: no free bank\n");
+		return -1;
+	}
+	uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
+	if (rd32(gr1 + 4 * cb) != CB_CBAR || rd32(cbp) != CB_SCTLR) {
+		wr32(cbp + 0x58, 0xffffffff);
+		wr32(cbp + 0x20, 0);
+		wr32(cbp + 0x24, 0);
+		wr32(cbp + 0x30, 0);
+		wr32(cbp + 0x10, 0);
+		wr32(cbp + 0x38, 0);
+		wr32(cbp + 0x3c, 0);
+		wr32(gr1 + 0x800 + 4 * cb, CB_CBA2R);
+		wr32(gr1 + 4 * cb, CB_CBAR);
+		wr32(cbp, CB_SCTLR);
+	}
+	for (unsigned k = 0; k < nsid; k++) {
+		int slot = -1, have = -1;
+		for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+			uint32_t smr = rd32(s + 0x800 + 4 * i);
+			if ((smr >> 31) && sid_match(smr, adsp_sids[k], 0))
+				have = (int)i;
+			else if (!(smr >> 31) && slot < 0)
+				slot = (int)i;
+		}
+		if (have >= 0) {
+			uint32_t s2cr = rd32(s + 0xc00 + 4 * have);
+			int good = ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)cb;
+			printf("smmu: %#x already in SMR%d (S2CR %08x)%s\n", adsp_sids[k], have, s2cr, good ? "" : " -> another bank");
+			ok += good;
+			continue;
+		}
+		if (slot < 0) {
+			printf("smmu: no free SMR for %#x\n", adsp_sids[k]);
+			continue;
+		}
+		wr32(s + 0xc00 + 4 * slot, (uint32_t)cb);
+		wr32(s + 0x800 + 4 * slot, (1u << 31) | adsp_sids[k]);
+		uint32_t smr = rd32(s + 0x800 + 4 * slot), s2cr = rd32(s + 0xc00 + 4 * slot);
+		int good = (smr >> 31) && (smr & 0x7fff) == adsp_sids[k] && (s2cr & 0xff) == (uint32_t)cb;
+		if (!good)
+			wr32(s + 0xc00 + 4 * slot, 2u << 16);	/* leave nothing half-written: fault */
+		printf("smmu: %#x -> CB%d via SMR%d: SMR %08x S2CR %08x -> %s\n", adsp_sids[k], cb, slot, smr, s2cr,
+		       good ? "ok" : "NOT as written");
+		ok += good;
+	}
+	wr32(s + 0x70, 0);
+	for (int i = 0; i < 1000 && (rd32(s + 0x74) & 1); i++)
+		usleep(1000);
+	smmu_done = ok == nsid;
+	printf("smmu: %u of %u ADSP streams through CB%d (SCTLR %08x CBAR %08x, translation off)\n", ok, nsid, cb, rd32(cbp),
+	       rd32(gr1 + 4 * cb));
+	return smmu_done ? 0 : -1;
+}
+
+/*
+ * ---- FastRPC (Linux drivers/misc/fastrpc.c; downstream drivers/char/adsprpc.c of this phone) ----
+ * Android starts the audio PD with `adsprpcd audiopd`: INIT_CREATE_STATIC (method 8 on the init handle 1)
+ * with { pgid, namelen, pageslen }, the name and one page: the PD's remote heap. Without it AFE, ASM and ADM
+ * (all in the audio PD) never answer. The ADSP session has no SMMU (no ADSP compute context bank in the DT)
+ * and no remote-heap VMID, so addresses are physical (through the identity context bank above) and the heap is plain memory: the ADSP's CMA region
+ * adsp_region of Android (0xfd800000, 16 MB below 4 GB), which XNU does not use (its RAM starts at 4 GB).
+ */
+#define RPC_HEAP_PA	0xfd800000ull
+#define RPC_HEAP_SIZE	0x00f00000ull
+#define RPC_BUF_PA	0xfe700000ull	/* the invoke buffer: metadata + copies of the arguments */
+#define RPC_BUF_SIZE	0x00100000ull
+#define RPC_ALIGN	128
+#define RPC_INIT_HANDLE	1
+#define RPC_SCALARS(m, in, out)	((((m) & 0x1f) << 24) | (((in) & 0xff) << 16) | (((out) & 0xff) << 8))
+
+struct rpc_msg {
+	int32_t pid, tid;
+	uint64_t ctx;
+	uint32_t handle, sc;
+	uint64_t addr, size;
+} __attribute__((packed));
+
+static uint64_t rpc_rsp_ctx;
+static int32_t rpc_rsp_ret;
+static int rpc_rsp_seen;
+
+static void fastrpc_rx(const uint8_t *d, uint32_t n)
+{
+	uint64_t ctx = 0;
+	int32_t ret = 0;
+	if (n >= 12) {
+		memcpy(&ctx, d, 8);
+		memcpy(&ret, d + 8, 4);
+	}
+	printf("[%6llu] fastrpc: < %u bytes: ctx %#llx retval %d (%#x)\n", (unsigned long long)edge_ms(), n,
+	       (unsigned long long)ctx, ret, (uint32_t)ret);
+	rpc_rsp_ctx = ctx;
+	rpc_rsp_ret = ret;
+	rpc_rsp_seen = 1;
+}
+
+/* One invoke with in-buffers only: the args copied into the buffer at RPC_BUF_PA (fastrpc_get_args layout) */
+static int fastrpc_invoke(uint32_t handle, uint32_t method, const void *const *in, const uint32_t *inlen, unsigned nin,
+			  uint32_t pd)
+{
+	unsigned n = nin;
+	uint32_t meta = n * (16 + 8 + 16) + 8 * 16 + 4 * 64;	/* remote_buf, invoke_buf, phy_page; fdlist, crclist */
+	static uint8_t b[0x10000];
+	memset(b, 0, sizeof(b));
+	uint32_t off = meta;
+	for (unsigned i = 0; i < n; i++) {
+		off = (off + RPC_ALIGN - 1) & ~(uint32_t)(RPC_ALIGN - 1);
+		uint64_t pv = RPC_BUF_PA + off, len = inlen[i];
+		uint64_t pg = pv & ~0xfffull, pgs = (((pv + (len ? len : 1) - 1) & ~0xfffull) - pg) / 0x1000 + 1;
+		memcpy(b + 16 * i, &pv, 8);
+		memcpy(b + 16 * i + 8, &len, 8);
+		uint32_t num = len ? 1 : 0, pgidx = i;
+		memcpy(b + 16 * n + 8 * i, &num, 4);
+		memcpy(b + 16 * n + 8 * i + 4, &pgidx, 4);
+		uint64_t psz = pgs * 0x1000;
+		memcpy(b + 24 * n + 16 * i, &pg, 8);
+		memcpy(b + 24 * n + 16 * i + 8, &psz, 8);
+		memcpy(b + off, in[i], inlen[i]);
+		off += inlen[i];
+	}
+	uint32_t size = (off + 0xfff) & ~0xfffu;
+	pm_wr(RPC_BUF_PA, b, (off + 3) & ~3u);
+	static uint32_t ctxseq = 1;
+	struct rpc_msg m = {
+		.pid = 0, .tid = 1234, .ctx = ((uint64_t)(ctxseq++) << 8) | pd, .handle = handle,
+		.sc = RPC_SCALARS(method, nin, 0), .addr = RPC_BUF_PA, .size = size,
+	};
+	printf("[%6llu] fastrpc: > handle %u method %u, %u in-args, buffer %llx+%x, ctx %#llx\n", (unsigned long long)edge_ms(),
+	       handle, method, nin, (unsigned long long)RPC_BUF_PA, size, (unsigned long long)m.ctx);
+	rpc_rsp_seen = 0;
+	if (edge_send(CH_RPC, &m, sizeof(m)))
+		return -1;
+	for (int t = 0; t < 1000 && !rpc_rsp_seen; t++) {
+		edge_poll(10);
+		smp2p_service();
+	}
+	if (!rpc_rsp_seen) {
+		printf("fastrpc: no answer in 10 s\n");
+		return -1;
+	}
+	return rpc_rsp_ret;
+}
+
+/* INIT_ATTACH (method 0 on the init handle, in: the pgid): joins the ADSP's guest OS process. No heap and no
+ * new PD: only the transport and the argument buffer through the SMMU, to tell those from the audio PD. */
+static int fastrpc_attach(void)
+{
+	if (!edge_ready(CH_RPC) || smmu_adsp_identity()) {
+		printf("attach: channel or SMMU streams not ready\n");
+		return -1;
+	}
+	int32_t pgid = 1234;
+	const void *in[1] = { &pgid };
+	const uint32_t len[1] = { sizeof(pgid) };
+	int r = fastrpc_invoke(RPC_INIT_HANDLE, 0, in, len, 1, 0);
+	printf("attach: -> %d\n", r);
+	return r;
+}
+
+static int audiopd_create(void)
+{
+	if (!edge_ready(CH_RPC)) {
+		printf("audiopd: %s not open (open it first)\n", CH_RPC->name);
+		return -1;
+	}
+	if (smmu_adsp_identity()) {
+		printf("audiopd: the ADSP's SMMU streams are not set up: not invoking (crashdump otherwise)\n");
+		return -1;
+	}
+	static const char name[] = "audiopd";
+	struct { int32_t pgid; uint32_t namelen, pageslen; } inbuf = { 1234, sizeof(name), 1 };
+	struct { uint64_t addr, size; } page = { RPC_HEAP_PA, RPC_HEAP_SIZE };
+	const void *in[3] = { &inbuf, name, &page };
+	const uint32_t len[3] = { sizeof(inbuf), sizeof(name), sizeof(page) };
+	printf("audiopd: CREATE_STATIC \"%s\", remote heap %llx+%llx\n", name, (unsigned long long)RPC_HEAP_PA,
+	       (unsigned long long)RPC_HEAP_SIZE);
+	int r = fastrpc_invoke(RPC_INIT_HANDLE, 8, in, len, 3, 1);
+	printf("audiopd: -> %d\n", r);
+	return r;
+}
+
 /* ---- main ---- */
 
 static void idle(unsigned ms)
@@ -890,6 +1129,7 @@ static int bring_up(int fresh)
 	chans[0].rx = qrtr_rx;
 	chans[1].rx = apr_rx;
 	chans[2].rx = apr_rx_apps2;
+	chans[3].rx = fastrpc_rx;
 	if (adopted) {
 		adsp_ready_state = 1;
 		return 0;
@@ -919,7 +1159,8 @@ static int bring_up(int fresh)
  * ADSP, see shutdown_adsp); commands, one per line, through the FIFO /var/local/adspd.cmd:
  *   afe on | afe off | status | pd PATH (PDR state, e.g. msm/adsp/audio_pd) | open NAME RCID (our end of a
  *   channel the ADSP opened) | aprch audio|apps2 (the channel for APR commands) | apr SVC OPCODE [WORDS] (raw
- *   APR command) | stop (graceful ADSP shutdown,
+ *   APR command) | smmu (the ADSP's streams untranslated) | attach (FastRPC INIT_ATTACH) | audiopd (FastRPC CREATE_STATIC of the
+ *   audio PD) | stop (graceful ADSP shutdown,
  *   then exit) | quit (exit, ADSP keeps running)
  */
 #define CMD_FIFO "/var/local/adspd.cmd"
@@ -969,6 +1210,14 @@ static void command(char *line)
 			w[n++] = (uint32_t)strtoul(t, NULL, 0);
 		int st = apr_cmd((uint8_t)svc, opcode, w, (uint16_t)(4 * n));
 		printf("apr: svc %u opcode %#x -> %d\n", svc, opcode, st);
+	} else if (!strncmp(line, "verbose ", 8)) {
+		edge_verbose = atoi(line + 8);
+	} else if (!strcmp(line, "smmu")) {
+		smmu_adsp_identity();
+	} else if (!strcmp(line, "attach")) {
+		fastrpc_attach();
+	} else if (!strcmp(line, "audiopd")) {
+		audiopd_create();
 	} else if (!strncmp(line, "pd ", 3)) {
 		servreg_query(line + 3);
 	} else if (!strcmp(line, "status")) {

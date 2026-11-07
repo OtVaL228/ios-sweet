@@ -3,6 +3,7 @@
  * SMEM items 478 (descriptor), 479 (ours), 480 (the remote's) in the
  * partition shared with the remote host, as Linux qcom_glink_smem_register.
  */
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -18,7 +19,7 @@
 #define N_INTENTS	8
 #define INTENT_SIZE	4096
 #define FEAT_INTENT_REUSE 1
-#define MAX_RINTENTS	64
+#define MAX_RINTENTS	256
 
 int edge_verbose = 1;
 static unsigned ipc;
@@ -224,7 +225,11 @@ static int rx_one(void)
 		for (uint32_t i = 0; i < p2; i++) {
 			uint32_t pr[2];
 			rx_peek(pr, 8 + i * 8, 8);
-			if (c && nrintent < MAX_RINTENTS) {
+			if (c && nrintent == MAX_RINTENTS) {
+				memmove(rintent, rintent + 1, sizeof(rintent[0]) * (MAX_RINTENTS - 1));
+				nrintent--;
+			}
+			if (c) {
 				rintent[nrintent].c = c;
 				rintent[nrintent].size = pr[0];
 				rintent[nrintent].iid = pr[1];
@@ -261,8 +266,8 @@ static int rx_one(void)
 		}
 		break;
 	case GLINK_CMD_RX_INTENT_REQ_ACK:
-		if (!p2)
-			LOG("glink: < RX_INTENT_REQ_ACK: refused\n");
+		if (!p2 || edge_verbose > 1)
+			LOG("glink: < RX_INTENT_REQ_ACK %u %s\n", p1, p2 ? "granted" : "refused");
 		break;
 	case GLINK_CMD_TX_DATA:
 	case GLINK_CMD_TX_DATA_CONT: {
@@ -371,6 +376,8 @@ int edge_send(struct edge_chan *c, const void *data, uint32_t len)
 	int i, asked = 0;
 	while ((i = find_intent(c, len)) < 0) {
 		if (asked < 3) {
+			if (edge_verbose > 1)
+				LOG("glink: > RX_INTENT_REQ %u bytes on %s (lcid %u)\n", len, c->name, c->lcid);
 			fifo_send(GLINK_CMD_RX_INTENT_REQ, c->lcid, len, NULL, 0);
 			asked++;
 		}
@@ -401,12 +408,14 @@ fail:
 
 /* ---- handing the edge to a new process (the ADSP must not restart within a boot: see adspd.c) ---- */
 
+#define STATE_V1_INTENTS 64	/* format 1 (EDGE): 64 remote intents; format 2 (EDG2): MAX_RINTENTS */
 struct edge_state {
 	uint32_t magic, nchan, nrintent, version_done;
 	struct { uint32_t rcid, remote_open, local_open, acked; } c[8];
 	struct { uint32_t chan, size, iid, busy; } ri[MAX_RINTENTS];
 };
-#define EDGE_STATE_MAGIC 0x45444745u
+#define EDGE_STATE_MAGIC_V1 0x45444745u
+#define EDGE_STATE_MAGIC 0x32474445u
 
 int edge_save(const char *path)
 {
@@ -438,9 +447,13 @@ int edge_adopt(const char *path, unsigned host, unsigned ipc_bit, struct edge_ch
 	FILE *f = fopen(path, "rb");
 	if (!f)
 		return -1;
-	int ok = fread(&st, sizeof(st), 1, f) == 1;
+	memset(&st, 0, sizeof(st));
+	size_t got = fread(&st, 1, sizeof(st), f);
 	fclose(f);
-	if (!ok || st.magic != EDGE_STATE_MAGIC || st.nchan > n || st.nchan > 8)
+	size_t v1 = offsetof(struct edge_state, ri) + STATE_V1_INTENTS * sizeof(st.ri[0]);
+	int ok = (st.magic == EDGE_STATE_MAGIC && got == sizeof(st)) ||
+		 (st.magic == EDGE_STATE_MAGIC_V1 && got >= v1 && st.nrintent <= STATE_V1_INTENTS);
+	if (!ok || st.nchan > n || st.nchan > 8)
 		return -1;
 	ipc = ipc_bit;
 	chan = chans;

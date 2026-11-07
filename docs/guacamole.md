@@ -373,7 +373,52 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   (the ADSP's other APR channel, unused by Android's apr_tal_rpmsg) gives no
   intents. Android runs `adsprpcd audiopd`: FastRPC INIT_CREATE_STATIC of
   the audio PD with its remote heap; ios-sweet-grus stopped there too.
-  Next: that over fastrpcglink-apps-dsp.
+- FastRPC over fastrpcglink-apps-dsp crashes the SoC: any invoke (the
+  audio PD create and even a plain attach) sends the phone to crashdump,
+  with nothing in the logs. adspd keeps the code but it must not be used.
+- WoA (Project-Aloha/windows_oem_oneplus_qc8150, WOA-Project
+  windows_silicon_qcom_hana) also runs the audio PD over FastRPC: SIDs
+  0x1b23/24/25 (FastRPCADSPSidInfo) translated through context banks
+  0x1b/0x1c/0x1f, AridBase 17 03 00 10/11/12, and ARPC depends on SCM0
+  (most likely a hyp_assign of the remote heap). Our SMMU setup bypasses
+  (identity), and we assign nothing: the likely reason for the crash.
+  Audio waits on that.
+
+## Bluetooth (userland/bt, controller up, no iOS stack yet)
+
+- Chip: the WCN3990-family BT core ("cherokee", persist.vendor.qcom.
+  bluetooth.soc), EDL version: product 0xa, patch 0x6699, ROM 0x1001,
+  SoC 0x40010224 = Cherokee 2.1.1. The QTI HAL picks files by SoC id:
+  linux-firmware `qca/crbtfw21.tlv` + `qca/crnv21.bin` (in
+  /var/local/fw/bt, not in git). After them: HCI/LMP 9 (5.0),
+  manufacturer 0x1d, subversion 0x2be.
+- UART: QUP wrapper 2 SE3 = qupv3_se13 at 0xc8c000 (UART fw 0x20b,
+  oversampling 32), CTS gpio43, RTS 44 (pull-down), TX 45 (pull-up), RX 46,
+  mux 1, east tile. GCC vote 0x52014 bit 7, CBCR 0x1e4d4, RCG 0x1e4d8 from
+  GPLL0 main: 384/31250 = 7.3728 MHz (115200 = div 2, 2400 = div 96).
+  Rails are WLAN's (pm8150 l7, pm8150l l2/l11), already on through wland.
+- `SE_IRQ_EN` must stay 0: all ones (as Linux) routes the SE interrupt to
+  the GIC, where XNU has no handler, and froze the whole SoC.
+- A stuck RX command survives between processes and swallows everything
+  (rx fifo status 0x30000000, s_irq 0x2 overrun): cancel is not enough,
+  abort it (qcom_geni_serial stop_rx). Before that fix the controller
+  seemed to ignore the power pulses every other run.
+- Power: 0xC0 at 2400 baud without flow control (off), 0xFC at 115200 (on),
+  then RTS/CTS on. btd waits 2 s / 1 s (Linux 10 ms / 100 ms) to be safe.
+- Firmware (btqca.c): the whole file in 243-byte EDL_PATCH_TLV_REQ (0x1e)
+  segments of vendor command 0xfc00. The patch is download mode 3: no answer
+  per segment, the last one ends with a Command Complete for opcode 0 and
+  then the vendor event 0x04. The NVM is answered per segment. The NVM's
+  HCI tag (17) is set to 115200 (data[2] = 0) and in-band sleep off
+  (data[0] &= ~0x80), so no IBS wake bytes are needed.
+- The controller sends its own log as ACL on handle 0x2edc (hci_qca
+  QCA_DEBUG_HANDLE): the H4 reader skips ACL/SCO packets.
+- `btd scan 15`: 301 LE advertising reports from 14 devices and 2 BR/EDR
+  inquiry results. The BD address is the NVM placeholder 39:90:21:64:07:00;
+  the phone's own address (Android keeps it in persist) is not set yet.
+- iOS bluetoothd fails with "Unable to match bluetooth service in device
+  tree": it wants an ADT `bluetooth` node and a Broadcom/BlueTool-style
+  transport. Next: recon of what it expects.
 
 ## SWEETBOX file drop
 
