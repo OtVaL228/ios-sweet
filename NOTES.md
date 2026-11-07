@@ -1,5 +1,27 @@
 # Active handoff — guacamole Metal2 (2026-11-06)
 
+- Latest finding: the device now creates Turnip in system processes, but
+  `backboardd` refuses IOSurface texture format 542 (`RGB8_444_2P`) as an
+  unsupported buffer format. The bridge had been marking every IOSurface as
+  non-planar and dropping its YCbCr surface facts at the C/Rust boundary.
+- Updated `NativeMetalObjects` to carry IOSurface plane index, planar flag,
+  surface OSType/dimensions, and plane 1 offset/row into the runtime. It only
+  attaches YCbCr facts for a planar surface and a YCbCr Metal format. Bundle
+  built and installed at `/System/Library/Extensions/SweetMetal2.bundle`;
+  previous installs preserved as `.pre-iosurface-facts-20261106` and
+  `.pre-iosurface-facts-v1-20261106`. Bundle archive in `outputs/` has SHA256
+  `c86bfa129fa7b27902c5b9935f3b3d2f375d6cb724190b97bca3d7ca44a5d518`.
+- No kernel source/image changes. The process must reload the installed bundle
+  before the new path is exercised. Next: after reboot or process restart,
+  inspect the `mtl2.log` texture result. The current kernel maps `b3a8` to a
+  one-plane BGRA surface unless `sweetsurf10=1`; if format 542 is still refused
+  over BGRA, that is a separate layout/format emulation gap and needs a surface
+  dump (OSType, plane count, plane offsets/rows, allocation size) before
+  implementing it.
+- Source patch is uncommitted in `userland/metal2/NativeBridgeMetalFrontend.mm`,
+  `bridge/NativeMetalObjects.h`, and `bridge/NativeMetalObjects.rs`. Previous
+  `userDictionary` change remains committed as `9710929`.
+
 - Source checkout: `OtVaL228/ios-sweet`, branch `guacamole`, HEAD
   `021682851328a343e373e1dfdd5e8fe11eae30fc`. The running kernel is from this
   source; the local build also uses the expected Xcode compatibility patch
@@ -15,12 +37,9 @@
   previous bundle saved as `SweetMetal2.bundle.pre-userdict-20261106`. File
   checksums match the local build. Terminated old PridePosterExtension PID 713
   so a later launch can load the replacement. No reboot or test run performed.
-- Separate unresolved failure: earlier `backboardd`, SpringBoard, and `chronod`
-  attempts returned `IOServiceOpen 0xe00002c2`; success in PridePosterExtension
-  does not establish Metal operation in those processes or the Phone app. Next:
-  trigger a fresh PridePosterExtension Metal path and inspect for the
-  `userDictionary` warning; diagnose system-process opens separately without
-  changing the kernel source.
+- Historical: earlier `backboardd`, SpringBoard, and `chronod` attempts
+  returned `IOServiceOpen 0xe00002c2`. Current logs now show system processes
+  creating Turnip devices; the active blocker is IOSurface format 542 above.
 
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 

@@ -292,9 +292,11 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
  }
 }
-static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
+static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface,
+                                  bool planar=false,uint64_t surfacePlane=0,uint32_t surfacePixelFormat=0,uint64_t surfaceWidth=0,uint64_t surfaceHeight=0,
+                                  uint64_t chromaOffset=0,uint64_t chromaRow=0) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
- NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
+ NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface,planar,surfacePlane,surfacePixelFormat,surfaceWidth,surfaceHeight,chromaOffset,chromaRow);
  if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
@@ -1448,7 +1450,15 @@ static char sweetMemoryOwnerKey;
  if(!row && sweetNarrow(d.pixelFormat)!=(uint64_t)d.pixelFormat)row=IOSurfaceGetWidth(surface)*4;  // 10-bit asked over BGRA
  if(at<(uintptr_t)base || at-(uintptr_t)base>=allocation){NBLOG(@"native-metal: surface texture refused: plane %lu outside the surface",(unsigned long)plane);return nil;}
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,at-(uintptr_t)base,row,true);
+ bool hasYCbCrPlanes=planes>=2;
+ uint64_t chromaOffset=0,chromaRow=0;
+ if(hasYCbCrPlanes){
+  void *chroma=IOSurfaceGetBaseAddressOfPlane(surface,1);
+  if(!chroma || (uintptr_t)chroma<(uintptr_t)base || (uintptr_t)chroma-(uintptr_t)base>=allocation)hasYCbCrPlanes=false;
+  else {chromaOffset=(uintptr_t)chroma-(uintptr_t)base;chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);}
+ }
+ NBTexture *texture=textureOnBuffer(buffer,d,at-(uintptr_t)base,row,true,hasYCbCrPlanes,plane,IOSurfaceGetPixelFormat(surface),
+                                    IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);
  if(!texture){const uint32_t f=IOSurfaceGetPixelFormat(surface);
   NBLOG(@"native-metal: surface %#x '%c%c%c%c' %zux%zu plane %lu: format %lu %lux%lu, row %zu refused",IOSurfaceGetID(surface),
    (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),

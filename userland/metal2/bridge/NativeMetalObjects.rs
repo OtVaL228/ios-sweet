@@ -20,7 +20,7 @@ use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    IoSurfaceYCbCr, SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -714,12 +714,23 @@ pub extern "C" fn nmb_texture_new(device: *mut NmbDevice, descriptor: *const Nmb
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
-                                            bytes_per_row: u64, iosurface: bool) -> *mut NmbTexture {
+                                            bytes_per_row: u64, iosurface: bool, planar: bool, surface_plane: u64, surface_pixel_format: u32,
+                                            surface_width: u64, surface_height: u64, chroma_offset: u64, chroma_bytes_per_row: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
         let buffer = &get(buffer)?.0;
         let texture = if iosurface {
-            buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, false))
+            let mut plane = IoSurfacePlane::new(offset, bytes_per_row, planar);
+            if planar && metal2vulkan::metal::format::ycbcr_format(descriptor.pixel_format).is_some() {
+                plane = plane.with_ycbcr(IoSurfaceYCbCr::new(
+                    surface_pixel_format,
+                    surface_plane,
+                    [surface_width, surface_height],
+                    chroma_offset,
+                    chroma_bytes_per_row,
+                ));
+            }
+            buffer.new_texture_with_iosurface_plane(&descriptor, plane)
         } else {
             buffer.new_texture(&descriptor, offset, bytes_per_row)
         };
