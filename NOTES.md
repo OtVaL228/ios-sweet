@@ -1,5 +1,17 @@
 # Active handoff — guacamole Metal2 (2026-11-06)
 
+- Cut the Rope Experiments (`com.zeptolab.ctrexperimentslite`) still shows a
+  white screen. Its recent `ctr-jni` run created a Turnip device, but
+  `/var/local/m2v-cache/ctr-jni/pipelines.log` contains only family capability
+  records and no render pipelines. The wakeups report records the run's args as
+  `sweetgl=0 sweetglfn=0 sweetbbd=0`; likely the game needs the OpenGL path, but
+  this is not proven yet. Prepared
+  `outputs/guacamole-metal2vulkan-0216828513-gl-on-wait120.img`, SHA256
+  `60e6977cf9dcedb9980417d3d39efe7555e1f1fd6007af525dd32decf0505473`.
+  It restores `sweetgl=1 sweetglfn=1 sweetbbd=1`, keeps `sweetmtl=2`, and sets
+  `sweetglwait=120`; shim/kernel and DTB match the source image byte-for-byte.
+  Not booted yet. Next: boot this combined image and retest the game.
+
 - Implemented `MTLDevice.newLibraryWithSource` in the Metal frontend. It calls
   iOS's inherited `_MTLDevice` compiler, reads the resulting metallib through
   `_MTLLibrary.libraryDataContents`, and opens that data as an `NBLibrary`; both
