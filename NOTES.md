@@ -586,3 +586,10 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## 2026-11-07: framebuffer present timing A/B image
+- Observation: Subway Surfers frames are clean in software screenshots but show large black regions/flicker on camera stills. That points to the panel presentation path; vblank/scanout interaction is a hypothesis, not confirmed.
+- Added `xnu/patches/0157-guacamole-fb-at-swap-toggle.patch`. It adds boot arg `sweetfbatswap` (default `1`) and logs `SWEET FB: GPU present mode ...`. `sweetfbatswap=0` disables the immediate Metal present in `AppleCLCD::swap()` and leaves the existing 60 Hz timer present path active.
+- Built locally from the existing `ios-sweet-latest` guacamole source tree and its already-applied Wi-Fi patches. XNU kernel build succeeded with Xcode 27.2/KDK 13.5. Local build-only workaround: removed Bash process substitution from the DXB dSYM warning filter because this sandbox denies `/dev/fd`; this does not change kernel code.
+- Packaged `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-metal2vulkan-vsync-only.img` using the existing guacamole shim and fullmetal stock boot template. Kernel payload args preserve the current GL/Metal/Wi-Fi settings and add only `sweetfbatswap=0` (plus refreshed `sweettime`). SHA-256: `042be7c91908d6da38ff17fb6f75e8f2960a939af2b13356f9e560f6db1b41f2`.
+- Not yet booted on hardware. Boot temporarily with `fastboot boot /Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-metal2vulkan-vsync-only.img`; after boot, verify `dmesg | grep 'SWEET FB: GPU present mode'` says `vsync-only`, then compare camera flicker. If unchanged, this toggle is not the cause.
