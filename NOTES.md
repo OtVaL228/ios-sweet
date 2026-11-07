@@ -1,5 +1,56 @@
 # Active handoff — guacamole Metal2 (2026-11-06)
 
+- Implemented `MTLDevice.newLibraryWithSource` in the Metal frontend. It calls
+  iOS's inherited `_MTLDevice` compiler, reads the resulting metallib through
+  `_MTLLibrary.libraryDataContents`, and opens that data as an `NBLibrary`; both
+  synchronous and completion-handler forms are bridged. Built
+  `outputs/guacamole-SweetMetal2-sourcecompile.tar.gz` (SHA256
+  `7fe4c2270b66487a77bbae3d9942e8bd47c24fa8d70f259562cdcb20f90c4043`) and
+  installed it on the phone. The prior bundle is preserved at
+  `/System/Library/Extensions/SweetMetal2.bundle.pre-sourcecompile-20261106`.
+- Ran the existing `/var/local/tests/mtltest` against the installed bundle:
+  device creation, blit fill, source compilation, compute pipeline creation,
+  and 4096-element GPU compute all PASS (0 wrong words). Restarted backboardd
+  and SpringBoard; both now create the Turnip device without refusal. System UI
+  frame acceleration still needs a visual/usage check. No kernel or boot args
+  changed. The compiler byte accessor is a private iOS 16 API.
+
+- Built one-time code-signing-off boot image
+  `outputs/guacamole-metal2vulkan-0216828513-csoff-once.img`, SHA256
+  `908bc85d3b46e1214990220fe240d014aa229d66a9c7e4bf82b916372bd2877e`.
+  Derived from the existing `guacamole-metal2vulkan-0216828513.img`; verified
+  Android kernel/shim and DTB are byte-identical, and the only payload change
+  is appending `sweetcsoff=1` to the existing boot arguments. No kernel, rootfs,
+  Wi-Fi, or Metal files changed. Image has not been transferred or booted.
+- User reports the staged system apps are now installed. Built
+  `outputs/guacamole-metal2vulkan-0216828513-gl-off.img`, SHA256
+  `cdaebfa3c7b156a8f6fc7c6adc9bc739cc924199a5efe81c1ac36dc711db786e`, from
+  the normal image with the exact `sweetgl=0 sweetglfn=0 sweetbbd=0` arguments.
+  Kernel and DTB are byte-identical; `sweetcsoff` is absent. Not transferred or
+  booted.
+- Rebuilt as `outputs/guacamole-metal2vulkan-0216828513-gl-off-wait120.img`,
+  SHA256 `e0855b52b754ad839a3ebed9551c135328f2918c86bb07836ce30255ec7803eb`,
+  with the corrected `sweetglwait=120`; all other arguments are unchanged.
+  Kernel and DTB remain byte-identical. Not transferred or booted.
+- User booted the GL-off/wait-120 image and reports Metal initialization did not
+  change. Prior confirmed compositor issue was refusal of IOSurface format 542
+  (`RGB8_444_2P`); subsequent standalone tests below narrowed the runtime gaps.
+- SSH later became reachable; installed the test archive and ran the three
+  tests. `mtltest`: device creation and blit fill pass; compute pipeline fails
+  `foreign function` because `newLibraryWithSource` is not bridged (runtime
+  explicitly reports `NotImplemented(LibrarySource)`). `surftest`: BGRA8 and
+  BGR10_XR IOSurface texture reads/clears all pass. `cgtest`: FAIL, 6272/960000
+  bytes differ; QuartzCore logs `fragmentFunction is not a MTLFunction` and
+  `vertexFunction is not a MTLFunction`.
+- Ran `m2vtest` on the phone against QuartzCore's 1014944-byte
+  `default.metallib`: device/compute/render/import self-tests pass (0/1000,
+  0/64, 0/4096 wrong); QuartzCore compilation: 3 kernels pass, 4 tile kernels
+  request unsupported tile attachments; 13 render pairs pass and 8 fail from
+  missing vertex-attribute/color-attachment descriptor inputs in this probe.
+  Main next gap is source-library bridging (`MTLDevice newLibraryWithSource`),
+  then test the specific QuartzCore/app pipeline descriptors. No kernel or boot
+  arguments changed during these tests.
+
 - Latest finding: the device now creates Turnip in system processes, but
   `backboardd` refuses IOSurface texture format 542 (`RGB8_444_2P`) as an
   unsupported buffer format. The bridge had been marking every IOSurface as

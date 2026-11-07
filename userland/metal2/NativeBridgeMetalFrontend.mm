@@ -11,6 +11,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <os/lock.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -73,6 +74,36 @@ static void noteFormat(uint32_t format,bool made) {
  for(unsigned i=0;i<gFormatCount;i++)if(gFormats[i]==format)return;
  if(gFormatCount<8)gFormats[gFormatCount++]=format;
 }
+// _MTLLibrary keeps the platform compiler's finished metallib here. On iOS 16, the public Metal API can compile
+// MSL but does not expose those bytes. The bridge consumes AIR/metallib, so use this private accessor after asking
+// the inherited _MTLDevice implementation to compile; keep the private dependency local to this adapter.
+@interface NSObject (SweetCompiledLibraryData)
+- (NSData *)libraryDataContents;
+@end
+
+static NSError *nbError(NSString *why);
+
+static id<MTLLibrary> bridgeCompiledLibrary(id device,id<MTLLibrary> nativeLibrary,NSError **error) {
+ if(!nativeLibrary)return nil;
+ if(![nativeLibrary respondsToSelector:@selector(libraryDataContents)]) {
+  if(error)*error=nbError(@"the system compiler did not expose compiled metallib data");
+  return nil;
+ }
+ NSData *bytes=[(NSObject *)nativeLibrary libraryDataContents];
+ if(!bytes.length) {
+  if(error)*error=nbError(@"the system compiler returned an empty metallib");
+  return nil;
+ }
+ NSData *retained=[bytes copy];
+ dispatch_data_t data=dispatch_data_create(retained.bytes,retained.length,dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{(void)retained;});
+ return [(id<MTLDevice>)device newLibraryWithData:data error:error];
+}
+
+static struct objc_super nativeDeviceSuper(id device) {
+ struct objc_super superInfo={device,class_getSuperclass(object_getClass(device))};
+ return superInfo;
+}
+
 static NSError *nbError(NSString *why) {
  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
 }
@@ -1471,6 +1502,36 @@ static char sweetMemoryOwnerKey;
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+}
+- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
+ // Ask Apple's inherited device implementation to compile MSL with the process's real iOS compiler service. Its
+ // result is a native _MTLLibrary, so extract the compiled metallib and reopen it through our bridge implementation.
+ SEL selector=@selector(newLibraryWithSource:options:error:);
+ struct objc_super superInfo=nativeDeviceSuper(self);
+ id<MTLLibrary> (*compile)(struct objc_super *,SEL,NSString *,MTLCompileOptions *,NSError **)=
+  (id<MTLLibrary> (*)(struct objc_super *,SEL,NSString *,MTLCompileOptions *,NSError **))objc_msgSendSuper;
+ NSError *compileError=nil;
+ id<MTLLibrary> nativeLibrary=compile(&superInfo,selector,source,options,&compileError);
+ if(!nativeLibrary){if(error)*error=compileError;return nil;}
+ const uint64_t began=nowUs();
+ id<MTLLibrary> library=bridgeCompiledLibrary(self,nativeLibrary,error);
+ gTimeLibrary.add(began);
+ return library;
+}
+- (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)completionHandler {
+ if(!completionHandler)return;
+ SEL selector=@selector(newLibraryWithSource:options:completionHandler:);
+ struct objc_super superInfo=nativeDeviceSuper(self);
+ void (*compile)(struct objc_super *,SEL,NSString *,MTLCompileOptions *,MTLNewLibraryCompletionHandler)=
+  (void (*)(struct objc_super *,SEL,NSString *,MTLCompileOptions *,MTLNewLibraryCompletionHandler))objc_msgSendSuper;
+ compile(&superInfo,selector,source,options,^(id<MTLLibrary> nativeLibrary,NSError *compileError){
+  if(!nativeLibrary){completionHandler(nil,compileError);return;}
+  NSError *bridgeError=nil;
+  const uint64_t began=nowUs();
+  id<MTLLibrary> library=bridgeCompiledLibrary(self,nativeLibrary,&bridgeError);
+  gTimeLibrary.add(began);
+  completionHandler(library,bridgeError);
+ });
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
