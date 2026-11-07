@@ -1,8 +1,11 @@
 # Active handoff — guacamole Metal2 cold-boot initialization (2026-11-07)
 
-- User confirms Metal was disabled after a cold reboot. The prior successful
-  Metal checks followed bundle replacement and service restarts, so they do
-  not establish that cold-boot initialization works.
+- User reports the visible system used OpenGL after reboot. Current phone log
+  shows the Metal driver did initialize (`ctr-jni` created Turnip), but
+  `backboardd` repeatedly rejected the compositor's `RGB8_444_2P` (542)
+  texture over its `_RB4` IOSurface. The system falls back visually because
+  Metal cannot import this framebuffer; a live device creation alone is not
+  evidence that the compositor is rendering with Metal.
 - Root cause hypothesis from source: RedwoodGPU is brought up asynchronously
   after `sweetgpu=11`; Metal's first open can happen before the backend is
   ready. `SweetMetal2Device` wraps initialization in `dispatch_once`, so a
@@ -23,6 +26,15 @@
   been cold-boot tested. Keep the user's OpenGL-off boot arguments and the
   existing Wi-Fi kernel. After booting the same temporary image, inspect
   `/var/local/mtl2.log` for the RedwoodGPU wait and `device Turnip ...` lines.
+- Added a port-specific mapping of the compositor's `RGB8_444_2P` request to
+  BGRA8 in `sweetNarrow`, for both textures and pipeline attachments. The
+  rejected `_RB4` surface has 4-byte rows (1920 bytes for width 465); the
+  kernel exposes the UI backing as BGRA8. Built and installed this new bundle
+  over SSH at `/System/Library/Extensions/SweetMetal2.bundle`, preserving the
+  wait-only bundle as `SweetMetal2.bundle.pre-rb4-20261107`. Archive:
+  `outputs/guacamole-SweetMetal2-rb4-fallback.tar.gz`, SHA256
+  `e9f4d3353d6f6871daccf360f8dcea220c26c9fb4325dae3d187638a1c2ec76b`.
+  Not yet loaded by running processes or validated after boot.
 
 - Cut the Rope Experiments (`com.zeptolab.ctrexperimentslite`) still shows a
   white screen. A previous `ctr-jni` run created a Turnip device, but

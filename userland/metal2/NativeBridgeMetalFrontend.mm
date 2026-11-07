@@ -220,11 +220,15 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
-// guacamole: the kernel's IOSurface (SweetSurface.cpp) stores the 10-bit wide-colour formats ('w30r', 'b3a8' with its alpha
-// plane, ...) as one-plane BGRA8, which backboardd composites as BGRA8 (the panel is 8-bit sRGB). QuartzCore still asks the
-// 10-bit XR pixel formats (550/551 RGB10A8_2P_XR10, 552/553 BGRA10_XR, 554/555 BGR10_XR; 550 is private and metal2vulkan
-// has none): every texture and every pipeline attachment of them is BGRA8Unorm(_sRGB), so they agree with each other
+// guacamole: SweetSurface exposes the system compositor's private '_RB4' surface as one-plane, four-byte pixels. QuartzCore
+// asks for RGB8_444_2P (542), but that Metal format describes two YCbCr-like planes and cannot import this backing. The
+// _RB4 IOSurface has BGRA8 row storage, so treat that format as BGRA8 for textures and pipeline attachments together.
+// The kernel also stores 10-bit wide-colour formats ('w30r', 'b3a8' with its alpha plane, ...) as one-plane BGRA8, which
+// backboardd composites as BGRA8 (the panel is 8-bit sRGB). QuartzCore still asks the 10-bit XR pixel formats (550/551
+// RGB10A8_2P_XR10, 552/553 BGRA10_XR, 554/555 BGR10_XR; 550 is private and metal2vulkan has none): every texture and
+// every pipeline attachment of them is BGRA8Unorm(_sRGB), so they agree with each other
 static uint64_t sweetNarrow(NSUInteger format) {
+ if(format==542)return MTLPixelFormatBGRA8Unorm;
  return format>=550 && format<=555?((format&1)?MTLPixelFormatBGRA8Unorm_sRGB:MTLPixelFormatBGRA8Unorm):format;
 }
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
