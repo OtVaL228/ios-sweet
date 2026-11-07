@@ -306,6 +306,15 @@ builds for APFS; our root is HFS. Four walls, each seen in the unified log:
 0161 also logs, once per command, file system ioctls that end in ENOTTY or
 ENOTSUP from the FileProvider processes ("SWEET IOCTL: ...").
 
+- Safari downloads never finish (2026-11-08): SafariServices "starting to
+  import placeholder to the Downloads folder", then "failed to import
+  placeholder: NSCocoaError 256". fileproviderd: move-writer collision
+  (Cocoa 516) -> bounce to "<name> 2.download", then "can't get item for
+  URL ... for extension; Cocoa 256" and "root failed". The zero-byte
+  *.download placeholders stay in File Provider Storage/Downloads. Next:
+  how fileproviderd resolves a fresh item URL to an item on our HFS root
+  (document IDs / fsctl), the same path the Files app fixes (0160/0161) touched.
+
 ## Audio (recon, nothing built yet)
 
 From the Android dumps (live.dtb, dmesg, i2c.txt, vendor_b, modem_b):
