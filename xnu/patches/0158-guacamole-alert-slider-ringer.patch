@@ -1,0 +1,211 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index c70f60a8a..252da28c5 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -7,6 +7,15 @@
+  * linux,code 114 in the same DT); both GPIOs are active low.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * Alert Slider (DT tri_state_key, "oneplus, tri-state-key"): TLMM gpio125
++ * (top), gpio134 (middle), gpio27 (bottom; physical order checked on the
++ * phone: silent at the top, ring at the bottom), function gpio, bias-disable,
++ * active low: exactly one pin reads 0 per position. Tiles from Linux
++ * pinctrl-sm8150.c (27 EAST, 125 WEST, 134 SOUTH; one 0x1000 page per pin,
++ * GPIO_IN_OUT at +4 bit 0). The bootloader leaves them pulled down (cfg 0x1),
++ * which reads 0 on all three; the one write is GPIO_CFG = 0 (gpio function,
++ * 2 mA, input, no pull), the DT's tri_state_key_active that Android applies.
++ * Top and middle (OnePlus silent / vibrate) are iOS silent, bottom rings.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -19,6 +28,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern unsigned sweet_hid_ringer(int silent);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -29,6 +39,15 @@ void sweet_keys_init(void);
+ #define KEYS_VDN_RT      0xc610u    /* PM8150 GPIO7 INT_RT_STS */
+ #define KEYS_NO_APID     0xffffu
+ 
++#define SLIDER_PINS      3
++static const uint32_t slider_pa[SLIDER_PINS] = {
++	0x03100000u + 125u * 0x1000u,   /* top, WEST */
++	0x03d00000u + 134u * 0x1000u,   /* middle, SOUTH */
++	0x03500000u + 27u * 0x1000u,    /* bottom, EAST */
++};
++static vm_offset_t slider_cfg[SLIDER_PINS];
++static int slider_mode;             /* sweetslider: 0 off, 1 on, 2 inverted (silent rings) */
++
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_vup_apid = KEYS_NO_APID,
+     keys_vdn_apid = KEYS_NO_APID;
+@@ -87,6 +106,58 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++/* Position 0 top, 1 middle, 2 bottom; -1 while moving (no pin or two low). */
++static int
++slider_read(uint32_t *bits)
++{
++	int pos = -1, low = 0;
++	*bits = 0;
++	for (int i = 0; i < SLIDER_PINS; ++i) {
++		uint32_t v = keys_rd(slider_cfg[i], 4) & 1u;
++		*bits |= v << i;
++		if (!v) {
++			pos = i;
++			++low;
++		}
++	}
++	return low == 1 ? pos : -1;
++}
++
++/*
++ * Reports a stable position once after it changes (three equal reads,
++ * 60 ms), and keeps repeating the first one until a HID client (backboardd)
++ * is listening, so iOS starts with the real switch state.
++ */
++static void
++slider_poll(void)
++{
++	static int last = -2, count, sent = -2;
++	static unsigned retries;
++	uint32_t bits;
++	int pos = slider_read(&bits);
++	if (pos != last) {
++		last = pos;
++		count = 0;
++		return;
++	}
++	if (pos < 0 || ++count < 3 || pos == sent) {
++		return;
++	}
++	int silent = pos != 2;
++	if (slider_mode == 2) {
++		silent = !silent;
++	}
++	unsigned clients = sweet_hid_ringer(silent);
++	if (sent != -2 || clients || (retries++ % 250u) == 0) {
++		printf("SWEET KEYS: slider %s (pins %#x) -> %s, %u HID clients\n",
++		    pos == 0 ? "top" : pos == 1 ? "middle" : "bottom", bits,
++		    silent ? "silent" : "ring", clients);
++	}
++	if (clients) {
++		sent = pos;
++	}
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -132,6 +203,9 @@ keys_thread(void *arg, wait_result_t result)
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		if (slider_mode) {
++			slider_poll();
++		}
+ 		keys_wait();
+ 	}
+ }
+@@ -157,6 +231,27 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
++	slider_mode = 1;
++	(void)PE_parse_boot_argn("sweetslider", &slider_mode, sizeof(slider_mode));
++	for (int i = 0; slider_mode && i < SLIDER_PINS; ++i) {
++		slider_cfg[i] = ml_io_map(slider_pa[i], 0x1000);
++		if (!slider_cfg[i]) {
++			printf("SWEET KEYS: slider MMIO mapping failed\n");
++			slider_mode = 0;
++		}
++	}
++	if (slider_mode) {
++		uint32_t was[SLIDER_PINS], bits;
++		for (int i = 0; i < SLIDER_PINS; ++i) {
++			was[i] = keys_rd(slider_cfg[i], 0);
++			*(volatile uint32_t *)slider_cfg[i] = 0;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		delay(1000);
++		int pos = slider_read(&bits);
++		printf("SWEET KEYS: slider cfg %#x/%#x/%#x -> 0, pins %#x position %d (mode %d)\n",
++		    was[0], was[1], was[2], bits, pos, slider_mode);
++	}
+ 	keys_version = keys_rd(keys_core, 0);
+ 	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+ 	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 83a81c3ad..c39563304 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -29,6 +29,14 @@
+ #include "IOHIDPrivateKeys.h"
+ #include "IOHIDUsageTables.h"
+ 
++/* IOHIDFamily IOHIDUsageTables.h; the trimmed copy here has no Telephony page. */
++#ifndef kHIDPage_Telephony
++#define kHIDPage_Telephony              0x0B
++#endif
++/* Telephony 0x2E: backboardd's BKButtonHIDEventProcessor routes page 0xB usage 0x2E (only) to
++ * _processRingerSwitchEvent; 0x2D (RingEnable) it logs as "Unknown page". */
++#define SWEET_HID_RINGER_SWITCH         0x2E
++
+ extern "C" uint64_t mach_absolute_time(void);
+ 
+ /* One open client: the user client and its event callback. */
+@@ -329,7 +337,8 @@ class SweetHIDButtons : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDButtons);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void key(UInt32 usage, bool down);
++	void key(UInt32 usage, bool down, UInt32 page = kHIDPage_Consumer);
++	unsigned clients() { return _clients ? _clients->getCount() : 0; }
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -397,13 +406,13 @@ SweetHIDButtons::start(IOService *provider)
+ }
+ 
+ void
+-SweetHIDButtons::key(UInt32 usage, bool down)
++SweetHIDButtons::key(UInt32 usage, bool down, UInt32 page)
+ {
+-	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
+ 
+ 	if (event) {
+-		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+-		    _clients ? _clients->getCount() : 0);
++		IOLog("SWEET HID: key 0x%x:0x%x %s (%u clients)\n", (unsigned)page, (unsigned)usage, down ? "down" : "up",
++		    clients());
+ 		dispatchEvent(event);
+ 		event->release();
+ 	}
+@@ -556,6 +565,22 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++/*
++ * Ring/silent switch: a level, not a press, on the Telephony page, usage 0x2E.
++ * backboardd takes ringerState = down and names 0 "silent", 1 "tone1", so the
++ * value is 1 while the switch is at ring. Returns the number of HID clients so
++ * the caller can repeat the initial state until backboardd listens.
++ */
++extern "C" unsigned
++sweet_hid_ringer(int silent)
++{
++	if (!gSweetButtons) {
++		return 0;
++	}
++	gSweetButtons->key(SWEET_HID_RINGER_SWITCH, silent == 0, kHIDPage_Telephony);
++	return gSweetButtons->clients();
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {

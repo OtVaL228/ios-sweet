@@ -632,6 +632,50 @@ static void join_poll(void)
 	asked = 1;
 }
 
+/*
+ * wifid tries its saved networks once when it starts and does not retry ("__WiFiDeviceManagerScheduleNextRetry not
+ * allowed with Unified Auto-Join"); at boot it starts long before the radio is up, its one try finds no scan results
+ * ("setScanResultsWithAutoJoinSessionCompletion: no scan results"), and the phone stayed off Wi-Fi until joined by
+ * hand. A wifid started again once the radio scans joins by itself (its own saved network and password, as a user
+ * join): if wifid has the bridge, the radio has scanned and nothing is joined 20 s later, wifid is killed once and
+ * launchd starts it again. WLAND_NO_WIFID_KICK=1 leaves it alone.
+ */
+/* libproc (libsystem_kernel); the iOS SDK has no libproc.h */
+int proc_listallpids(void *buffer, int buffersize);
+int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+static void wifid_kick_poll(void)
+{
+	static uint64_t since;
+	static int done;
+	if (done || !bridge_joins || !radio_scans() || getenv("WLAND_NO_WIFID_KICK"))
+		return;
+	uint64_t now = link_ms();
+	if (radio_joined()) {
+		done = 1;			/* wifid joined on its own */
+		return;
+	}
+	if (!since) {
+		since = now;
+		return;
+	}
+	if (now - since < 20000)
+		return;
+	done = 1;
+	pid_t pids[2048];
+	int n = proc_listallpids(pids, sizeof(pids)) ;
+	for (int i = 0; i < n; i++) {
+		char name[64];
+		if (pids[i] > 0 && proc_name(pids[i], name, sizeof(name)) > 0 && strcmp(name, "wifid") == 0) {
+			printf("[%6llu] net: radio up %llu s, not joined: wifid (%d) started again for its auto-join\n",
+			       (unsigned long long)now, (unsigned long long)(now - since) / 1000, pids[i]);
+			kill(pids[i], SIGKILL);
+			return;
+		}
+	}
+	printf("[%6llu] net: no wifid to start again\n", (unsigned long long)now);
+}
+
 static volatile sig_atomic_t drop_asked;
 
 static void on_usr1(int sig)
@@ -650,6 +694,7 @@ static void net_idle(void)
 	ipnet_poll();
 	bridge_poll();
 	join_poll();
+	wifid_kick_poll();
 }
 
 static int net(unsigned secs)

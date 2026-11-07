@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee51..5e4a065ee 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -385,6 +385,19 @@ get(struct apple80211req *request)
+ 		kfree_data(bss, sizeof(*bss));
+ 		return error;
+ 	}
++	case 106: {                             /* the RSSI range, dBm: IO80211 makes RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD of it */
++		/*
++		 * wifid's auto-join threshold is RSSI_THRESHOLD (__WiFiDeviceManagerGetAutoJoinThreshold); without
++		 * this answer it stays 0 and every network is "Below minimum RSSI threshold", so only a user's
++		 * join from Settings worked. -80 is also CoreWiFi's own auto-join minRSSI.
++		 */
++		struct {
++			uint32_t version;
++			int32_t min, max, threshold;
++		} answer = { .version = 1, .min = -100, .max = 0, .threshold = -80 };
++
++		return give(request, &answer, sizeof(answer));
++	}
+ 	default:
+ 		break;
+ 	}

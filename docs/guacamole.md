@@ -17,6 +17,7 @@ as coming from a device tree (DT) or Linux.
 | iOS userland: lock screen, home screen, apps | works (CPU rendering) |
 | Display 1125x2436 presented, scaled x1.28 to 1440x3120 | works (0083); 60 Hz with sweetfb_hz=60 (gl16, 0132) |
 | Buttons (power, volume) | works (0084) |
+| Alert Slider as the ring/silent switch | works (0158; MobileGestalt ringer-switch answer, see Alert Slider) |
 | Touch (Samsung S6SY761) | works (0085-0087) |
 | GPU (Adreno 640) | kernel bring-up, RedwoodGPU (G2b), Mesa freedreno (G3), CoreAnimation in backboardd on the GPU drawing straight into IOSurfaces at 60 Hz (G4: 0117-0132, userland/gpu, userland/bbd) |
 | File drop (SWEETBOX) | works: raw image in `rawdump` -> files in /private/var/tmp |
@@ -178,6 +179,33 @@ sweetwifid=0, wland keeps its own utun + netsvc). 0139 also has AKS
 wrap/unwrap (keychain items, wifid's passwords) and drops IOKit's busy
 hold for an IOKit daemon that never reports (configd's InterfaceNamer and
 wifid waited for it).
+
+Auto-join after boot (0159): wifid's auto-join threshold is the device's
+RSSI_THRESHOLD (`__WiFiDeviceManagerGetAutoJoinThreshold`), which IO80211
+reads with Apple80211 get 106 (RSSI bounds: version, min, max, threshold as
+int32). Our ioctl did not answer it, the threshold stayed 0 dBm and every
+network was "Below minimum RSSI threshold"; a join from Settings skips that
+check, so only manual joins worked. 0159 answers -100 / 0 / -80 (CoreWiFi's
+own auto-join minRSSI is -80). wland also restarts wifid once if the radio
+scans and nothing joined for 20 s (WLAND_NO_WIFID_KICK turns it off).
+
+## Alert Slider
+
+0158 (bsd/dev/sweet_keys.c, keys thread, every 20 ms): TLMM gpio125 (top),
+gpio134 (middle), gpio27 (bottom), active low, one pin low per position.
+The bootloader leaves them pulled down (cfg 0x1, all read 0); the kernel
+writes GPIO_CFG = 0 once (no pull, Android's tri_state_key_active). Top and
+middle (OnePlus silent / vibrate) are silent, bottom rings; sweetslider=0
+off, 2 inverted. `userland/jb/slider` reads the pins over /dev/pmem.
+
+What iOS needs, from the disassembly: backboardd's BKButtonHIDEventProcessor
+sends only Telephony page 0xB usage **0x2E** to _processRingerSwitchEvent
+(0x2D is "Unknown page"), ringerState = the key's down value (0 "silent",
+1 "tone1"), so SweetHID sends down while at ring. SpringBoard's
+_ringerChanged: then does nothing unless SBUIHasHIDRingerSwitch(), which
+is MGGetBoolAnswer("ringer-switch"): false on this phone. Fixed in the
+MobileGestalt cache: `mgtool setbool ringer-switch true` (once; a rebuilt
+cache needs it again), then respring.
 
 ## Metal (metal2vulkan + Turnip, sweetmtl=2)
 
