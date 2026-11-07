@@ -3,6 +3,19 @@
 - User reports both the OpenGL-off and OpenGL-on boot images now seem to render
   with Metal after the `_RB4` fallback update. Cut the Rope still opens to a
   white screen; cause is unresolved.
+- Installed Angry Birds Classic 8.0.3 (`com.clickgamer.AngryBirds`) from
+  `/Users/coreycusick/Downloads/Angry Birds Classic.ipa` to
+  `/Applications/AngryBirdsClassic.app`. Its executable is arm64, requires
+  OpenGL ES 2, and imports OpenGLES.framework; it has no Metal path. Repeated
+  launch reports show `SIGABRT` / `Abort trap: 6` about 0.1 s after launch,
+  unwinding through the C++/Objective-C terminate handler. The `.ips` reports
+  omit the exception reason. The IPA contains the diagnostic string
+  `Failed to create EAGLContext`, so failure to initialize the app's own GL
+  context is a likely cause. The `sweetgl` boot path loads Mesa into
+  `backboardd` only; it does not establish an EAGL context for Angry Birds.
+  Need app-process EAGL logging/injection to confirm. The phone went offline on
+  SSH (`192.168.0.50` host down) during this check, so no per-app shim change
+  was made.
 - Root cause hypothesis from source: RedwoodGPU is brought up asynchronously
   after `sweetgpu=11`; Metal's first open can happen before the backend is
   ready. `SweetMetal2Device` wraps initialization in `dispatch_once`, so a
