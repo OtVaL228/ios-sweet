@@ -27,8 +27,11 @@ screen (image versions v8-v14 in NOTES.md):
                   /usr/libexec/sweet-bbd (userland/bbd), which execs the real
                   backboardd with our library in DYLD_INSERT_LIBRARIES;
                   guacamole: com.sweet.wland (Wi-Fi, /var/local/bin/wland up 0)
+                  com.sweet.btd (Bluetooth, /var/local/bin/btd serve; bluetoothd
+                  gets BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt, com.apple.BlueTool
+                  runs /var/local/bin/bluetoold)
                   and com.sweet.sshd (the rootless Procursus bootstrap's sshd in
-                  /var/jb), both RunAtLoad, so Wi-Fi and SSH come up on every
+                  /var/jb), all RunAtLoad, so Wi-Fi and SSH come up on every
                   boot without a SWEETBOX autorun.sh
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
@@ -92,6 +95,17 @@ NET_JOBS = {
         'StandardOutPath': '/var/local/wland.out',
         'StandardErrorPath': '/var/local/wland.out',
     },
+    # Bluetooth (userland/bt): btd powers the controller, loads its firmware from /var/local/fw/bt and
+    # serves it to bluetoothd through the kernel control com.sweet.bt (xnu 0162, boot-arg sweetbt=1);
+    # it retries until wland has the rails up.
+    '/System/Library/LaunchDaemons/com.sweet.btd.plist': {
+        'Label': 'com.sweet.btd',
+        'ProgramArguments': ['/var/local/bin/btd', 'serve'],
+        'RunAtLoad': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/btd.out',
+        'StandardErrorPath': '/var/local/btd.out',
+    },
     '/System/Library/LaunchDaemons/com.sweet.sshd.plist': {
         'Label': 'com.sweet.sshd',
         'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D'],
@@ -100,6 +114,13 @@ NET_JOBS = {
         'POSIXSpawnType': 'Interactive',
     },
 }
+
+# bluetoothd: H4 over its "POSIX" driver, which is a kernel control socket (PF_SYSTEM) by name, not a tty:
+# com.sweet.bt relays it to btd. The address comes from the ADT bluetooth node (tools/mkadt.py). BlueTool
+# (Broadcom/Apple chip scripts; nothing for our ProductHash) is replaced by userland/bt/bluetoold, which
+# answers bluetoothd's RunBuiltinScript requests ("boot", "init") with result 0.
+BLUETOOTHD_ENV = {'BT_HCI_TRANSPORT': 'H4:POSIX:com.sweet.bt'}
+BLUETOOL_STANDIN = ['/var/local/bin/bluetoold']
 
 BBD_WRAPPER = '/usr/libexec/sweet-bbd'
 REMOVED_JOBS = ('com.apple.CommCenter', 'com.apple.fairplayd.H2')
@@ -127,6 +148,11 @@ def launchd_plist(src, dst):
     if '--net' in sys.argv:
         for k, j in NET_JOBS.items():
             jobs[k] = dict(j)
+        for job in jobs.values():
+            if job.get('Label') == 'com.apple.bluetoothd':
+                job.setdefault('EnvironmentVariables', {}).update(BLUETOOTHD_ENV)
+            if job.get('Label') == 'com.apple.BlueTool':
+                job['ProgramArguments'] = list(BLUETOOL_STANDIN)
     for job in jobs.values():
         if job.get('Label') == 'com.apple.backboardd':
             job['ProgramArguments'] = [BBD_WRAPPER]

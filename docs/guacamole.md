@@ -384,7 +384,7 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   (identity), and we assign nothing: the likely reason for the crash.
   Audio waits on that.
 
-## Bluetooth (userland/bt, controller up, no iOS stack yet)
+## Bluetooth (userland/bt + xnu 0162: controller up, iOS stack running)
 
 - Chip: the WCN3990-family BT core ("cherokee", persist.vendor.qcom.
   bluetooth.soc), EDL version: product 0xa, patch 0x6699, ROM 0x1001,
@@ -416,9 +416,53 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
 - `btd scan 15`: 301 LE advertising reports from 14 devices and 2 BR/EDR
   inquiry results. The BD address is the NVM placeholder 39:90:21:64:07:00;
   the phone's own address (Android keeps it in persist) is not set yet.
-- iOS bluetoothd fails with "Unable to match bluetooth service in device
-  tree": it wants an ADT `bluetooth` node and a Broadcom/BlueTool-style
-  transport. Next: recon of what it expects.
+- iOS stack (bluetoothd), what it needs and what we give it:
+  - Address: only from IOService `bluetooth` (or `marconi-bt`) ->
+    IODeviceTree `local-mac-address`. `BT_DEVICE_ADDRESS` is parsed and then
+    zeroed in the release build (and, when set, skips the device tree), so
+    without the node: "No bluetooth on this device", exit 0, every 10 s.
+    mkadt.py adds `/arm-io/bluetooth` with 02:53:57:45:45:02
+    (mac-address-bluetooth0); btd writes the same address into the NVM.
+  - Transport: `BT_HCI_TRANSPORT=TRANSPORT:DRIVER:ARG` (transports USB H4DS
+    H4BC H4 H5 APPLEBT VIRT PCIE PCIESW, drivers USB POSIX APPLEBT VIRT PCIE
+    PCIESW). The POSIX driver is not a tty: socket(PF_SYSTEM, SOCK_STREAM,
+    SYSPROTO_CONTROL), CTLIOCGINFO by name (default Apple's Skywalk
+    com.apple.uart.sk.bluetooth), getsockopt(TIOCGETA) / setsockopt(TIOCSETA)
+    with a 72-byte termios, then the H4 stream. xnu 0162
+    (bsd/dev/sweet_btctl.c, boot-arg `sweetbt=1`) registers
+    `com.sweet.bt`, a relay: the client that sets option 0x5357 is the
+    controller (btd serve), the others are hosts. bluetoothd gets
+    `H4:POSIX:com.sweet.bt`.
+  - Chip boot: bluetoothd asks the XPC service com.apple.BlueTool to
+    RunBuiltinScript "boot" then "init" (kMsgArgs: script, btaddress).
+    BlueTool knows Broadcom/Apple chips only (platform = hex ProductHash,
+    override /etc/bluetool/<hash>.<seq>.script never found; then it waits
+    for an AppleOLYHAL Wi-Fi vendor and times out). userland/bt/bluetoold
+    answers every request with result 0; the com.apple.BlueTool job runs it.
+  - HCI init (btd serve rewrites on the way):
+    - Read Local Supported Commands: bluetoothd only sends listed commands;
+      Write Default Erroneous Data Reporting (0x0c5b, octet 18 bit 3) is
+      listed and its "unknown command" answered as done.
+    - Vendor commands (OGF 0x3f) are Broadcom's (it takes the chip for
+      BCM_4357 from the model) and never go to the Qualcomm firmware, whose
+      own vendor range overlaps (0xfc00 = download). btd answers them:
+      Unknown HCI Command plus 2 bytes, since replies parsed by
+      _BCM_ByteStreamEventParser need >= 2 bytes or the command never
+      completes (15 s, "timedout waiting for controller", restart). The
+      "Olympic" multiplexer 0xfce2 (sub-command first: 0x15 ANTENNA_PREF_B,
+      0x0d power statistics, ...) gets success, the sub-command echoed and
+      34 zero bytes (0x0d asserts on a short reply, bcm_vsc.c:139).
+    - LE Read Transmit Power (0x204a) is answered here as unknown: after it
+      the controller refuses the legacy LE commands bluetoothd then uses
+      (Set Scan Parameters, Read Advertising Channel Tx Power: 0x0c).
+    - LE Set Scan / Advertising Parameters with a random own address go out
+      as public: the random address is set with a Broadcom command.
+  - Restarting btd under a running bluetoothd leaves the controller
+    unconfigured (bluetoothd does not notice): restart bluetoothd after it.
+- Result: bluetoothd stays up (STACK_READY), LE scanning delivers
+  advertisements. Jobs (sweet-root-tweaks.py --net): com.sweet.btd,
+  com.apple.BlueTool -> bluetoold, bluetoothd env. /var/local/btd.off
+  keeps btd from starting; /var/local/btd.trace logs every command.
 
 ## SWEETBOX file drop
 

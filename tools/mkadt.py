@@ -230,6 +230,18 @@ def build(seed=None, qemu=False, highmem=False):
             ph(),
             ('device_type', cstr('wlan')),
             ('compatible', cstr('guacamole,wcn3990')),
+        ]),
+        # bluetoothd takes its address only from IOService "bluetooth" (or
+        # "marconi-bt") -> IODeviceTree local-mac-address (BT_DEVICE_ADDRESS
+        # is parsed and then zeroed in release builds); without it: "No
+        # bluetooth on this device", exit 0. The transport comes from
+        # BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt (xnu 0162 + btd serve). Same address
+        # as mac-address-bluetooth0; btd writes it into the controller's NVM.
+        node('bluetooth', [
+            ph(),
+            ('device_type', cstr('bluetooth')),
+            ('compatible', cstr('guacamole,wcn3990-bt')),
+            ('local-mac-address', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])),
         ])] if GUACAMOLE else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node

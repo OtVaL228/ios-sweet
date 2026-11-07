@@ -16,11 +16,18 @@
  *   btd up                  and the rampatch + NVM (/var/local/fw/bt: linux-firmware qca/crbtfw21.tlv, crnv21.bin),
  *                           HCI reset, version and address
  *   btd scan [SECS]         and a classic inquiry plus an LE scan
+ *   btd serve [NAME]        and hand the controller to bluetoothd: H4 both ways through the kernel control
+ *                           NAME (default com.sweet.bt, xnu 0162, boot-arg sweetbt=1); bluetoothd's POSIX driver
+ *                           connects to it with BT_HCI_TRANSPORT=H4:POSIX:NAME (its transport table: USB H4DS
+ *                           H4BC H4 H5 APPLEBT VIRT PCIE PCIESW, drivers USB POSIX APPLEBT VIRT PCIE PCIESW)
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #include "../wland/pmem.h"
@@ -495,8 +502,13 @@ static void nvm_fixup(uint8_t *d, size_t n)
 			data[0] &= ~0x80;	/* IBS: the host would have to wake the chip with 0xfd before each packet */
 			data[2] = 0;
 		}
-		if (id == 2 && tlen == 6)
-			printf("nvm: BD address %02x:%02x:%02x:%02x:%02x:%02x\n", data[5], data[4], data[3], data[2], data[1], data[0]);
+		if (id == 2 && tlen == 6) {
+			/* the ADT's local-mac-address (tools/mkadt.py), what bluetoothd believes; LSB first here */
+			static const uint8_t addr[6] = { 0x02, 0x45, 0x45, 0x57, 0x53, 0x02 };
+			printf("nvm: BD address %02x:%02x:%02x:%02x:%02x:%02x -> 02:53:57:45:45:02\n", data[5], data[4], data[3],
+			       data[2], data[1], data[0]);
+			memcpy(data, addr, 6);
+		}
 		idx += 12u + tlen;
 	}
 }
@@ -687,6 +699,257 @@ static void scan(unsigned secs)
 	       soc_log_bytes);
 }
 
+/* ---- serve: the controller to bluetoothd (BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt) ---- */
+
+#define SWEET_BT_DEVICE 0x5357	/* sweet_btctl.c: this end is the controller */
+
+/* xnu bsd/sys/kern_control.h, sys_domain.h (not in the iOS SDK) */
+#define SYSPROTO_CONTROL	2
+#define AF_SYS_CONTROL		2
+struct ctl_info {
+	uint32_t ctl_id;
+	char ctl_name[96];
+};
+struct sockaddr_ctl {
+	uint8_t sc_len;
+	uint8_t sc_family;
+	uint16_t ss_sysaddr;
+	uint32_t sc_id;
+	uint32_t sc_unit;
+	uint32_t sc_reserved[5];
+};
+#define CTLIOCGINFO		_IOWR('N', 3, struct ctl_info)
+
+/* the next whole H4 packet the controller sent, 0 if none yet; noise bytes are dropped */
+static unsigned h4_take(uint8_t *out)
+{
+	for (;;) {
+		unsigned n = 0;
+		if (!rxq_n)
+			return 0;
+		switch (rxq[0]) {
+		case 0x02:
+			if (rxq_n >= 5)
+				n = 5u + (rxq[3] | rxq[4] << 8);
+			break;
+		case 0x03:
+			if (rxq_n >= 4)
+				n = 4u + rxq[3];
+			break;
+		case 0x04:
+			if (rxq_n >= 3)
+				n = 3u + rxq[2];
+			break;
+		default:
+			printf("serve: dropping byte %#x\n", rxq[0]);
+			memmove(rxq, rxq + 1, --rxq_n);
+			continue;
+		}
+		if (!n || n > rxq_n)
+			return 0;
+		memcpy(out, rxq, n);
+		memmove(rxq, rxq + n, rxq_n - n);
+		rxq_n -= n;
+		return n;
+	}
+}
+
+/* the kernel's relay (xnu 0162, bsd/dev/sweet_btctl.c), opened before the hardware is touched */
+static int serve_fd = -1;
+
+static int serve_open(const char *name)
+{
+	int m = socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL);
+	struct ctl_info ci;
+	memset(&ci, 0, sizeof(ci));
+	strlcpy(ci.ctl_name, name, sizeof(ci.ctl_name));
+	if (m < 0 || ioctl(m, CTLIOCGINFO, &ci)) {
+		printf("serve: no kernel control %s (boot-arg sweetbt=1?): %s\n", name, strerror(errno));
+		return -1;
+	}
+	struct sockaddr_ctl sc = { .sc_len = sizeof(sc), .sc_family = AF_SYSTEM, .ss_sysaddr = AF_SYS_CONTROL,
+				   .sc_id = ci.ctl_id };
+	int one = 1;
+	if (connect(m, (struct sockaddr *)&sc, sizeof(sc)) ||
+	    setsockopt(m, SYSPROTO_CONTROL, SWEET_BT_DEVICE, &one, sizeof(one))) {
+		printf("serve: %s: %s\n", name, strerror(errno));
+		return -1;
+	}
+	fcntl(m, F_SETFL, O_NONBLOCK);
+	serve_fd = m;
+	return 0;
+}
+
+/*
+ * Commands bluetoothd needs to pass that this controller does not know: settings with nothing to return,
+ * answered as if done. Every other refusal is logged and passed on.
+ */
+static const struct {
+	uint16_t op;
+	uint8_t octet, bit;	/* in Read Local Supported Commands: bluetoothd only sends what is listed there */
+} fake_ok_ops[] = {
+	{ 0x0c5b, 18, 3 },	/* Write Default Erroneous Data Reporting */
+};
+
+/* Read Local Supported Commands (0x1002): list the commands answered here */
+static void supported_commands(uint8_t *pkt, unsigned n)
+{
+	if (n < 7u + 64 || pkt[6])	/* H4 type, code, length, ncmd, opcode, status, 64 octets */
+		return;
+	for (unsigned i = 0; i < sizeof(fake_ok_ops) / sizeof(fake_ok_ops[0]); i++)
+		pkt[7 + fake_ok_ops[i].octet] |= (uint8_t)(1u << fake_ok_ops[i].bit);
+}
+
+static void fake_ok(const uint8_t *pkt, uint16_t op, uint8_t *status)
+{
+	(void)pkt;
+	int fake = 0;
+	for (unsigned i = 0; i < sizeof(fake_ok_ops) / sizeof(fake_ok_ops[0]); i++)
+		fake |= fake_ok_ops[i].op == op;
+	printf("serve: %#06x refused with status %#x%s\n", op, *status, fake ? ", answered as done" : "");
+	if (fake)
+		*status = 0;
+}
+
+static int serve(const char *name)
+{
+	int m = serve_fd;
+	const char *sn = name;
+	int trace = getenv("BTD_TRACE") != NULL || !access("/var/local/btd.trace", F_OK);
+	printf("serve: kernel control %s, H4 to the controller\n", sn);
+	static uint8_t pkt[sizeof(rxq)];
+	static uint8_t up[4096];
+	unsigned up_n = 0, own_addr_logged = 0;
+	int random_set = 0;
+	unsigned long up_cmds = 0, up_bytes = 0, down_pkts = 0, logs = 0, vsc = 0;
+	uint64_t next_stat = now_us() + 60000000ull;
+	for (;;) {
+		ssize_t r = read(m, up + up_n, sizeof(up) - up_n);
+		if (r > 0) {
+			up_n += (unsigned)r;
+			up_bytes += (unsigned long)r;
+			/* whole H4 packets from the host: commands, ACL, SCO */
+			for (;;) {
+				unsigned len = 0;
+				if (up_n >= 4 && up[0] == 0x01)
+					len = 4u + up[3];
+				else if (up_n >= 5 && up[0] == 0x02)
+					len = 5u + (up[3] | up[4] << 8);
+				else if (up_n >= 4 && up[0] == 0x03)
+					len = 4u + up[3];
+				else if (up_n && up[0] != 0x01 && up[0] != 0x02 && up[0] != 0x03) {
+					printf("serve: host sent %#x, dropping\n", up[0]);
+					memmove(up, up + 1, --up_n);
+					continue;
+				}
+				if (!len || len > up_n)
+					break;
+				uint16_t op = up[0] == 0x01 ? (uint16_t)(up[1] | up[2] << 8) : 0;
+				if (up[0] == 0x01) {
+					up_cmds++;
+					if (trace) {
+						printf("serve: > cmd %#06x (%u bytes)", op, up[3]);
+						for (unsigned i = 0; i < up[3] && i < 16; i++)
+							printf(" %02x", up[4 + i]);
+						printf("\n");
+					}
+				}
+				if (up[0] == 0x01 && (op == 0x200b || op == 0x2006) && up[3] >= 6 && up[4 + 5] == 1) {
+					/* own address type random: bluetoothd sets the random address with a Broadcom
+					 * command that never reaches this controller, which then refuses (0x0c); use
+					 * the public address until the random one is set the standard way (0x2005) */
+					if (!random_set) {
+						up[4 + 5] = 0;
+						if (!own_addr_logged++)
+							printf("serve: LE own address random -> public (no random address set)\n");
+					}
+				}
+				if (up[0] == 0x01 && op == 0x2005)
+					random_set = 1;
+				if (up[0] == 0x01 && op == 0x204a) {
+					/* an extended-advertising-era LE command: once the controller has seen one it
+					 * refuses the legacy LE commands bluetoothd goes on to use (Set Scan Parameters,
+					 * Read Advertising Channel Tx Power: 0x0c Command Disallowed) */
+					uint8_t cc[7] = { 0x04, 0x0e, 4, 1, (uint8_t)op, (uint8_t)(op >> 8), 0x01 };
+					if (write(m, cc, sizeof(cc)) != (ssize_t)sizeof(cc))
+						printf("serve: reply to %#06x lost\n", op);
+					memmove(up, up + len, up_n - len);
+					up_n -= len;
+					continue;
+				}
+				if (up[0] == 0x01 && op >> 10 == 0x3f) {
+					/* vendor commands are Broadcom's here (BD_VSC_*): never to the Qualcomm firmware,
+					 * whose own vendor commands share the range (0xfc00 is its download command) */
+					/* Unknown HCI Command, with two bytes after the status: the commands whose reply
+					 * goes through _BCM_ByteStreamEventParser (e.g. BD_VSC_FACTORY_CAL_READ_TABLE)
+					 * only complete, with the error, when it has 2 bytes to read */
+					uint8_t cc[9 + 32] = { 0x04, 0x0e, 6, 1, (uint8_t)op, (uint8_t)(op >> 8), 0x01,
+							       up[3] ? up[4] : 0, 0x01 };
+					if (op == 0xfce2 && up[3]) {
+						/* BD_VSC_OLYMPIC_*: one opcode, the sub-command in the first byte. Its reply
+						 * goes through _BCM_ByteStreamEventParser, which wants at least 2 bytes
+						 * (sub-command, its status) before it calls the command's callback;
+						 * without that ANTENNA_PREF_B (0x15) never completes and after 15 s
+						 * bluetoothd restarts ("timedout waiting for controller") */
+						cc[2] = 6 + 32;
+						cc[6] = 0;
+						cc[7] = up[4];
+						cc[8] = 0;
+						/* and zeros for what the sub-command's own callback reads (0x0d, power
+						 * statistics, asserts "ByteStream_NumReadBytesAvail(*pBs) >= 2") */
+					}
+					if (write(m, cc, 3u + cc[2]) != (ssize_t)(3u + cc[2]))
+						printf("serve: reply to %#06x lost\n", op);
+					vsc++;
+				} else {
+					for (unsigned off = 0; off < len;) {
+						unsigned c = len - off > 240 ? 240 : len - off;
+						if (uart_write(up + off, c))
+							printf("serve: UART TX failed\n");
+						off += c;
+					}
+				}
+				memmove(up, up + len, up_n - len);
+				up_n -= len;
+			}
+		}
+		uart_poll();
+		unsigned n;
+		while ((n = h4_take(pkt))) {
+			if (pkt[0] == 0x02 && ((pkt[1] | pkt[2] << 8) & 0xfff) == (0x2edc & 0xfff)) {
+				logs++;
+				continue;
+			}
+			if (trace && pkt[0] == 0x04)
+				printf("serve: < event %#x (%u bytes)%s\n", pkt[1], pkt[2],
+				       pkt[1] == 0x0e && n >= 7 && pkt[6] ? " (status != 0)" : "");
+			if (pkt[0] == 0x04 && pkt[1] == 0x0e && n >= 7 && (pkt[4] | pkt[5] << 8) == 0x1002)
+				supported_commands(pkt, n);
+			if (pkt[0] == 0x04 && pkt[1] == 0x0e && n >= 7 && pkt[6])
+				fake_ok(pkt, pkt[4] | pkt[5] << 8, &pkt[6]);
+			else if (pkt[0] == 0x04 && pkt[1] == 0x0f && n >= 7 && pkt[3])
+				fake_ok(pkt, pkt[5] | pkt[6] << 8, &pkt[3]);
+			down_pkts++;
+			for (unsigned off = 0; off < n;) {
+				ssize_t w = write(m, pkt + off, n - off);
+				if (w > 0)
+					off += (unsigned)w;
+				else if (errno == EAGAIN)
+					usleep(200);
+				else
+					break;
+			}
+		}
+		if (now_us() > next_stat) {
+			printf("serve: %lu commands (%lu vendor, answered here), %lu bytes up; %lu packets down, %lu controller "
+			       "log packets dropped\n", up_cmds, vsc, up_bytes, down_pkts, logs);
+			next_stat = now_us() + 60000000ull;
+		}
+		if (r <= 0)
+			usleep(300);
+	}
+}
+
 static void pins(void)
 {
 	/* function qup13 (mux 1), 2 mA: CTS 43 and RX 46 no pull, RTS 44 pull-down, TX 45 pull-up (live DT) */
@@ -700,9 +963,19 @@ static void pins(void)
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	if (argc < 2 || (strcmp(argv[1], "version") && strcmp(argv[1], "up") && strcmp(argv[1], "scan"))) {
-		fprintf(stderr, "usage: btd version | up | scan [SECS]\n");
+	if (argc < 2 || (strcmp(argv[1], "version") && strcmp(argv[1], "up") && strcmp(argv[1], "scan") &&
+			 strcmp(argv[1], "serve"))) {
+		fprintf(stderr, "usage: btd version | up | scan [SECS] | serve [NAME]\n");
 		return 2;
+	}
+	if (!strcmp(argv[1], "serve")) {
+		/* at boot: nothing to do without the kernel's relay, or when switched off */
+		if (!access("/var/local/btd.off", F_OK)) {
+			printf("serve: /var/local/btd.off, not starting\n");
+			return 0;
+		}
+		if (serve_open(argc > 2 ? argv[2] : "com.sweet.bt"))
+			return 0;
 	}
 	pm_init();
 	step("pins");
@@ -713,15 +986,16 @@ int main(int argc, char **argv)
 	if (uart_init())
 		return 1;
 	/* a chip left running by an earlier btd does not always take the pulses: off, a pause, on, again */
-	int ok = 0;
-	for (int i = 0; i < 4 && !ok; i++) {
+	/* at boot (launchd job com.sweet.btd) the rails may not be up yet: wland turns them on for WLAN */
+	int ok = 0, tries = strcmp(argv[1], "serve") ? 4 : 30;
+	for (int i = 0; i < tries && !ok; i++) {
 		step("bt: power pulses");
 		if (power_on())
 			return 1;
 		step("bt: version");
 		ok = !read_version();
 		if (!ok)
-			usleep(200000);
+			usleep(i < 3 ? 200000 : 3000000);
 	}
 	if (!ok)
 		return 1;
@@ -732,5 +1006,7 @@ int main(int argc, char **argv)
 		return 1;
 	if (!strcmp(argv[1], "scan"))
 		scan(argc > 2 ? (unsigned)atoi(argv[2]) : 12);
+	if (!strcmp(argv[1], "serve"))
+		return serve(argc > 2 ? argv[2] : "com.sweet.bt") ? 1 : 0;
 	return 0;
 }
