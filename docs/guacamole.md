@@ -17,6 +17,7 @@ as coming from a device tree (DT) or Linux.
 | iOS userland: lock screen, home screen, apps | works (CPU rendering) |
 | Display 1125x2436 presented, scaled x1.28 to 1440x3120 | works (0083); 60 Hz with sweetfb_hz=60 (gl16, 0132) |
 | Buttons (power, volume) | works (0084) |
+| Files app, On My iPhone | works (0160, 0161, userland/jb fpwrap + libsweet-fpfs; see Files app) |
 | Alert Slider as the ring/silent switch | works (0158; MobileGestalt ringer-switch answer, see Alert Slider) |
 | Touch (Samsung S6SY761) | works (0085-0087) |
 | GPU (Adreno 640) | kernel bring-up, RedwoodGPU (G2b), Mesa freedreno (G3), CoreAnimation in backboardd on the GPU drawing straight into IOSurfaces at 60 Hz (G4: 0117-0132, userland/gpu, userland/bbd) |
@@ -265,6 +266,45 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   Chat videos hang: mediaserverd waits for an audio device at start
   (vaemGetVirtualAudioDeviceIDs). web.telegram.org restarts itself when its
   shared worker dies (not a GPU error).
+
+## Files app
+
+On My iPhone is FileProvider's LocalStorage domain on FPFS, which iOS 16
+builds for APFS; our root is HFS. Four walls, each seen in the unified log:
+
+1. fileproviderd keeps its FPFS library only on an eligible volume:
+   -[FPDVolume isEligibleForFPFS:] (FileProviderDaemon) takes a statfs and
+   wants f_fstypename "apfs" ("Non-eligible device /dev/ufsroot0: non-apfs"),
+   so every domain stayed "url:(null) state:disabled" and Files listed
+   nothing. userland/jb/fpfs.m (/var/local/lib/libsweet-fpfs.dylib) also
+   accepts a local writable HFS volume; userland/jb/fpwrap.c
+   (/var/local/bin/fpwrap) puts it in DYLD_INSERT_LIBRARIES and execs
+   fileproviderd. The com.apple.FileProvider job's Program in
+   /System/Library/xpc/launchd.plist is /var/local/bin/fpwrap (backup
+   launchd.plist.pre-fpwrap; /var/local/fpwrap.off turns the library off).
+2. The LocalStorage extension aborted: PlugInKit asks
+   sandbox_container_path_for_pid (Sandbox op 4) and throws on failure
+   ("plugin has invalid sandbox or container: error 2"). launchd spawns it
+   with Sandbox spawn attributes, profile "plugin", empty container; pkd
+   puts the data container in the launch overlay as HOME. 0160:
+   sweet_sandbox_exec (called from exec_mach_imgact) keeps the container
+   per pid (spawn attributes, else HOME under /private/var/mobile/
+   Containers/), op 4 answers it.
+3. FPFS marks a domain's storage as a sync root with APFS fsctls
+   ("can't obtain VFSItem ... [25: Inappropriate ioctl]"). 0161 emulates
+   _IOW/_IOR('J', 72) (set/get, xattr com.apple.sweet.syncroot) and
+   _IOR('J', 74) (sync root id above an item) for HFS. The storage made
+   before 0161 needed the mark once by hand (`xattr -w
+   com.apple.sweet.syncroot 1 ".../File Provider Storage"`).
+4. Directories could not be found by file id (a new folder vanished):
+   fpfs_fgethandle asks fpfs_pkg_dirstat, _IOWR('J', 32, 40 bytes), and
+   accepts only ENOTSUP as "not supported". 0161 answers ENOTSUP for that
+   one fsctl on HFS. Not for every 'J' fsctl: launchd queries the root with
+   one and panics the boot on ENOTSUP ("failed to query root device
+   status: 45"); it wants ENOTTY.
+
+0161 also logs, once per command, file system ioctls that end in ENOTTY or
+ENOTSUP from the FileProvider processes ("SWEET IOCTL: ...").
 
 ## SWEETBOX file drop
 
