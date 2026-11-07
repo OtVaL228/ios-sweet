@@ -16,6 +16,8 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include "NativeBridgeMetalFrontend.h"
@@ -146,6 +148,43 @@ static bool listed(void)
 	return yes;
 }
 
+/*
+ * The kernel starts the Adreno asynchronously (sweetgpu=11). Metal can be
+ * requested by SpringBoard before RedwoodGPU has registered, and its first
+ * failed IOServiceOpen is cached for the process lifetime below. Wait for the
+ * backend's readiness service before making that one-shot attempt. Override
+ * the 120-second default with sweetmtlwait=N; zero disables the wait.
+ */
+static long metal_wait_seconds(void)
+{
+	char args[2048] = { 0 };
+	size_t size = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0)
+		return 120;
+	args[sizeof(args) - 1] = 0;
+	const char *key = "sweetmtlwait=";
+	char *p = strstr(args, key);
+	if (!p)
+		return 120;
+	char *end = NULL;
+	long value = strtol(p + strlen(key), &end, 10);
+	return end == p + strlen(key) || value < 0 ? 120 : value;
+}
+
+static io_service_t wait_for_redwood_gpu(long patience, long *waited)
+{
+	*waited = 0;
+	io_service_t gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
+	while (!gpu && *waited < patience) {
+		if (*waited == 0)
+			sm2_log("waiting up to %ld s for RedwoodGPU before first Metal open", patience);
+		sleep(1);
+		++*waited;
+		gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
+	}
+	return gpu;
+}
+
 @interface _MTLDevice : NSObject
 @end
 
@@ -165,6 +204,15 @@ static bool listed(void)
 		if (!listed()) {
 			sm2_log("not listed (/var/local/mtl2-clients): no Metal device");
 			return;
+		}
+		long waited = 0;
+		long patience = metal_wait_seconds();
+		io_service_t gpu = wait_for_redwood_gpu(patience, &waited);
+		if (gpu) {
+			IOObjectRelease(gpu);
+			sm2_log("RedwoodGPU ready after %ld s; opening Metal", waited);
+		} else {
+			sm2_log("RedwoodGPU absent after %ld s; trying Metal open", waited);
 		}
 		NSString *bundle = [[NSBundle bundleForClass:[SweetMTL2Device class]] bundlePath];
 		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];

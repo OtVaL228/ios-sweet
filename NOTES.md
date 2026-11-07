@@ -1,16 +1,36 @@
-# Active handoff — guacamole Metal2 (2026-11-06)
+# Active handoff — guacamole Metal2 cold-boot initialization (2026-11-07)
+
+- User confirms Metal was disabled after a cold reboot. The prior successful
+  Metal checks followed bundle replacement and service restarts, so they do
+  not establish that cold-boot initialization works.
+- Root cause hypothesis from source: RedwoodGPU is brought up asynchronously
+  after `sweetgpu=11`; Metal's first open can happen before the backend is
+  ready. `SweetMetal2Device` wraps initialization in `dispatch_once`, so a
+  failed first open is cached for that process. `sweetglwait=120` waits only
+  in the OpenGL/backboardd injection path and does not delay Metal.
+- Added a Metal-specific wait in `userland/metal2/SweetMetal2.mm`: before its
+  one-shot Turnip open, it polls the `RedwoodGPU` readiness service. Default
+  timeout is 120 seconds; `sweetmtlwait=N` overrides it (0 disables waiting).
+  This requires no kernel or boot-image changes. It applies when a process
+  first requests Metal; it does not eagerly launch a Metal client on its own.
+- Bundle built with the existing iOS SDK, Turnip and native bridge. Archive:
+  `outputs/guacamole-SweetMetal2-bootwait.tar.gz`, SHA256
+  `a0212f0bc7a4ccd59e115204def0fc82708e624a391093db98fcbd2122369f12`.
+  Ad-hoc code signature verified. Installed over SSH at
+  `/System/Library/Extensions/SweetMetal2.bundle`; previous bundle preserved
+  as `SweetMetal2.bundle.pre-bootwait-20261107` (root:wheel ownership fixed).
+  Current running processes have not reloaded it, and this bundle has not yet
+  been cold-boot tested. Keep the user's OpenGL-off boot arguments and the
+  existing Wi-Fi kernel. After booting the same temporary image, inspect
+  `/var/local/mtl2.log` for the RedwoodGPU wait and `device Turnip ...` lines.
 
 - Cut the Rope Experiments (`com.zeptolab.ctrexperimentslite`) still shows a
-  white screen. Its recent `ctr-jni` run created a Turnip device, but
-  `/var/local/m2v-cache/ctr-jni/pipelines.log` contains only family capability
-  records and no render pipelines. The wakeups report records the run's args as
-  `sweetgl=0 sweetglfn=0 sweetbbd=0`; likely the game needs the OpenGL path, but
-  this is not proven yet. Prepared
-  `outputs/guacamole-metal2vulkan-0216828513-gl-on-wait120.img`, SHA256
-  `60e6977cf9dcedb9980417d3d39efe7555e1f1fd6007af525dd32decf0505473`.
-  It restores `sweetgl=1 sweetglfn=1 sweetbbd=1`, keeps `sweetmtl=2`, and sets
-  `sweetglwait=120`; shim/kernel and DTB match the source image byte-for-byte.
-  Not booted yet. Next: boot this combined image and retest the game.
+  white screen. A previous `ctr-jni` run created a Turnip device, but
+  `/var/local/m2v-cache/ctr-jni/pipelines.log` contained only family capability
+  records and no render pipelines. This game issue is separate from cold-boot
+  Metal initialization and is unresolved. A GL-on test image was prepared but
+  is not the current plan; respect the user's report that enabling OpenGL
+  globally breaks many things.
 
 - Implemented `MTLDevice.newLibraryWithSource` in the Metal frontend. It calls
   iOS's inherited `_MTLDevice` compiler, reads the resulting metallib through
