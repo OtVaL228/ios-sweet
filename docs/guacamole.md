@@ -459,6 +459,26 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
       as public: the random address is set with a Broadcom command.
   - Restarting btd under a running bluetoothd leaves the controller
     unconfigured (bluetoothd does not notice): restart bluetoothd after it.
+- Audio (A2DP), with OnePlus Buds 4: pairing, ACL, AVRCP, AVDTP discover /
+  get capabilities / set configuration (AAC) and open work. Right after the
+  stream channel opens bluetoothd registers a Skywalk user pipe nexus (the
+  audio path to mediaserverd's BTAudioHALPlugin): our MAC policy denied
+  PRIV_SKYWALK_REGISTER_USER_PIPE (EPERM for non-root; root works),
+  "Failed to alloc a nexus provider", SIGSEGV in os_channel_get_fd. xnu 0163
+  grants the Skywalk privileges to processes whose main binary has the
+  matching com.apple.private.skywalk.* entitlement, as iOS AMFI does.
+- VirtualAudio.plugin is back in /Library/Audio/Plug-Ins/HAL (it had been
+  moved to HAL.disabled for a mediaserverd crash with no audio device at
+  all); mediaserverd stays up with it. BTAudioHALPlugin builds the
+  "Unified Device" for the buds (ports -tacl A2DP, -tsco HFP), but
+  VirtualAudio routes every category (RingtonePreview, MediaPlayback) to an
+  aggregate over Null_Device: "Connection between ports Application
+  Processor and <addr>-tacl not allowed due to property inclusion policy
+  [dst: Require out of band speech input support]; [dst: Require wireless
+  splitter not in use]", for the ringtone "Route change failed: nort". No
+  AVDTP_Start follows. Next: where VirtualAudio gets that policy and the
+  port properties. Video in Safari crashes mediaserverd separately
+  (exception in FigGetAlignmentForIOSurfaceOutputToDisplayService).
 - Result: bluetoothd stays up (STACK_READY), LE scanning delivers
   advertisements. Jobs (sweet-root-tweaks.py --net): com.sweet.btd,
   com.apple.BlueTool -> bluetoold, bluetoothd env. /var/local/btd.off
