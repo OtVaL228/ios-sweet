@@ -1,11 +1,8 @@
 # Active handoff — guacamole Metal2 cold-boot initialization (2026-11-07)
 
-- User reports the visible system used OpenGL after reboot. Current phone log
-  shows the Metal driver did initialize (`ctr-jni` created Turnip), but
-  `backboardd` repeatedly rejected the compositor's `RGB8_444_2P` (542)
-  texture over its `_RB4` IOSurface. The system falls back visually because
-  Metal cannot import this framebuffer; a live device creation alone is not
-  evidence that the compositor is rendering with Metal.
+- User reports both the OpenGL-off and OpenGL-on boot images now seem to render
+  with Metal after the `_RB4` fallback update. Cut the Rope still opens to a
+  white screen; cause is unresolved.
 - Root cause hypothesis from source: RedwoodGPU is brought up asynchronously
   after `sweetgpu=11`; Metal's first open can happen before the backend is
   ready. `SweetMetal2Device` wraps initialization in `dispatch_once`, so a
@@ -22,10 +19,8 @@
   Ad-hoc code signature verified. Installed over SSH at
   `/System/Library/Extensions/SweetMetal2.bundle`; previous bundle preserved
   as `SweetMetal2.bundle.pre-bootwait-20261107` (root:wheel ownership fixed).
-  Current running processes have not reloaded it, and this bundle has not yet
-  been cold-boot tested. Keep the user's OpenGL-off boot arguments and the
-  existing Wi-Fi kernel. After booting the same temporary image, inspect
-  `/var/local/mtl2.log` for the RedwoodGPU wait and `device Turnip ...` lines.
+  The user rebooted after this build. Logs show Metal opens successfully, but
+  they also show the `_RB4` import failure below.
 - Added a port-specific mapping of the compositor's `RGB8_444_2P` request to
   BGRA8 in `sweetNarrow`, for both textures and pipeline attachments. The
   rejected `_RB4` surface has 4-byte rows (1920 bytes for width 465); the
@@ -34,7 +29,16 @@
   wait-only bundle as `SweetMetal2.bundle.pre-rb4-20261107`. Archive:
   `outputs/guacamole-SweetMetal2-rb4-fallback.tar.gz`, SHA256
   `e9f4d3353d6f6871daccf360f8dcea220c26c9fb4325dae3d187638a1c2ec76b`.
-  Not yet loaded by running processes or validated after boot.
+  User reports Metal appears to work on both tested boot images; detailed
+  post-install compositor log has not yet been collected.
+
+- Installed `/Users/coreycusick/Downloads/Angry Birds Classic.ipa` on the
+  phone at `/Applications/AngryBirdsClassic.app` and registered it with
+  `/var/jb/usr/bin/uicache`. IPA is decrypted (`cryptid=0`), version 8.0.3,
+  `com.clickgamer.AngryBirds`, arm64 executable, OpenGL ES 2 requirement, no
+  Metal framework. User is currently testing an OpenGL-on boot image; next is
+  for them to launch Angry Birds and report its display. The IPA remains in
+  `/var/local/AngryBirdsClassic.ipa` on the phone.
 
 - Cut the Rope Experiments (`com.zeptolab.ctrexperimentslite`) still shows a
   white screen. A previous `ctr-jni` run created a Turnip device, but
