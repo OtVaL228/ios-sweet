@@ -1,0 +1,67 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -87,6 +87,7 @@
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++static uint32_t sweet_fb_vsync_us = SWEET_FB_VSYNC_US; /* adjustable synthetic display tick */
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -258,12 +259,19 @@
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	uint32_t vsyncHz = 60;
++	(void)PE_parse_boot_argn("sweetfb_vsync", &vsyncHz, sizeof(vsyncHz));
++	if (vsyncHz < 1 || vsyncHz > 240) {
++		vsyncHz = 60;
++	}
++	sweet_fb_vsync_us = 1000000 / vsyncHz;
++	IOLog("SWEET FB: synthetic vsync %u Hz (%u us)\n", vsyncHz, sweet_fb_vsync_us);
+ 	uint32_t presentAtSwap = 1;
+ 	(void)PE_parse_boot_argn("sweetfbatswap", &presentAtSwap, sizeof(presentAtSwap));
+ 	sweet_fb_present_at_swap = presentAtSwap != 0;
+ 	IOLog("SWEET FB: GPU present mode %s\n", sweet_fb_present_at_swap ? "at-swap" : "vsync-only");
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fVsync->setTimeoutUS(sweet_fb_vsync_us);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -355,7 +363,7 @@
+ 	 */
+ 	static uint64_t period;
+ 	if (period == 0) {
+-		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
++		nanoseconds_to_absolutetime((uint64_t)sweet_fb_vsync_us * 1000, &period);
+ 	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+@@ -382,7 +390,7 @@
+ 				bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(sweet_fb_vsync_us);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -423,7 +431,7 @@
+ 			fb->fDirty = true;
+ 			IOLockUnlock(fb->fLock);
+ 			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			sender->setTimeoutUS(sweet_fb_vsync_us);
+ 			return;
+ 		}
+ 		if (gpu == 0) {
+@@ -440,7 +448,7 @@
+ 			spent = 0;
+ 		}
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(sweet_fb_vsync_us);
+ }
+ 
+ void
