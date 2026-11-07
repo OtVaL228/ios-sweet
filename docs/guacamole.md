@@ -306,6 +306,75 @@ builds for APFS; our root is HFS. Four walls, each seen in the unified log:
 0161 also logs, once per command, file system ioctls that end in ENOTTY or
 ENOTSUP from the FileProvider processes ("SWEET IOCTL: ...").
 
+## Audio (recon, nothing built yet)
+
+From the Android dumps (live.dtb, dmesg, i2c.txt, vendor_b, modem_b):
+
+- Speakers: two NXP **TFA9874** smart amps (driver tfa98xx v6.5.3) on QUP
+  SE4 I2C (`i2c@890000`, Android i2c-0), 0x34 right (reset GPIO 37) and
+  0x35 left (reset GPIO 100). fsa4480 (USB-C audio switch) on the same bus
+  at 0x42. Haptics: aw8697 on i2c-2 at 0x5a.
+- Card `sm8150-tavil-snd-card` (WCD9340 on SLIMbus for headset/mics). The
+  speakers are fed by **QUAT_MI2S_RX** (AFE port 0x1006), 2 channels,
+  S24_LE (mixer_paths_tavil.xml "deep-buffer-playback quat_i2s",
+  audio_platform_info: speaker backend QUAT_MI2S_RX, ACDB id 15);
+  VI feedback off (QUAT_MI2S_RX_VI_FB_MUX = ZERO). Pins gpio137-142
+  (qua_mi2s). OnePlus commented out the WSA speaker path.
+- ADSP: APR over the GLINK channel `apr_audio_svc` on the lpass edge; audio
+  buffers through apps SMMU SID 0x1b21 (mask 0xf, msm-audio-ion). Firmware
+  modem_b `image/adsp.mdt` + b00-b14 (13 MB); `adspr.jsn` (root_pd) and
+  `adspua.jsn` (msm/adsp/audio_pd provides avs/audio) for pd-mapper.
+  Android also runs `adsprpcd audiopd` (fastrpc audio PD).
+- Precedent: the sm8150-mainline Linux tree (map220v/sm8150-mainline) has
+  APR q6core/q6afe/q6asm/q6adm on sm8150 without a protection-domain
+  property, and Xiaomi Pad 5 (nabu, SM8150) plays through
+  QUATERNARY_TDM_RX_0 to four CS35L41: same shape as ours.
+- iOS side: UniXNU-sheng (BSD-2-Clause-Patent) has a working
+  AudioServerPlugIn + kernel ring service (AudioReach DSP, SM8550); the DSP
+  half does not apply to our APR ADSP. ios-port-marble (SM7475) and
+  ios-sweet-grus (SM7150, APR, stopped at the audio PD) have no sound.
+- Extracted files (not in git): ../dumps/vendor-audio/ (mixer paths,
+  platform info, tfa98xx.cnt, acdbdata, adsp/).
+
+Bring-up from userland (userland/adsp, over /dev/pmem like wland):
+
+- `adspd` (firmware in /var/local/fw/adsp, lower-case names): PAS id 1,
+  region 0x8be00000 + 0x1e00000, cx vote >= 385, AOP load_state adsp,
+  SMP2P items 443 in / 429 out (IPC bit 10), GLINK on SMEM host 2 (IPC
+  bit 8). Works: ready after 100 ms; the ADSP opens IPCRTR, apr_audio_svc,
+  fastrpcglink-apps-dsp, apr_apps2, glink_ssr, LOOPBACK_CTL_LPASS; QRTR node
+  5 asks our pd-mapper for "avs/audio" (adspr/adspua.jsn table); APR q6core:
+  state 1 (ready), framework 2.9, services core 3, AFE 4 (0x260000), ASM 7,
+  ADM 8, 9-0xd. No audio PD needed for these.
+- `tfa`: GENI I2C on QUP wrapper 0 SE4 (GPIO51/52 mux 1; GCC vote 0x5200c
+  bits 6/7/14, RCG 0x17608 DFS level 0 = XO), the touch driver's FIFO engine.
+  Both amps answer: REV 0x0c74 (TFA9874, NXP "V1.14" settings), SYS_CTRL0
+  0x0001 (powered down). `tfa init` = NXP tfa_dev_start for a part without
+  CoolFlux (no CFE/SBSL/ACS fields): I2CR, key1/key2 unlock, the 0x0c74
+  register set, the container's device items (56 with the "speaker"
+  profile), MANSCONF=1, PWDN=0 -> MANSTATE 4, waiting for the I2S clock.
+- AFE plan: QUAT_MI2S_RX (0x1006) on SD1 (rx-lines 2, GPIO140; SCK 137,
+  WS 138), 48 kHz stereo 32-bit slots, Q6AFE clock QUAD_MI2S_IBIT (0x106)
+  3.072 MHz via AFE_SVC_CMD_SET_PARAM (0x100f3) / AFE_MODULE_CLOCK_SET,
+  AFE_PARAM_ID_I2S_CONFIG, DEVICE_START.
+- A silent ADSP restart kills Wi-Fi: after a plain PAS shutdown and a new
+  boot of the ADSP the modem went ERR-FATAL (wland.out) and the phone fell
+  off the network (the kernel kept running). Linux tells the other
+  processors over glink_ssr; we do not, so the ADSP boots once per phone
+  boot. `adspd serve` keeps it (commands through the FIFO
+  /var/local/adspd.cmd: afe on/off, status, pd PATH, open NAME RCID,
+  aprch, apr SVC OPCODE WORDS, quit, stop); `quit` saves the GLINK/QRTR
+  state (/var/local/adspd.state, .qrtr) so a new adspd adopts the running
+  edge instead of restarting the ADSP. `stop` is graceful (force-stop,
+  stop-ack, PAS shutdown).
+- The audio services do not answer: AFE (clock set, even DEVICE_STOP), ASM
+  and ADM never reply on apr_audio_svc (q6core does), though PDR (servreg
+  notifier, QRTR 0x42 at 5:3) reports msm/adsp/audio_pd UP. apr_apps2
+  (the ADSP's other APR channel, unused by Android's apr_tal_rpmsg) gives no
+  intents. Android runs `adsprpcd audiopd`: FastRPC INIT_CREATE_STATIC of
+  the audio PD with its remote heap; ios-sweet-grus stopped there too.
+  Next: that over fastrpcglink-apps-dsp.
+
 ## SWEETBOX file drop
 
 `tools/sweet-mailbox.py pack out.img NAME SRC [NAME SRC ...]`, then in TWRP
