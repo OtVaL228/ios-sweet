@@ -1,3 +1,27 @@
+# Active handoff — guacamole Metal2 (2026-11-06)
+
+- Source checkout: `OtVaL228/ios-sweet`, branch `guacamole`, HEAD
+  `021682851328a343e373e1dfdd5e8fe11eae30fc`. The running kernel is from this
+  source; the local build also uses the expected Xcode compatibility patch
+  `xnu/local/0001-iorpc-kernelcontent.patch`. No kernel source changes were made
+  for this userland update.
+- Device logs from `PridePosterExtension` show successful Turnip device creation,
+  then `MISSING NBCommandBuffer -userDictionary`. Added a mutable
+  `userDictionary` to `NBCommandBuffer` in
+  `userland/metal2/NativeBridgeMetalFrontend.mm` and initialized it per command
+  buffer. Bundle rebuilt with `userland/metal2/build.sh`; archive SHA256
+  `4452b57fd8c14ede3d3db64c95278f3320b0ec8bcff3afb7e254f0c9067e7b2a`.
+- Installed bundle on phone at `/System/Library/Extensions/SweetMetal2.bundle`;
+  previous bundle saved as `SweetMetal2.bundle.pre-userdict-20261106`. File
+  checksums match the local build. Terminated old PridePosterExtension PID 713
+  so a later launch can load the replacement. No reboot or test run performed.
+- Separate unresolved failure: earlier `backboardd`, SpringBoard, and `chronod`
+  attempts returned `IOServiceOpen 0xe00002c2`; success in PridePosterExtension
+  does not establish Metal operation in those processes or the Phone app. Next:
+  trigger a fresh PridePosterExtension Metal path and inspect for the
+  `userDictionary` warning; diagnose system-process opens separately without
+  changing the kernel source.
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)
