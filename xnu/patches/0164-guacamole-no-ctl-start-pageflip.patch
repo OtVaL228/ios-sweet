@@ -1,0 +1,34 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -290,18 +290,15 @@
+ 	volatile uint32_t *vig0 = (volatile uint32_t *)(fSde + SWEET_SDE_VIG0 + SWEET_SDE_SSPP_SRC0_ADDR);
+ 	volatile uint32_t *vig1 = (volatile uint32_t *)(fSde + SWEET_SDE_VIG1 + SWEET_SDE_SSPP_SRC0_ADDR);
+ 	volatile uint32_t *flush = (volatile uint32_t *)(fSde + SWEET_SDE_CTL0 + SWEET_SDE_CTL_FLUSH);
+-	volatile uint32_t *start = (volatile uint32_t *)(fSde + SWEET_SDE_CTL0 + SWEET_SDE_CTL_START);
+ 	*vig0 = (uint32_t)fPageFlipPa[next];
+ 	*vig1 = (uint32_t)fPageFlipPa[next];
+ 	__builtin_arm_dsb(0xf);
+-	*flush = 0x3; /* CTL0 flush mask: VIG0 and VIG1 address shadow registers */
+-	__builtin_arm_dsb(0xf);
+-	*start = 1;  /* command-mode kickoff, from the panel TE worker */
++	*flush = 0x20003; /* VIG0 + VIG1 + CTL flush; ABL autorefresh owns command-mode kickoff. */
+ 	__builtin_arm_dsb(0xf);
+ 	fPageFlipActive = next;
+ 	fPageFlipPending = -1;
+ 	if (++fPageFlipCommits == 1 || (fPageFlipCommits % 300) == 0) {
+-		IOLog("SWEET FB: pageflip commit %llu buffer %u pa=%llx CTL0 flush=3 start=1\n",
++		IOLog("SWEET FB: pageflip commit %llu buffer %u pa=%llx CTL0 flush=0x20003 (no start)\n",
+ 		    fPageFlipCommits, next, fPageFlipPa[next]);
+ 	}
+ }
+@@ -622,9 +619,7 @@
+ 		if (fb->fPageFlipEnabled) {
+ 			*((volatile uint32_t *)(fb->fSde + SWEET_SDE_VIG0 + SWEET_SDE_SSPP_SRC0_ADDR)) = (uint32_t)fb->fPhys;
+ 			*((volatile uint32_t *)(fb->fSde + SWEET_SDE_VIG1 + SWEET_SDE_SSPP_SRC0_ADDR)) = (uint32_t)fb->fPhys;
+-			*((volatile uint32_t *)(fb->fSde + SWEET_SDE_CTL0 + SWEET_SDE_CTL_FLUSH)) = 0x3;
+-			__builtin_arm_dsb(0xf);
+-			*((volatile uint32_t *)(fb->fSde + SWEET_SDE_CTL0 + SWEET_SDE_CTL_START)) = 1;
++			*((volatile uint32_t *)(fb->fSde + SWEET_SDE_CTL0 + SWEET_SDE_CTL_FLUSH)) = 0x20003;
+ 			__builtin_arm_dsb(0xf);
+ 			fb->fPageFlipEnabled = false;
+ 			fb->fPageFlipActive = -1;

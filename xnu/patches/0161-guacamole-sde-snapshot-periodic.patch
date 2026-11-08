@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 000000000..000000001 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -513,5 +513,10 @@
+ 				IOLog("SWEET FB: SDE INTF1 en=%x status=%x top=%x tear_irq_en=%x tear_irq_status=%x tear_en=%x sync=%x count=%x line=%x\n",
+ 				    intf_en, intf_status, top_status, tear_irq_en, tear_irq_status, tear_en, tear_sync, tear_count, tear_line);
++				uint32_t dumpSde = 0;
++				(void)PE_parse_boot_argn("sweetfb_sde_dump", &dumpSde, sizeof(dumpSde));
++				if (dumpSde != 0) {
++					sweet_fb_dump_sde(fb->fSde);
++				}
+ 			}
+ 		}
+ 		uint64_t keep = sweet_fb_stats.last_swap;

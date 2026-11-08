@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -135,6 +135,9 @@
+ 	uint64_t            fSdeIrqDispatches;
+ 	uint64_t            fVsyncCount;
+ 	bool                fPageFlipEnabled;
++	bool                fPageFlipRequested;
++	bool                fPageFlipInitAttempted;
++	bool                fPageFlipRetryLogged;
+ 	int                 fPageFlipActive;
+ 	int                 fPageFlipPending;
+ 	uint64_t            fPageFlipBytes;
+@@ -211,15 +214,24 @@
+ bool
+ AppleCLCD::setupPageFlip(void)
+ {
+-	uint32_t requested = 0;
+-	(void)PE_parse_boot_argn("sweetfb_pageflip", &requested, sizeof(requested));
+-	if (!requested) {
++	if (!fPageFlipRequested || fPageFlipInitAttempted) {
+ 		return false;
+ 	}
+ 	if (!fHardwareVsync || fSde == 0 || fWidth != 1440 || fHeight != 3120 || fRowBytes != 5760) {
+ 		IOLog("SWEET FB: pageflip unavailable (requires hardware TE and 1440x3120x5760 panel)\n");
++		fPageFlipRequested = false;
++		fPageFlipInitAttempted = true;
++		return false;
++	}
++	/* sweet_gpu_pool_alloc takes gpu_be_lock, initialized by gpu_backend_start(). */
++	if (!redwood_gpu_ready()) {
++		if (!fPageFlipRetryLogged) {
++			IOLog("SWEET FB: pageflip waiting for GPU backend before allocating scanout buffers\n");
++			fPageFlipRetryLogged = true;
++		}
+ 		return false;
+ 	}
++	fPageFlipInitAttempted = true;
+ 	fPageFlipBytes = round_page_64((uint64_t)fRowBytes * fHeight);
+ 	fPageFlipActive = -1;
+ 	fPageFlipPending = -1;
+@@ -242,6 +254,7 @@
+ 					fPageFlipPa[j] = 0;
+ 				}
+ 			}
++			fPageFlipRequested = false;
+ 			return false;
+ 		}
+ 		fPageFlipPixels[i] = (uintptr_t)fPageFlipMap[i]->getVirtualAddress();
+@@ -255,6 +268,7 @@
+ 					fPageFlipPa[j] = 0;
+ 				}
+ 			}
++			fPageFlipRequested = false;
+ 			return false;
+ 		}
+ 		memcpy((void *)fPageFlipPixels[i], (const void *)fPixels, (size_t)fRowBytes * fHeight);
+@@ -407,6 +421,9 @@
+ 	fHwVsyncIrqs = 0;
+ 	fSdeIrqDispatches = 0;
+ 	fPageFlipEnabled = false;
++	fPageFlipRequested = false;
++	fPageFlipInitAttempted = false;
++	fPageFlipRetryLogged = false;
+ 	fPageFlipActive = -1;
+ 	fPageFlipPending = -1;
+ 	fPageFlipBytes = 0;
+@@ -481,7 +498,10 @@
+ 	sweet_fb_vsync_us = 1000000 / vsyncHz;
+ 	IOLog("SWEET FB: synthetic vsync %u Hz (%u us)\n", vsyncHz, sweet_fb_vsync_us);
+ 	uint32_t useHardwareVsync = 0;
++	uint32_t pageFlipRequested = 0;
+ 	(void)PE_parse_boot_argn("sweetfb_hwvsync", &useHardwareVsync, sizeof(useHardwareVsync));
++	(void)PE_parse_boot_argn("sweetfb_pageflip", &pageFlipRequested, sizeof(pageFlipRequested));
++	fPageFlipRequested = pageFlipRequested != 0;
+ 	if (useHardwareVsync) {
+ 		fSde = ml_io_map(SWEET_SDE_PA, SWEET_SDE_SIZE);
+ 		fHwVsyncCall = thread_call_allocate(&AppleCLCD::hwVsyncWorker, (thread_call_param_t)this);
+@@ -615,6 +635,10 @@
+ 		*((volatile uint32_t *)(fb->fSde + SWEET_SDE_INTF1_TEAR_IRQ + SWEET_SDE_TEAR_INTR_EN)) &= ~SWEET_SDE_TEAR_TE_DETECTED;
+ 		IOLog("SWEET FB: no panel TE/vsync IRQ; reverting to synthetic vsync\n");
+ 	}
++	if (sender == NULL && fb->fHardwareVsync && fb->fPageFlipRequested &&
++	    !fb->fPageFlipEnabled && !fb->fPageFlipInitAttempted) {
++		(void)fb->setupPageFlip();
++	}
+ 	if (sender == NULL && fb->fHardwareVsync) {
+ 		fb->commitPageFlip();
+ 	}

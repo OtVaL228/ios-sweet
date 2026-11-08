@@ -1,0 +1,152 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -285,7 +285,12 @@
+ void
+ AppleCLCD::commitPageFlip(void)
+ {
+-	if (!fPageFlipEnabled || fPageFlipPending < 0 || fSde == 0) {
++	if (!fPageFlipEnabled || fSde == 0 || fPresentLock == NULL || !IOLockTryLock(fPresentLock)) {
++		return;
++	}
++	if (fPageFlipPending < 0 ||
++	    (fPageFlipFence != 0 && sweet_gpu_wait_fence_ns(fPageFlipFence, 0) != 0)) {
++		IOLockUnlock(fPresentLock);
+ 		return;
+ 	}
+ 	const int next = fPageFlipPending;
+@@ -299,10 +304,12 @@
+ 	__builtin_arm_dsb(0xf);
+ 	fPageFlipActive = next;
+ 	fPageFlipPending = -1;
++	fPageFlipFence = 0;
+ 	if (++fPageFlipCommits == 1 || (fPageFlipCommits % 300) == 0) {
+ 		IOLog("SWEET FB: pageflip commit %llu buffer %u pa=%llx CTL0 flush=0x20003 (no start)\n",
+ 		    fPageFlipCommits, next, fPageFlipPa[next]);
+ 	}
++	IOLockUnlock(fPresentLock);
+ }
+ 
+ void
+@@ -311,27 +318,19 @@
+ 	if (!fPageFlipEnabled) {
+ 		return;
+ 	}
+-	if (fPresentLock != NULL) {
+-		IOLockLock(fPresentLock);
++	if (fPresentLock == NULL || !IOLockTryLock(fPresentLock)) {
++		return;
+ 	}
+-	if (fPageFlipFence != 0 && sweet_gpu_wait_fence_ns(fPageFlipFence, 20000000ull) != 0) {
+-		static uint32_t waitMisses;
+-		if ((++waitMisses % 60) == 1) {
+-			IOLog("SWEET FB: pageflip deferred; GPU present fence %u has not retired\n", fPageFlipFence);
+-		}
+-		if (fPresentLock != NULL) {
+-			IOLockUnlock(fPresentLock);
+-		}
++	/* GPU presents target the inactive scanout buffer directly; CPU copy is fallback only. */
++	if (fPageFlipPending >= 0) {
++		IOLockUnlock(fPresentLock);
+ 		return;
+ 	}
+-	fPageFlipFence = 0;
+ 	int next = fPageFlipActive == 0 ? 1 : 0;
+ 	memcpy((void *)fPageFlipPixels[next], (const void *)fPixels, (size_t)fRowBytes * fHeight);
+ 	__builtin_arm_dsb(0xf);
+ 	fPageFlipPending = next;
+-	if (fPresentLock != NULL) {
+-		IOLockUnlock(fPresentLock);
+-	}
++	IOLockUnlock(fPresentLock);
+ }
+ 
+ /* Read-only SM8150 SDE snapshot, opt-in with sweetfb_sde_dump=1. */
+@@ -799,7 +798,9 @@
+ 		if (gpu == 0) {
+ 			fb->present(rec);
+ 		}
+-		fb->stagePageFlip();
++		if (gpu == 0) {
++			fb->stagePageFlip();
++		}
+ 		sweet_fb_stats.at_vsync++;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		spent += mach_absolute_time() - began;
+@@ -984,6 +985,7 @@
+  */
+ #define FBGPU_IB_BYTES          0x4000u
+ #define FBGPU_PANEL_OFF         0x1000000ull
++#define FBGPU_PAGEFLIP1_OFF     0x2200000ull
+ #define FBGPU_SLOT_OFF          0x4000000ull
+ #define FBGPU_SLOT_BYTES        0x1000000ull
+ #define FBGPU_SLOTS             4
+@@ -1037,7 +1039,8 @@
+ 
+ /* Once: the window, the command buffers, the panel mapping */
+ static bool
+-fbgpu_setup(uint64_t panel_pa, uint64_t panel_bytes)
++fbgpu_setup(uint64_t panel_pa, uint64_t panel_bytes, bool pageflip_enabled,
++	    uint64_t flip_pa0, uint64_t flip_pa1, uint64_t flip_bytes)
+ {
+ 	if (sweet_fbgpu.tried) {
+ 		return sweet_fbgpu.ok;
+@@ -1060,7 +1063,10 @@
+ 	    (md = IOMemoryDescriptor::withPhysicalAddress(pa, 0x10000, kIODirectionInOut)) == NULL ||
+ 	    (map = md->map(kIOMapWriteCombineCache)) == NULL ||
+ 		!fbgpu_map_contig(sweet_fbgpu.win, pa, 0x10000) ||
+-		!fbgpu_map_contig(sweet_fbgpu.win + FBGPU_PANEL_OFF, panel_pa, round_page_64(panel_bytes))) {
++		(pageflip_enabled ?
++		    (!fbgpu_map_contig(sweet_fbgpu.win + FBGPU_PANEL_OFF, flip_pa0, flip_bytes) ||
++		     !fbgpu_map_contig(sweet_fbgpu.win + FBGPU_PAGEFLIP1_OFF, flip_pa1, flip_bytes)) :
++		    !fbgpu_map_contig(sweet_fbgpu.win + FBGPU_PANEL_OFF, panel_pa, round_page_64(panel_bytes)))) {
+ 		IOLog("SWEET FB: GPU present unavailable: the CPU copies frames\n");
+ 		return false;
+ 	}
+@@ -1069,8 +1075,8 @@
+ 	sweet_fbgpu.ib[0] = (uint32_t *)cpu;
+ 	sweet_fbgpu.ib[1] = (uint32_t *)(cpu + FBGPU_IB_BYTES);
+ 	sweet_fbgpu.ok = true;
+-	IOLog("SWEET FB: GPU present: window %#llx, panel at +%#llx (%llu KB)\n", sweet_fbgpu.win, FBGPU_PANEL_OFF,
+-	    panel_bytes >> 10);
++	IOLog("SWEET FB: GPU present: window %#llx, destination %s (%llu KB)\n", sweet_fbgpu.win,
++	    pageflip_enabled ? "off-screen pageflip buffers" : "panel", panel_bytes >> 10);
+ 	return true;            /* md and map stay for good */
+ }
+ 
+@@ -1236,8 +1242,18 @@
+ int
+ AppleCLCD::presentGPU(const uint8_t *rec)
+ {
+-	if (!sweet_fb_metal || !fScaleUp || !fbgpu_setup(fPhys, (uint64_t)fRowBytes * fHeight)) {
++	if (!sweet_fb_metal || !fScaleUp ||
++	    !fbgpu_setup(fPhys, (uint64_t)fRowBytes * fHeight, fPageFlipEnabled,
++	    fPageFlipPa[0], fPageFlipPa[1], fPageFlipBytes)) {
+ 		return 0;
++	}
++	int pageFlipTarget = -1;
++	if (fPageFlipEnabled) {
++		/* One GPU frame may be pending until TE commits it; don't overwrite that buffer. */
++		if (fPageFlipPending >= 0) {
++			return -1;
++		}
++		pageFlipTarget = fPageFlipActive == 0 ? 1 : 0;
+ 	}
+ 	pauseConsole();
+ 	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS;
+@@ -1295,7 +1311,7 @@
+ 	if (px1 <= px0 || py1 <= py0) {
+ 		return 0;
+ 	}
+-	uint64_t dst = sweet_fbgpu.win + FBGPU_PANEL_OFF;
++	uint64_t dst = sweet_fbgpu.win + (pageFlipTarget == 1 ? FBGPU_PAGEFLIP1_OFF : FBGPU_PANEL_OFF);
+ 	uint64_t border = sweet_fbgpu.win + 2 * FBGPU_IB_BYTES, ts = border + 0x100;
+ 	uint32_t *dw = sweet_fbgpu.ib[k], n = 0;
+ #define EV(e)           do { dw[n++] = fbgpu_pkt7(0x46, 1); dw[n++] = (e); } while (0)
+@@ -1366,6 +1382,7 @@
+ 	sweet_fbgpu.fence[k] = fence;
+ 	if (fPageFlipEnabled) {
+ 		fPageFlipFence = fence;
++		fPageFlipPending = pageFlipTarget;
+ 	}
+ 	sweet_fbgpu.next = k ^ 1;
+ 	static bool said;
