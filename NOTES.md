@@ -1,3 +1,27 @@
+# Active handoff — 0170 multi-layer composition (2026-11-08, Claude)
+
+- 0169 hardware result (Subway Surfers, user still sees flicker): `no new GPU work at swap` ~0, `forced` 0,
+  `re-swapped` 0 → the submit-after-swap and unfinished-frame hypotheses are NOT the cause. backboardd calls SwapWait
+  twice per swap (selectors 4:N 5:N 6:2N). In game windows, frames alternate between one-layer swaps (GPU blit at
+  swap) and multi-layer swaps (`skip layers` 97/136, `CPU-copied Metal frames` 48/68, e.g. "shown at swap 8, at
+  vsync 68"). The CPU `present()` pasted every layer opaque (alpha ignored), ignored rect a's source size, and wrote
+  the panel while an earlier GPU blit could still land on top. That alternation is the new prime suspect.
+- NEW `xnu/patches/0170-guacamole-fb-compose-layers.patch` (applies after 0169; compiled locally with Xcode 27.2 and
+  macOS 13.5 KDK 22G74):
+  boot-arg `sweetfbcompose` (default 1, 0 = old paste). Multi-layer frames (or a layer whose rect a size != rect b
+  size) are composed in a cached 1125x2436 buffer: layer 0 lowest, scaled from rect a to rect b, upper layers
+  premultiplied source-over (an upper layer whose 64 alpha samples are all 0 is treated as opaque); waits for running
+  GPU blits; then one scaled copy to the panel. The GPU blit now uses rect a's size as its source rectangle.
+  Logs: `SWEET FB: compose swap ... layer ... a .. b .. xform .. flags .. alpha 0:N 255:N mid:N -> opaque|blended`
+  (first 12, then the first of each 5 s window) and `SWEET FB: 5s: composed N frames (us each) ...`.
+- Test: boot 0169+0170 kernel, play ~30 s, collect `dmesg | grep 'SWEET FB: compose\|SWEET FB: 5s'`.
+  If the game shows a layer missing/black, the layer order or alpha assumption is wrong: the compose lines give the
+  layer formats/rects/flags to correct it. Expect lower fps on multi-layer frames (CPU compose).
+- Packaged separate image `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0170-60hz-gpu-compose.img`,
+  SHA-256 `5b996f6e84ffadc46176bb065ace91180ff9ce3e985606d75b08cb71c0343101`. It uses the usual 60 Hz GPU-present
+  arguments with `sweetfbsync=1 sweetfbcompose=1`. Kernel compile and image packaging succeeded; not yet booted on hardware.
+- Reconstructed file after 0170: `work/claude-recon/SweetFramebuffer.after0170.cpp` (reference only).
+
 # Active handoff — 0169 frame hand-over sync (2026-11-08, Claude)
 
 - Goal: Subway Surfers black-region flicker. Hypothesis (NOT yet confirmed on hardware): the display shows frames

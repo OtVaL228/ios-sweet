@@ -1,0 +1,305 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 25368bb..c17004b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,15 @@ static bool sweet_fb_scanout_diag;
+  * on the panel (at most 50 ms). The 5 s statistics count all of this with or without the boot-arg.
+  */
+ static bool sweet_fb_sync = true;
++/*
++ * 0170: frames of more than one layer (Subway Surfers: the game's Metal layer plus another, every few frames)
++ * took present(): each layer pasted opaque in turn straight into the scanned panel memory, its alpha and its
++ * source size (rect a) ignored, while a GPU blit of the previous one-layer frame could still land on top
++ * later. With sweetfbcompose (default 1) they are composed in a cached buffer first (scaled from rect a to
++ * rect b, upper layers premultiplied source-over), the GPU's blits are waited for, then one scaled copy.
++ * sweetfbcompose=0: present() as before. The GPU blit takes rect a's size as its source too.
++ */
++static bool sweet_fb_compose = true;
+ extern "C" int proc_selfpid(void);
+ extern "C" uint32_t sweet_mtl_pid_submits(int pid, uint32_t *last_fence);      /* SweetAccelerator.cpp, 0169 */
+ /* 0151: frame statistics, logged every 5 s while frames come (swaps; shown at the swap, at a vsync; GPU busy) */
+@@ -72,6 +81,9 @@ static struct {
+ 	 * swapwait / swapwait_to: SwapWait calls, and those that ran out.
+ 	 */
+ 	uint32_t nowork, late, forced, reswap, cpu_metal, gpu_skip[6], swapwait, swapwait_to;
++	/* 0170: composed frames, their layers drawn opaque / blended, GPU blits still running before one, its cost */
++	uint32_t composed, comp_opaque, comp_blend, comp_skipped, comp_gpu_wait;
++	uint64_t comp_time;
+ 	uint32_t sel[128];
+ } sweet_fb_stats;
+ 
+@@ -177,6 +189,9 @@ public:
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	int presentGPU(const uint8_t *rec);
++	bool presentComposed(const uint8_t *rec);
++	uint32_t     *fCompose;       /* 0170: fLogicalW x fLogicalH BGRA, cached */
++	uint32_t     *fComposeX;      /* 0170: per destination column of a layer, its source column */
+ 	void pauseConsole(void);
+ 	void publishRefresh(void);
+ 	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+@@ -295,6 +310,10 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t sync = 1;
+ 	(void)PE_parse_boot_argn("sweetfbsync", &sync, sizeof(sync));
+ 	sweet_fb_sync = sync != 0;
++	uint32_t compose = 1;
++	(void)PE_parse_boot_argn("sweetfbcompose", &compose, sizeof(compose));
++	sweet_fb_compose = compose != 0;
++	IOLog("SWEET FB: multi-layer composition %s (0170)\n", sweet_fb_compose ? "on" : "off");
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+ 	IOLog("SWEET FB: GPU present mode %s\n", sweet_fb_present_at_swap ? "at-swap" : "vsync-only");
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -421,6 +440,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			    sweet_fb_stats.cpu_metal, sweet_fb_stats.gpu_skip[0], sweet_fb_stats.gpu_skip[1], sweet_fb_stats.gpu_skip[2],
+ 			    sweet_fb_stats.gpu_skip[3], sweet_fb_stats.gpu_skip[4], sweet_fb_stats.gpu_skip[5], sweet_fb_stats.swapwait,
+ 			    sweet_fb_stats.swapwait_to);
++			if (sweet_fb_stats.composed != 0) {
++				uint64_t us = 0;
++				absolutetime_to_nanoseconds(sweet_fb_stats.comp_time, &us);
++				us /= 1000;
++				IOLog("SWEET FB: 5s: composed %u frames (%llu us each): layers opaque %u, blended %u, skipped %u; waited for GPU blit %u\n",
++				    sweet_fb_stats.composed, us / sweet_fb_stats.composed, sweet_fb_stats.comp_opaque,
++				    sweet_fb_stats.comp_blend, sweet_fb_stats.comp_skipped, sweet_fb_stats.comp_gpu_wait);
++			}
+ 		}
+ 		uint64_t keep = sweet_fb_stats.last_swap;
+ 		bzero(&sweet_fb_stats, sizeof(sweet_fb_stats));
+@@ -513,7 +540,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (sweet_fb_metal) {
+ 				sweet_fb_stats.cpu_metal++;
+ 			}
+-			fb->present(rec);
++			if (!fb->presentComposed(rec)) {        /* 0170 */
++				fb->present(rec);
++			}
+ 		}
+ 		fb->shown(rec);                         /* 0169 */
+ 		sweet_fb_stats.at_vsync++;
+@@ -1066,7 +1095,13 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		w = (int32_t)s->width;
+ 		h = (int32_t)s->height;
+ 	}
+-	if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || w > (int32_t)s->width - sx || h > (int32_t)s->height - sy ||
++	/* 0170: the source rectangle's own size (rect a); the blit scales it onto rect b */
++	int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
++	if (!sweet_fb_compose || aw <= 0 || ah <= 0) {
++		aw = w;
++		ah = h;
++	}
++	if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || aw > (int32_t)s->width - sx || ah > (int32_t)s->height - sy ||
+ 	    w > (int32_t)fLogicalW - dx || h > (int32_t)fLogicalH - dy) {
+ 		OSSafeReleaseNULL(s);
+ 		sweet_fb_stats.gpu_skip[4]++;
+@@ -1126,9 +1161,9 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	dw[n++] = (px1 - 1) | ((py1 - 1) << 16);
+ 	dw[n++] = fbgpu_pkt4(0x8401, 4);        /* GRAS_A2D_SRC_XMIN..YMAX, 24.8 fixed, inclusive */
+ 	dw[n++] = (uint32_t)sx << 8;
+-	dw[n++] = (uint32_t)(sx + w - 1) << 8;
++	dw[n++] = (uint32_t)(sx + aw - 1) << 8;
+ 	dw[n++] = (uint32_t)sy << 8;
+-	dw[n++] = (uint32_t)(sy + h - 1) << 8;
++	dw[n++] = (uint32_t)(sy + ah - 1) << 8;
+ 	dw[n++] = fbgpu_pkt4(0xb4c0, 5);        /* TPL1_A2D_SRC_TEXTURE_INFO, SIZE, BASE, PITCH */
+ 	dw[n++] = 0x00500430 | 0x10000;         /* 8888, linear, WXYZ; bilinear */
+ 	dw[n++] = sw | (sh << 15);
+@@ -1173,6 +1208,200 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	return 1;
+ }
+ 
++/*
++ * 0170: alpha of a layer's source rectangle, sampled on an 8x8 grid: how many samples are 0, 255, between.
++ * CoreAnimation's surfaces are premultiplied BGRA. An upper layer whose samples are all 0 carries no alpha
++ * at all (an opaque Metal drawable may leave it 0): it is drawn opaque, not blended away.
++ */
++static void
++sweet_fb_alpha_samples(const uint8_t *base, uint32_t bpr, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
++    uint32_t *zero, uint32_t *full, uint32_t *part)
++{
++	*zero = *full = *part = 0;
++	for (int32_t j = 0; j < 8; j++) {
++		const uint32_t *row = (const uint32_t *)(base + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * bpr);
++		for (int32_t i = 0; i < 8; i++) {
++			uint32_t alpha = row[sx + (sw * (2 * i + 1)) / 16] >> 24;
++			if (alpha == 0) {
++				(*zero)++;
++			} else if (alpha == 255) {
++				(*full)++;
++			} else {
++				(*part)++;
++			}
++		}
++	}
++}
++
++/* premultiplied source-over, one channel pair at a time (a = 1..254) */
++static inline uint32_t
++sweet_fb_over(uint32_t src, uint32_t dst)
++{
++	uint32_t inv = 255u - (src >> 24);
++	uint32_t rb = (dst & 0x00ff00ffu) * inv;
++	uint32_t ag = ((dst >> 8) & 0x00ff00ffu) * inv;
++	rb = ((rb + 0x00800080u + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++	ag = ((ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++	uint32_t out = rb | (ag << 8);
++	/* add the source with per-channel saturation */
++	uint32_t sum = 0;
++	for (unsigned c = 0; c < 32; c += 8) {
++		uint32_t v = ((out >> c) & 0xffu) + ((src >> c) & 0xffu);
++		sum |= (v > 255u ? 255u : v) << c;
++	}
++	return sum;
++}
++
++static uint32_t sweet_fb_comp_logged;
++
++/*
++ * 0170: a frame of two or more layers (or one whose source and destination sizes differ), composed in the
++ * cached fCompose in layer order (the record's layer 0 lowest), then copied once into the panel memory,
++ * scaled by fColMap. False: not for this path (present() shows it).
++ */
++bool
++AppleCLCD::presentComposed(const uint8_t *rec)
++{
++	if (!sweet_fb_compose || !fScaleUp || fColMap == NULL) {
++		return false;
++	}
++	uint32_t mask = get32(rec, 0x104), layers = 0;
++	bool scaled = false;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
++			layers++;
++			const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
++			if (get32(a, 8) != 0 && get32(a, 12) != 0 && (get32(a, 8) != get32(b, 8) || get32(a, 12) != get32(b, 12))) {
++				scaled = true;
++			}
++		}
++	}
++	if (layers == 0 || (layers == 1 && !scaled)) {
++		return false;
++	}
++	if (fCompose == NULL) {
++		fCompose = (uint32_t *)IOMallocData((vm_size_t)fLogicalW * fLogicalH * 4);
++		fComposeX = (uint32_t *)IOMallocData((vm_size_t)fLogicalW * 4);
++		if (fCompose == NULL || fComposeX == NULL) {
++			IOLog("SWEET FB: no memory to compose frames: layers pasted as before\n");
++			sweet_fb_compose = false;
++			return false;
++		}
++	}
++	pauseConsole();
++	uint64_t began = mach_absolute_time();
++	bzero(fCompose, (size_t)fLogicalW * fLogicalH * 4);
++	bool log = sweet_fb_comp_logged < 12 || (sweet_fb_stats.composed == 0 && sweet_fb_comp_logged < 200);
++	if (log) {
++		sweet_fb_comp_logged++;
++	}
++	bool first = true;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		uint32_t id = get32(rec, 0x54 + 4 * l);
++		if (!(mask & (1u << l)) || id == 0) {
++			continue;
++		}
++		const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t dw = (int32_t)get32(b, 8), dh = (int32_t)get32(b, 12);
++		SweetSurface *s = sweet_surface_copy(id);
++		uintptr_t src = s != NULL ? s->kernelAddress() : 0;
++		if (s != NULL && (sw <= 0 || sh <= 0)) {
++			sw = (int32_t)s->width;
++			sh = (int32_t)s->height;
++		}
++		if (dw <= 0 || dh <= 0) {
++			dw = sw;
++			dh = sh;
++		}
++		bool ok = s != NULL && s != fSurface && src != 0 && s->memory != NULL && s->elementWidth == 1 &&
++		    s->elementHeight == 1 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) && sx >= 0 && sy >= 0 &&
++		    sw > 0 && sh > 0 && sx + sw <= (int32_t)s->width && sy + sh <= (int32_t)s->height &&
++		    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 <= s->memory->getLength();
++		uint32_t zero = 0, full = 0, part = 0;
++		bool blend = false;
++		if (ok) {
++			s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
++			const uint8_t *base = (const uint8_t *)(src + s->offset);
++			sweet_fb_alpha_samples(base, s->bytesPerRow, sx, sy, sw, sh, &zero, &full, &part);
++			blend = !first && zero != 64;
++			/* destination clipped to the logical display; each kept column/row maps back to the source */
++			int32_t x0 = dx < 0 ? 0 : dx, y0 = dy < 0 ? 0 : dy;
++			int32_t x1 = dx + dw > (int32_t)fLogicalW ? (int32_t)fLogicalW : dx + dw;
++			int32_t y1 = dy + dh > (int32_t)fLogicalH ? (int32_t)fLogicalH : dy + dh;
++			if (x1 <= x0 || y1 <= y0) {
++				x1 = x0;
++				y1 = y0;                /* off the display: nothing to draw */
++			}
++			for (int32_t x = x0; x < x1; x++) {
++				fComposeX[x] = (uint32_t)(sx + (int32_t)(((int64_t)(x - dx) * sw) / dw));
++			}
++			for (int32_t y = y0; y < y1; y++) {
++				const uint32_t *srow = (const uint32_t *)(base +
++				    (uint64_t)(sy + (int32_t)(((int64_t)(y - dy) * sh) / dh)) * s->bytesPerRow);
++				uint32_t *drow = fCompose + (uint64_t)y * fLogicalW;
++				if (!blend) {
++					if (sw == dw) {
++						memcpy(drow + x0, srow + fComposeX[x0], (size_t)(x1 - x0) * 4);
++					} else {
++						for (int32_t x = x0; x < x1; x++) {
++							drow[x] = srow[fComposeX[x]];
++						}
++					}
++					continue;
++				}
++				for (int32_t x = x0; x < x1; x++) {
++					uint32_t p = srow[fComposeX[x]];
++					uint32_t alpha = p >> 24;
++					if (alpha == 255u) {
++						drow[x] = p;
++					} else if (alpha != 0) {
++						drow[x] = sweet_fb_over(p, drow[x]);
++					}
++				}
++			}
++			if (blend) {
++				sweet_fb_stats.comp_blend++;
++			} else {
++				sweet_fb_stats.comp_opaque++;
++			}
++			first = false;
++		} else {
++			sweet_fb_stats.comp_skipped++;
++		}
++		if (log) {
++			/* per-layer flag bytes as kern_SwapSetLayer sets them (NOTES 2026-10-17), transform */
++			IOLog("SWEET FB: compose swap %u layer %u surface %u %ux%u fmt 0x%x bpe %u bpr %u a %d,%d %dx%d b %d,%d %dx%d "
++			    "xform %u flags %02x %02x %02x %02x %02x %02x alpha 0:%u 255:%u mid:%u -> %s\n",
++			    get32(rec, 0x50), l, id, s ? s->width : 0, s ? s->height : 0, s ? s->pixelFormat : 0,
++			    s ? s->bytesPerElement : 0, s ? s->bytesPerRow : 0, sx, sy, sw, sh, dx, dy, dw, dh,
++			    get32(rec, 0x114 + 4 * l), rec[0x2ca + l], rec[0x2cc + l], rec[0x2e3 + l], rec[0x2e5 + l],
++			    rec[0x2e6 + l], rec[0x467 + l], zero, full, part, !ok ? "skipped" : blend ? "blended" : "opaque");
++		}
++		OSSafeReleaseNULL(s);
++	}
++	/* a GPU blit of an earlier frame still running would land on top of this one later */
++	for (unsigned k = 0; k < 2; k++) {
++		if (sweet_fbgpu.fence[k] != 0 && sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 0) != 0) {
++			sweet_fb_stats.comp_gpu_wait++;
++			(void)sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 50000000ull);
++		}
++	}
++	for (uint32_t py = 0; py < fHeight; py++) {
++		uint32_t ly = (uint32_t)(((uint64_t)py * fLogicalH) / fHeight);
++		const uint32_t *srow = fCompose + (uint64_t)ly * fLogicalW;
++		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		for (uint32_t px = 0; px < fWidth; px++) {
++			drow[px] = srow[fColMap[px]];
++		}
++	}
++	sweet_fb_stats.composed++;
++	sweet_fb_stats.comp_time += mach_absolute_time() - began;
++	return true;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
