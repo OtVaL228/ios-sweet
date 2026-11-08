@@ -1,0 +1,418 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cbb9d9a..57598c6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -64,6 +64,7 @@ static bool sweet_fb_sync = true;
+  * sweetfbcompose=0: present() as before. The GPU blit takes rect a's size as its source too.
+  */
+ static bool sweet_fb_compose = true;
++static bool sweet_fb_opaque_flag = true;   /* 0172: sweetfbopaqueflag, see sweet_fb_layer_is_opaque */
+ /*
+  * 0171: layer order. Subway Surfers (0170 log): layer 0 = the game's drawable (flag byte 0x467+layer = 1),
+  * layer 1 = CoreAnimation's own framebuffer surface (2/3), fully opaque or fully transparent. Drawing layer 0
+@@ -321,6 +322,9 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t compose = 1;
+ 	(void)PE_parse_boot_argn("sweetfbcompose", &compose, sizeof(compose));
+ 	sweet_fb_compose = compose != 0;
++	uint32_t opaqueFlag = 1;
++	(void)PE_parse_boot_argn("sweetfbopaqueflag", &opaqueFlag, sizeof(opaqueFlag));
++	sweet_fb_opaque_flag = opaqueFlag != 0;
+ 	IOLog("SWEET FB: multi-layer composition %s (0170)\n", sweet_fb_compose ? "on" : "off");
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+ 	IOLog("SWEET FB: GPU present mode %s\n", sweet_fb_present_at_swap ? "at-swap" : "vsync-only");
+@@ -457,7 +461,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				    sweet_fb_stats.comp_blend, sweet_fb_stats.comp_skipped, sweet_fb_stats.comp_gpu_wait);
+ 			}
+ 			if (sweet_fb_stats.top_only != 0) {
+-				IOLog("SWEET FB: 5s: multi-layer frames shown as their opaque top layer on the GPU: %u\n",
++				IOLog("SWEET FB: 5s: multi-layer frames shown on the GPU (opaque top layer, bottom layer around it): %u\n",
+ 				    sweet_fb_stats.top_only);
+ 			}
+ 		}
+@@ -814,7 +818,7 @@ AppleCLCD::presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, in
+ #define FBGPU_PANEL_OFF         0x1000000ull
+ #define FBGPU_SLOT_OFF          0x4000000ull
+ #define FBGPU_SLOT_BYTES        0x1000000ull
+-#define FBGPU_SLOTS             4
++#define FBGPU_SLOTS             8       /* 0172: was 4; two layers of three surfaces each rotate */
+ 
+ static struct {
+ 	bool tried, ok;
+@@ -907,7 +911,7 @@ fbgpu_setup(uint64_t panel_pa, uint64_t panel_bytes)
+  * remapped only while no blit of ours is queued (busy: *busy, the frame waits a vsync).
+  */
+ static uint64_t
+-fbgpu_surface_va(SweetSurface *s, bool *busy)
++fbgpu_surface_va(SweetSurface *s, bool *busy, int avoid, int *slot)
+ {
+ 	IOByteCount seg = 0;
+ 	uint64_t len = round_page_64(s->memory->getLength());
+@@ -917,6 +921,7 @@ fbgpu_surface_va(SweetSurface *s, bool *busy)
+ 	}
+ 	for (unsigned i = 0; i < FBGPU_SLOTS; i++) {
+ 		if (sweet_fbgpu.slot[i].id == s->id && sweet_fbgpu.slot[i].pa0 == pa0 && sweet_fbgpu.slot[i].len == len) {
++			*slot = (int)i;
+ 			return sweet_fbgpu.win + FBGPU_SLOT_OFF + i * FBGPU_SLOT_BYTES;
+ 		}
+ 	}
+@@ -927,6 +932,9 @@ fbgpu_surface_va(SweetSurface *s, bool *busy)
+ 		}
+ 	}
+ 	unsigned i = sweet_fbgpu.victim++ % FBGPU_SLOTS;
++	if ((int)i == avoid) {
++		i = sweet_fbgpu.victim++ % FBGPU_SLOTS;  /* 0172: not the slot this frame's other layer is in */
++	}
+ 	uint32_t n = 0;
+ 	for (uint64_t off = 0; off < len; off += 4096, n++) {
+ 		addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+@@ -943,6 +951,7 @@ fbgpu_surface_va(SweetSurface *s, bool *busy)
+ 	sweet_fbgpu.slot[i].id = s->id;
+ 	sweet_fbgpu.slot[i].pa0 = pa0;
+ 	sweet_fbgpu.slot[i].len = len;
++	*slot = (int)i;
+ 	return va;
+ }
+ 
+@@ -1092,6 +1101,66 @@ sweet_fb_layer_opaque(SweetSurface *s, const uint8_t *a)
+ 	return true;
+ }
+ 
++/*
++ * 0172: is layer l opaque? The flag byte rec[0x467 + l] (kern_SwapSetLayer flag bit 9) is set on the game's
++ * Metal layer only, whose alpha is not all 255 (Subway Surfers: 255:61 mid:3): read as CoreAnimation's "opaque"
++ * (alpha ignored). Boot-arg sweetfbopaqueflag=0 ignores the byte (alpha samples only).
++ */
++static bool
++sweet_fb_layer_is_opaque(const uint8_t *rec, uint32_t l, SweetSurface *s)
++{
++	if (sweet_fb_opaque_flag && rec[0x467 + l] != 0) {
++		return true;
++	}
++	return s != NULL && sweet_fb_layer_opaque(s, rec + 0x64 + 16 * l);
++}
++
++/* 0172: one CP_BLIT: a source rectangle (24.8 fixed, inclusive) scaled onto a panel rectangle [px0,px1) x [py0,py1) */
++struct sweet_fb_blit {
++	uint64_t src;
++	uint32_t sw, sh, spitch;
++	uint32_t sx0, sx1, sy0, sy1;
++	uint32_t px0, px1, py0, py1;
++};
++
++/*
++ * 0172: a layer's part [x0,x1) x [y0,y1) of the logical display (inside its rect b) as a blit: the matching part
++ * of its source rect a, the panel pixels presentScaled's rounding gives that logical part. False: empty.
++ */
++static bool
++sweet_fb_part(const AppleCLCD *fb, uint64_t src, SweetSurface *s, int32_t sx, int32_t sy, int32_t aw, int32_t ah,
++    int32_t dx, int32_t dy, int32_t w, int32_t h, int32_t x0, int32_t y0, int32_t x1, int32_t y1, struct sweet_fb_blit *o)
++{
++	if (x1 <= x0 || y1 <= y0) {
++		return false;
++	}
++	o->px0 = (uint32_t)(((uint64_t)x0 * fb->fWidth + fb->fLogicalW - 1) / fb->fLogicalW);
++	o->px1 = (uint32_t)(((uint64_t)x1 * fb->fWidth + fb->fLogicalW - 1) / fb->fLogicalW);
++	o->py0 = (uint32_t)(((uint64_t)y0 * fb->fHeight + fb->fLogicalH - 1) / fb->fLogicalH);
++	o->py1 = (uint32_t)(((uint64_t)y1 * fb->fHeight + fb->fLogicalH - 1) / fb->fLogicalH);
++	o->px1 = o->px1 > fb->fWidth ? fb->fWidth : o->px1;
++	o->py1 = o->py1 > fb->fHeight ? fb->fHeight : o->py1;
++	if (o->px1 <= o->px0 || o->py1 <= o->py0) {
++		return false;
++	}
++	o->src = src;
++	o->sw = s->width;
++	o->sh = s->height;
++	o->spitch = s->bytesPerRow;
++	/* source edges in 1/256 pixel; the end is inclusive as before ((sx + aw - 1) << 8 for the whole layer) */
++	o->sx0 = (uint32_t)(sx * 256 + (int32_t)(((int64_t)(x0 - dx) * aw * 256) / w));
++	o->sx1 = (uint32_t)(sx * 256 + (int32_t)(((int64_t)(x1 - dx) * aw * 256) / w) - 256);
++	o->sy0 = (uint32_t)(sy * 256 + (int32_t)(((int64_t)(y0 - dy) * ah * 256) / h));
++	o->sy1 = (uint32_t)(sy * 256 + (int32_t)(((int64_t)(y1 - dy) * ah * 256) / h) - 256);
++	if ((int32_t)o->sx1 < (int32_t)o->sx0) {
++		o->sx1 = o->sx0;
++	}
++	if ((int32_t)o->sy1 < (int32_t)o->sy0) {
++		o->sy1 = o->sy0;
++	}
++	return true;
++}
++
+ /* 1 shown (queued on the GPU), 0 not for the GPU (the CPU path shows it), -1 the GPU is busy: next vsync */
+ int
+ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -1104,83 +1173,109 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		return 0;
+ 	}
+ 	pauseConsole();
+-	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS, layers = 0;
++	/* 0171: the lowest index is the top layer. 0172: up to two layers, the top one opaque */
++	uint32_t mask = get32(rec, 0x104), order[SWEET_FB_LAYERS], layers = 0;
+ 	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+ 		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
+-			if (layer == SWEET_FB_LAYERS) {
+-				layer = l;              /* 0171: the lowest index is the top layer */
+-			}
+-			layers++;
++			order[layers++] = l;
+ 		}
+ 	}
+-	if (layer == SWEET_FB_LAYERS) {
++	if (layers == 0) {
+ 		sweet_fb_stats.gpu_skip[2]++;
+ 		return 0;
+ 	}
+-	if (layers > 1) {
+-		/* 0171: an opaque top layer over the whole display hides the rest: blit it alone */
+-		const uint8_t *tb = rec + 0xc4 + 16 * layer;
+-		SweetSurface *top = sweet_fb_compose ? sweet_surface_copy(get32(rec, 0x54 + 4 * layer)) : NULL;
+-		bool alone = top != NULL && get32(tb, 0) == 0 && get32(tb, 4) == 0 && get32(tb, 8) == fLogicalW &&
+-		    get32(tb, 12) == fLogicalH && sweet_fb_layer_opaque(top, rec + 0x64 + 16 * layer);
+-		OSSafeReleaseNULL(top);
+-		if (!alone) {
+-			sweet_fb_stats.gpu_skip[1]++;
+-			return 0;               /* the CPU path composes them */
+-		}
++	if (layers > 2 || (layers == 2 && !sweet_fb_compose)) {
++		sweet_fb_stats.gpu_skip[1]++;
++		return 0;
+ 	}
+ 	unsigned k = sweet_fbgpu.next;
+ 	if (sweet_fbgpu.fence[k] != 0 && sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 0) != 0) {
+ 		return -1;
+ 	}
+-	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
+-	if (s == NULL || s == fSurface || s->memory == NULL || s->pixelFormat != 0x42475241u ||
+-	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerRow & 63) ||
+-	    (s->offset & 63)) {
+-		OSSafeReleaseNULL(s);
+-		sweet_fb_stats.gpu_skip[3]++;
+-		return 0;
+-	}
+-	const uint8_t *a = rec + 0x64 + 16 * layer;
+-	const uint8_t *b = rec + 0xc4 + 16 * layer;
+-	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
+-	int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+-	int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
+-	if (w <= 0 || h <= 0) {
+-		w = (int32_t)s->width;
+-		h = (int32_t)s->height;
+-	}
+-	/* 0170: the source rectangle's own size (rect a); the blit scales it onto rect b */
+-	int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
+-	if (!sweet_fb_compose || aw <= 0 || ah <= 0) {
+-		aw = w;
+-		ah = h;
+-	}
+-	if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || aw > (int32_t)s->width - sx || ah > (int32_t)s->height - sy ||
+-	    w > (int32_t)fLogicalW - dx || h > (int32_t)fLogicalH - dy) {
+-		OSSafeReleaseNULL(s);
+-		sweet_fb_stats.gpu_skip[4]++;
+-		return 0;
+-	}
+-	bool busy = false;
+-	uint64_t src = fbgpu_surface_va(s, &busy);
+-	uint32_t sw = s->width, sh = s->height, spitch = s->bytesPerRow;
+-	src += src ? s->offset : 0;
+-	s->release();
+-	if (src == 0) {
+-		if (!busy) {
+-			sweet_fb_stats.gpu_skip[5]++;
++	struct sweet_fb_blit blits[5];
++	unsigned nblits = 0;
++	int32_t tx0 = 0, ty0 = 0, tx1 = 0, ty1 = 0;     /* the top layer's logical rectangle (clipped) */
++	int avoid = -1;
++	for (uint32_t i = 0; i < layers; i++) {
++		uint32_t l = order[i];
++		SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * l));
++		if (s == NULL || s == fSurface || s->memory == NULL || s->pixelFormat != 0x42475241u ||
++		    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerRow & 63) ||
++		    (s->offset & 63)) {
++			OSSafeReleaseNULL(s);
++			sweet_fb_stats.gpu_skip[3]++;
++			return 0;
+ 		}
+-		return busy ? -1 : 0;
++		if (i == 0 && layers == 2 && !sweet_fb_layer_is_opaque(rec, l, s)) {
++			s->release();
++			sweet_fb_stats.gpu_skip[1]++;   /* a translucent top layer: the CPU path blends it */
++			return 0;
++		}
++		const uint8_t *a = rec + 0x64 + 16 * l;
++		const uint8_t *b = rec + 0xc4 + 16 * l;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++		if (w <= 0 || h <= 0) {
++			w = (int32_t)s->width;
++			h = (int32_t)s->height;
++		}
++		/* 0170: the source rectangle's own size (rect a); the blit scales it onto rect b */
++		int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
++		if (!sweet_fb_compose || aw <= 0 || ah <= 0) {
++			aw = w;
++			ah = h;
++		}
++		if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || aw > (int32_t)s->width - sx || ah > (int32_t)s->height - sy ||
++		    w > (int32_t)fLogicalW - dx || h > (int32_t)fLogicalH - dy) {
++			OSSafeReleaseNULL(s);
++			sweet_fb_stats.gpu_skip[4]++;
++			return 0;
++		}
++		bool busy = false;
++		int slot = -1;
++		uint64_t src = fbgpu_surface_va(s, &busy, avoid, &slot);
++		src += src ? s->offset : 0;
++		if (src == 0) {
++			s->release();
++			if (!busy) {
++				sweet_fb_stats.gpu_skip[5]++;
++			}
++			return busy ? -1 : 0;
++		}
++		avoid = slot;
++		if (i == 0) {
++			/* the top layer whole */
++			tx0 = dx;
++			ty0 = dy;
++			tx1 = dx + w;
++			ty1 = dy + h;
++			if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, dx, dy, dx + w, dy + h, &blits[nblits])) {
++				nblits++;
++			}
++		} else {
++			/*
++			 * the bottom layer only where the top one is not: every panel pixel written once, so the panel
++			 * never scans the bottom layer where the game is (no black flash between two blits)
++			 */
++			int32_t bx0 = dx, by0 = dy, bx1 = dx + w, by1 = dy + h;
++			int32_t my0 = by0 > ty0 ? by0 : ty0, my1 = by1 < ty1 ? by1 : ty1;
++			int32_t cut[4][4] = {
++				{ bx0, by0, bx1, by1 < ty0 ? by1 : ty0 },                       /* above */
++				{ bx0, by0 > ty1 ? by0 : ty1, bx1, by1 },                       /* below */
++				{ bx0, my0, bx1 < tx0 ? bx1 : tx0, my1 },                       /* left */
++				{ bx0 > tx1 ? bx0 : tx1, my0, bx1, my1 },                       /* right */
++			};
++			for (unsigned c = 0; c < 4; c++) {
++				if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, cut[c][0], cut[c][1], cut[c][2],
++				    cut[c][3], &blits[nblits])) {
++					nblits++;
++				}
++			}
++		}
++		s->release();
+ 	}
+-	/* the panel rectangle the logical one covers (presentScaled's rounding) */
+-	uint32_t px0 = (uint32_t)(((uint64_t)dx * fWidth + fLogicalW - 1) / fLogicalW);
+-	uint32_t px1 = (uint32_t)(((uint64_t)(dx + w) * fWidth + fLogicalW - 1) / fLogicalW);
+-	uint32_t py0 = (uint32_t)(((uint64_t)dy * fHeight + fLogicalH - 1) / fLogicalH);
+-	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH);
+-	px1 = px1 > fWidth ? fWidth : px1;
+-	py1 = py1 > fHeight ? fHeight : py1;
+-	if (px1 <= px0 || py1 <= py0) {
++	if (nblits == 0) {
+ 		sweet_fb_stats.gpu_skip[4]++;
+ 		return 0;
+ 	}
+@@ -1211,35 +1306,38 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	REG(0x8c00, 0x00f03000);                /* RB_A2D_BLT_CNTL: 8888 UNORM, mask f */
+ 	REG(0x8400, 0x00f03000);                /* GRAS_A2D_BLT_CNTL */
+ 	REG(0xacc0, 0xf180);                    /* SP_A2D_OUTPUT_INFO */
+-	dw[n++] = fbgpu_pkt4(0x8405, 2);        /* GRAS_A2D_DEST_TL, _BR (inclusive) */
+-	dw[n++] = px0 | (py0 << 16);
+-	dw[n++] = (px1 - 1) | ((py1 - 1) << 16);
+-	dw[n++] = fbgpu_pkt4(0x8401, 4);        /* GRAS_A2D_SRC_XMIN..YMAX, 24.8 fixed, inclusive */
+-	dw[n++] = (uint32_t)sx << 8;
+-	dw[n++] = (uint32_t)(sx + aw - 1) << 8;
+-	dw[n++] = (uint32_t)sy << 8;
+-	dw[n++] = (uint32_t)(sy + ah - 1) << 8;
+-	dw[n++] = fbgpu_pkt4(0xb4c0, 5);        /* TPL1_A2D_SRC_TEXTURE_INFO, SIZE, BASE, PITCH */
+-	dw[n++] = 0x00500430 | 0x10000;         /* 8888, linear, WXYZ; bilinear */
+-	dw[n++] = sw | (sh << 15);
+-	dw[n++] = (uint32_t)src;
+-	dw[n++] = (uint32_t)(src >> 32);
+-	dw[n++] = spitch << 3;
+-	dw[n++] = fbgpu_pkt4(0xb4ca, 3);        /* TPL1_A2D_SRC_TEXTURE_FLAG_BASE, _PITCH */
+-	dw[n++] = (uint32_t)src;
+-	dw[n++] = (uint32_t)(src >> 32);
+-	dw[n++] = 0;
+-	dw[n++] = fbgpu_pkt4(0x8c17, 4);        /* RB_A2D_DEST_BUFFER_INFO, BASE, PITCH (64 B units) */
+-	dw[n++] = 0x430;
+-	dw[n++] = (uint32_t)dst;
+-	dw[n++] = (uint32_t)(dst >> 32);
+-	dw[n++] = fRowBytes >> 6;
+-	dw[n++] = fbgpu_pkt4(0x8c20, 3);        /* RB_A2D_DEST_FLAG_BUFFER_BASE, _PITCH */
+-	dw[n++] = (uint32_t)dst;
+-	dw[n++] = (uint32_t)(dst >> 32);
+-	dw[n++] = 0;
+-	dw[n++] = fbgpu_pkt7(0x2c, 1);          /* CP_BLIT */
+-	dw[n++] = 3;                            /* BLIT_OP_SCALE */
++	for (unsigned j = 0; j < nblits; j++) {
++		const struct sweet_fb_blit *o = &blits[j];
++		dw[n++] = fbgpu_pkt4(0x8405, 2);        /* GRAS_A2D_DEST_TL, _BR (inclusive) */
++		dw[n++] = o->px0 | (o->py0 << 16);
++		dw[n++] = (o->px1 - 1) | ((o->py1 - 1) << 16);
++		dw[n++] = fbgpu_pkt4(0x8401, 4);        /* GRAS_A2D_SRC_XMIN..YMAX, 24.8 fixed, inclusive */
++		dw[n++] = o->sx0;
++		dw[n++] = o->sx1;
++		dw[n++] = o->sy0;
++		dw[n++] = o->sy1;
++		dw[n++] = fbgpu_pkt4(0xb4c0, 5);        /* TPL1_A2D_SRC_TEXTURE_INFO, SIZE, BASE, PITCH */
++		dw[n++] = 0x00500430 | 0x10000;         /* 8888, linear, WXYZ; bilinear */
++		dw[n++] = o->sw | (o->sh << 15);
++		dw[n++] = (uint32_t)o->src;
++		dw[n++] = (uint32_t)(o->src >> 32);
++		dw[n++] = o->spitch << 3;
++		dw[n++] = fbgpu_pkt4(0xb4ca, 3);        /* TPL1_A2D_SRC_TEXTURE_FLAG_BASE, _PITCH */
++		dw[n++] = (uint32_t)o->src;
++		dw[n++] = (uint32_t)(o->src >> 32);
++		dw[n++] = 0;
++		dw[n++] = fbgpu_pkt4(0x8c17, 4);        /* RB_A2D_DEST_BUFFER_INFO, BASE, PITCH (64 B units) */
++		dw[n++] = 0x430;
++		dw[n++] = (uint32_t)dst;
++		dw[n++] = (uint32_t)(dst >> 32);
++		dw[n++] = fRowBytes >> 6;
++		dw[n++] = fbgpu_pkt4(0x8c20, 3);        /* RB_A2D_DEST_FLAG_BUFFER_BASE, _PITCH */
++		dw[n++] = (uint32_t)dst;
++		dw[n++] = (uint32_t)(dst >> 32);
++		dw[n++] = 0;
++		dw[n++] = fbgpu_pkt7(0x2c, 1);          /* CP_BLIT */
++		dw[n++] = 3;                            /* BLIT_OP_SCALE */
++	}
+ 	EV_TS(0x1d);                            /* PC_CCU_FLUSH_COLOR_TS */
+ 	EV_TS(0x1c);                            /* PC_CCU_FLUSH_DEPTH_TS */
+ 	EV_TS(0x04);                            /* CACHE_FLUSH_TS */
+@@ -1248,6 +1346,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ #undef REG
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint64_t iova = sweet_fbgpu.win + (uint64_t)k * FBGPU_IB_BYTES;
++	bool busy = false;
+ 	uint32_t fence = sweet_gpu_submit_v2(&iova, &n, 1, &busy);
+ 	if (fence == 0) {
+ 		return busy ? -1 : 0;
+@@ -1257,11 +1356,12 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	if (layers > 1) {
+ 		sweet_fb_stats.top_only++;
+ 	}
+-	static bool said;
+-	if (!said) {
++	static bool said, said2;
++	if (!said || (layers > 1 && nblits > 1 && !said2)) {
+ 		said = true;
+-		IOLog("SWEET FB: first GPU present: %ux%u -> panel %u,%u-%u,%u (%u dwords, fence %u)\n", sw, sh,
+-		    px0, py0, px1, py1, n, fence);
++		said2 = said2 || (layers > 1 && nblits > 1);
++		IOLog("SWEET FB: GPU present: %u layer(s), %u blit(s), first -> panel %u,%u-%u,%u (%u dwords, fence %u)\n",
++		    layers, nblits, blits[0].px0, blits[0].py0, blits[0].px1, blits[0].py1, n, fence);
+ 	}
+ 	return 1;
+ }
+@@ -1384,7 +1484,8 @@ AppleCLCD::presentComposed(const uint8_t *rec)
+ 			s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
+ 			const uint8_t *base = (const uint8_t *)(src + s->offset);
+ 			sweet_fb_alpha_samples(base, s->bytesPerRow, sx, sy, sw, sh, &zero, &full, &part);
+-			blend = !first && zero != 64;
++			/* 0172: a layer flagged opaque is copied, its alpha ignored */
++			blend = !first && zero != 64 && !(sweet_fb_opaque_flag && rec[0x467 + l] != 0);
+ 			/* destination clipped to the logical display; each kept column/row maps back to the source */
+ 			int32_t x0 = dx < 0 ? 0 : dx, y0 = dy < 0 ? 0 : dy;
+ 			int32_t x1 = dx + dw > (int32_t)fLogicalW ? (int32_t)fLogicalW : dx + dw;

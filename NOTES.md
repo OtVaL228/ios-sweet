@@ -1,3 +1,25 @@
+# Active handoff — 0172 two layers on the GPU (2026-11-08, Claude)
+
+- 0171 hardware result: game visible; long stretches at ~60 fps with every frame GPU-blitted (top layer alone).
+  Other stretches still CPU-composed (27-38 ms/frame) because (1) the game layer's alpha is not all 255
+  (samples 255:61 mid:3) and (2) the game layer is sometimes 1125x2226 over CA's layer (bottom strip visible).
+  User has not yet said whether flicker is gone with 0171.
+- NEW `xnu/patches/0172-guacamole-fb-two-layers-on-gpu.patch` (after 0171; compiled locally with Xcode 27.2 and
+  macOS 13.5 KDK 22G74):
+  - rec[0x467+layer] != 0 (set only on the game layer) is treated as "opaque, ignore alpha" (`sweetfbopaqueflag=0`
+    disables). Also used by the CPU compose (copy, not blend).
+  - presentGPU handles up to two layers with an opaque top: top layer blitted whole, bottom layer only in the
+    parts of its rect not covered by the top (up to 4 cut rectangles), so every panel pixel is written once
+    (no black flash between blits). Panel rows of adjacent cuts meet exactly (checked: top rows 0-2851, strip 2852-3119).
+  - FBGPU_SLOTS 4 -> 8 (window still fits: 64 MB + 8 x 16 MB < 256 MB); slot eviction avoids the other layer's slot.
+  - Log: `SWEET FB: GPU present: N layer(s), N blit(s) ...` once for the first frame and once for the first cut frame.
+- Test: same args, play ~30 s, `dmesg | grep 'SWEET FB: 5s\|SWEET FB: GPU present\|SWEET FB: compose'`.
+  Expect `composed` ~0 in game and the multi-layer GPU count to cover the game frames.
+- Packaged image `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0172-60hz-gpu-two-layers.img`,
+  SHA-256 `0154e7ecd84e32a956f820503e844111185a6056f2d3a17ab265e19b49644b53`. It uses the 60 Hz GPU-present,
+  sync and composition arguments plus `sweetfbopaqueflag=1`. Kernel compile and image packaging succeeded; not yet
+  booted on hardware.
+
 # Active handoff — 0171 layer order + opaque top layer on GPU (2026-11-08, Claude)
 
 - 0170 hardware result: Subway Surfers ALL BLACK (normal for ~0.2 s after leaving Control Center). Compose log:
