@@ -1,3 +1,21 @@
+# Active handoff — 0171 layer order + opaque top layer on GPU (2026-11-08, Claude)
+
+- 0170 hardware result: Subway Surfers ALL BLACK (normal for ~0.2 s after leaving Control Center). Compose log:
+  layer 0 = game drawable (surface 53/55, 1125x2436 BGRA, flag byte rec[0x467+layer]=1, alpha all 255),
+  layer 1 = CoreAnimation framebuffer surface 2/3 (alpha all 255 or all 0). 0170 drew layer 0 lowest, so layer 1
+  covered the game (and the all-0-alpha heuristic made it black). Conclusion: the record's layer 0 is the TOP.
+  This also explains the original flicker: old present() pasted layer 1 over the game on every multi-layer frame.
+- NEW `xnu/patches/0171-guacamole-fb-layer-order-top-only.patch` (after 0170; compiled locally with Xcode 27.2 and
+  macOS 13.5 KDK 22G74):
+  composition goes from the highest index up (layer 0 on top); and in presentGPU, a multi-layer frame whose top
+  layer covers the whole logical display with all-255 alpha samples (rows cache-invalidated individually) is
+  GPU-blitted alone, no CPU composition. New 5 s line: `multi-layer frames shown as their opaque top layer on the GPU: N`.
+- Test: same args, play ~30 s, `dmesg | grep 'SWEET FB: 5s\|SWEET FB: compose'`. Expect most game frames in
+  `top layer on the GPU`, few/no `composed`.
+- Packaged separate image `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0171-60hz-gpu-top-layer.img`,
+  SHA-256 `bf8898488c01cdec0866a3f2025140ea09abc4d582d066423dbec049af4b75b2`. It uses the same 60 Hz GPU-present,
+  sync and composition arguments as 0170. Kernel compile and image packaging succeeded; not yet booted on hardware.
+
 # Active handoff — 0170 multi-layer composition (2026-11-08, Claude)
 
 - 0169 hardware result (Subway Surfers, user still sees flicker): `no new GPU work at swap` ~0, `forced` 0,

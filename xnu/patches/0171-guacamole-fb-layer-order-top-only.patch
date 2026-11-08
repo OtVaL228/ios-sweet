@@ -1,0 +1,141 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c17004b..cbb9d9a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -64,6 +64,13 @@ static bool sweet_fb_sync = true;
+  * sweetfbcompose=0: present() as before. The GPU blit takes rect a's size as its source too.
+  */
+ static bool sweet_fb_compose = true;
++/*
++ * 0171: layer order. Subway Surfers (0170 log): layer 0 = the game's drawable (flag byte 0x467+layer = 1),
++ * layer 1 = CoreAnimation's own framebuffer surface (2/3), fully opaque or fully transparent. Drawing layer 0
++ * lowest hid the game (all black). The record's layer 0 is the TOP: composition goes from the highest
++ * index up. And a top layer covering the whole display with opaque samples needs nothing below it: the GPU
++ * blits it alone (no CPU composition).
++ */
+ extern "C" int proc_selfpid(void);
+ extern "C" uint32_t sweet_mtl_pid_submits(int pid, uint32_t *last_fence);      /* SweetAccelerator.cpp, 0169 */
+ /* 0151: frame statistics, logged every 5 s while frames come (swaps; shown at the swap, at a vsync; GPU busy) */
+@@ -83,6 +90,7 @@ static struct {
+ 	uint32_t nowork, late, forced, reswap, cpu_metal, gpu_skip[6], swapwait, swapwait_to;
+ 	/* 0170: composed frames, their layers drawn opaque / blended, GPU blits still running before one, its cost */
+ 	uint32_t composed, comp_opaque, comp_blend, comp_skipped, comp_gpu_wait;
++	uint32_t top_only;                      /* 0171: multi-layer frames shown as their opaque top layer, on the GPU */
+ 	uint64_t comp_time;
+ 	uint32_t sel[128];
+ } sweet_fb_stats;
+@@ -448,6 +456,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				    sweet_fb_stats.composed, us / sweet_fb_stats.composed, sweet_fb_stats.comp_opaque,
+ 				    sweet_fb_stats.comp_blend, sweet_fb_stats.comp_skipped, sweet_fb_stats.comp_gpu_wait);
+ 			}
++			if (sweet_fb_stats.top_only != 0) {
++				IOLog("SWEET FB: 5s: multi-layer frames shown as their opaque top layer on the GPU: %u\n",
++				    sweet_fb_stats.top_only);
++			}
+ 		}
+ 		uint64_t keep = sweet_fb_stats.last_swap;
+ 		bzero(&sweet_fb_stats, sizeof(sweet_fb_stats));
+@@ -1048,6 +1060,38 @@ AppleCLCD::pauseConsole(void)
+ 	}
+ }
+ 
++/*
++ * 0171: are all 64 alpha samples of this layer's source rectangle 255? Each sampled row is cache-invalidated
++ * on its own (the GPU wrote it), not the whole surface.
++ */
++static bool
++sweet_fb_layer_opaque(SweetSurface *s, const uint8_t *a)
++{
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++	int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++	uintptr_t src = s->kernelAddress();
++	if (sw <= 0 || sh <= 0) {
++		sw = (int32_t)s->width;
++		sh = (int32_t)s->height;
++	}
++	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    sx < 0 || sy < 0 || sx + sw > (int32_t)s->width || sy + sh > (int32_t)s->height ||
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++		return false;
++	}
++	for (int32_t j = 0; j < 8; j++) {
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
++		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
++		const uint32_t *row = (const uint32_t *)(src + off);
++		for (int32_t i = 0; i < 8; i++) {
++			if ((row[(sw * (2 * i + 1)) / 16] >> 24) != 255u) {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
+ /* 1 shown (queued on the GPU), 0 not for the GPU (the CPU path shows it), -1 the GPU is busy: next vsync */
+ int
+ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -1060,20 +1104,31 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		return 0;
+ 	}
+ 	pauseConsole();
+-	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS;
++	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS, layers = 0;
+ 	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+ 		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
+-			if (layer != SWEET_FB_LAYERS) {
+-				sweet_fb_stats.gpu_skip[1]++;
+-				return 0;               /* two layers: the CPU path composes them */
++			if (layer == SWEET_FB_LAYERS) {
++				layer = l;              /* 0171: the lowest index is the top layer */
+ 			}
+-			layer = l;
++			layers++;
+ 		}
+ 	}
+ 	if (layer == SWEET_FB_LAYERS) {
+ 		sweet_fb_stats.gpu_skip[2]++;
+ 		return 0;
+ 	}
++	if (layers > 1) {
++		/* 0171: an opaque top layer over the whole display hides the rest: blit it alone */
++		const uint8_t *tb = rec + 0xc4 + 16 * layer;
++		SweetSurface *top = sweet_fb_compose ? sweet_surface_copy(get32(rec, 0x54 + 4 * layer)) : NULL;
++		bool alone = top != NULL && get32(tb, 0) == 0 && get32(tb, 4) == 0 && get32(tb, 8) == fLogicalW &&
++		    get32(tb, 12) == fLogicalH && sweet_fb_layer_opaque(top, rec + 0x64 + 16 * layer);
++		OSSafeReleaseNULL(top);
++		if (!alone) {
++			sweet_fb_stats.gpu_skip[1]++;
++			return 0;               /* the CPU path composes them */
++		}
++	}
+ 	unsigned k = sweet_fbgpu.next;
+ 	if (sweet_fbgpu.fence[k] != 0 && sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 0) != 0) {
+ 		return -1;
+@@ -1199,6 +1254,9 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	}
+ 	sweet_fbgpu.fence[k] = fence;
+ 	sweet_fbgpu.next = k ^ 1;
++	if (layers > 1) {
++		sweet_fb_stats.top_only++;
++	}
+ 	static bool said;
+ 	if (!said) {
+ 		said = true;
+@@ -1256,7 +1314,7 @@ static uint32_t sweet_fb_comp_logged;
+ 
+ /*
+  * 0170: a frame of two or more layers (or one whose source and destination sizes differ), composed in the
+- * cached fCompose in layer order (the record's layer 0 lowest), then copied once into the panel memory,
++ * cached fCompose from the highest layer index up (0171: the record's layer 0 is the top), then copied once into the panel memory,
+  * scaled by fColMap. False: not for this path (present() shows it).
+  */
+ bool
+@@ -1296,7 +1354,7 @@ AppleCLCD::presentComposed(const uint8_t *rec)
+ 		sweet_fb_comp_logged++;
+ 	}
+ 	bool first = true;
+-	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++	for (uint32_t l = SWEET_FB_LAYERS; l-- > 0;) {     /* 0171: highest index lowest, layer 0 on top */
+ 		uint32_t id = get32(rec, 0x54 + 4 * l);
+ 		if (!(mask & (1u << l)) || id == 0) {
+ 			continue;
