@@ -1,0 +1,69 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@
+ extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);   /* 0144 */
+ static bool sweet_fb_metal;     /* 0145: sweetmtl=2 */
+ static bool sweet_fb_present_at_swap = true; /* 0157: test immediate GPU present vs. vsync-only */
++static bool sweet_fb_scanout_diag;
+ /* 0151: frame statistics, logged every 5 s while frames come (swaps; shown at the swap, at a vsync; GPU busy) */
+ static struct {
+ 	uint64_t window_start, last_swap, max_gap;
+@@ -274,6 +275,12 @@
+ 	fVsync->setTimeoutUS(sweet_fb_vsync_us);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
++	uint32_t scanoutDiag = 0;
++	(void)PE_parse_boot_argn("sweetfb_scanoutdiag", &scanoutDiag, sizeof(scanoutDiag));
++	sweet_fb_scanout_diag = scanoutDiag != 0;
++	if (sweet_fb_scanout_diag)
++		IOLog("SWEET FB: scanout memory sampling enabled at %ux%u stride %u address 0x%llx\n",
++		    fWidth, fHeight, fRowBytes, (uint64_t)fPixels);
+ 	setProperty("external", false);
+ 	publishRefresh();
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -311,12 +318,44 @@
+ 	return true;
+ }
+ 
++/* Read-only probe of the physical framebuffer scanned by the panel. Five bands,
++ * each four full-width rows; run once a second only when explicitly enabled. */
++static void
++sweet_fb_scanout_sample(AppleCLCD *fb, uint64_t tick)
++{
++	if (!sweet_fb_scanout_diag || tick % 60 != 0 || fb->fPixels == 0 ||
++	    fb->fWidth == 0 || fb->fHeight < 16 || fb->fRowBytes < fb->fWidth * 4) {
++		return;
++	}
++	volatile const uint32_t *base = (volatile const uint32_t *)fb->fPixels;
++	static const uint32_t bandPermille[5] = { 80, 250, 500, 750, 920 };
++	for (unsigned band = 0; band < 5; band++) {
++		uint32_t y0 = (uint32_t)((uint64_t)(fb->fHeight - 4) * bandPermille[band] / 1000);
++		uint64_t hash = 1469598103934665603ull;
++		uint64_t light = 0;
++		uint32_t nonblack = 0;
++		for (uint32_t y = y0; y < y0 + 4; y++) {
++			volatile const uint32_t *row = base + (uint64_t)y * fb->fRowBytes / 4;
++			for (uint32_t x = 0; x < fb->fWidth; x++) {
++				uint32_t px = row[x];
++				uint32_t rgb = ((px >> 16) & 0xff) + ((px >> 8) & 0xff) + (px & 0xff);
++				hash = (hash ^ px) * 1099511628211ull;
++				light += rgb;
++				if (rgb > 24) nonblack++;
++			}
++		}
++		IOLog("SWEET FB: scanout tick %llu band %u y=%u hash=%016llx nonblack=%u/%u mean=%llu\n",
++		    tick, band, y0, hash, nonblack, fb->fWidth * 4, light / ((uint64_t)fb->fWidth * 4 * 3));
++	}
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_scanout_sample(fb, count);
+ 	if (sweet_fb_stats.window_start == 0) {
+ 		sweet_fb_stats.window_start = now;
+ 	}
