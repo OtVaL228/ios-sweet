@@ -1,0 +1,360 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 770e9b7..a8bf266 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -42,6 +42,52 @@ uint64_t sweet_gpu_timestamp(void);
+ int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ uint64_t sweet_gpu_pool_avail(void);
+ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
++int proc_selfpid(void);
++uint32_t sweet_mtl_pid_submits(int pid, uint32_t *last_fence);
++}
++
++/*
++ * 0169: the last GPU job each process queued, and how many it has queued. The display (SweetFramebuffer.cpp)
++ * reads it for the process that swaps (backboardd): which fence a frame's drawing ends at, and whether that
++ * drawing reached the ring before the swap. A small table; a pid not in it reads as no submits.
++ */
++#define SWEET_MTL_PIDS  16
++static struct {
++	int pid;
++	uint32_t fence, submits;
++} sweet_mtl_pid[SWEET_MTL_PIDS];
++static unsigned sweet_mtl_pid_next;
++
++static void
++sweet_mtl_note_submit(int pid, uint32_t fence)
++{
++	unsigned i;
++	for (i = 0; i < SWEET_MTL_PIDS; i++) {
++		if (sweet_mtl_pid[i].pid == pid) {
++			break;
++		}
++	}
++	if (i == SWEET_MTL_PIDS) {
++		/* a new process: take the oldest slot (two first submits at once may both land: harmless counts) */
++		i = __atomic_fetch_add(&sweet_mtl_pid_next, 1, __ATOMIC_RELAXED) % SWEET_MTL_PIDS;
++		__atomic_store_n(&sweet_mtl_pid[i].submits, 0, __ATOMIC_RELAXED);
++		__atomic_store_n(&sweet_mtl_pid[i].pid, pid, __ATOMIC_RELEASE);
++	}
++	__atomic_store_n(&sweet_mtl_pid[i].fence, fence, __ATOMIC_RELEASE);
++	__atomic_add_fetch(&sweet_mtl_pid[i].submits, 1, __ATOMIC_RELEASE);
++}
++
++uint32_t
++sweet_mtl_pid_submits(int pid, uint32_t *last_fence)
++{
++	for (unsigned i = 0; i < SWEET_MTL_PIDS; i++) {
++		if (__atomic_load_n(&sweet_mtl_pid[i].pid, __ATOMIC_ACQUIRE) == pid) {
++			*last_fence = __atomic_load_n(&sweet_mtl_pid[i].fence, __ATOMIC_ACQUIRE);
++			return __atomic_load_n(&sweet_mtl_pid[i].submits, __ATOMIC_ACQUIRE);
++		}
++	}
++	*last_fence = 0;
++	return 0;
+ }
+ 
+ #define SWEET_V2_OPEN_TYPE      0x4147  /* the darwin backend's default ('AG', as the AGX plugin's) */
+@@ -581,6 +627,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}
+ 		fLastFence = fence;
++		sweet_mtl_note_submit(proc_selfpid(), fence);  /* 0169 */
+ 		rp->fence = fence;
+ 		return kIOReturnSuccess;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 53237b7..25368bb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,16 @@ extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);   /
+ static bool sweet_fb_metal;     /* 0145: sweetmtl=2 */
+ static bool sweet_fb_present_at_swap = true; /* 0157: test immediate GPU present vs. vsync-only */
+ static bool sweet_fb_scanout_diag;
++/*
++ * 0169: frame hand-over between CoreAnimation and the display (boot-arg sweetfbsync, default 1; 0 = as before).
++ * A swap waits (at most 4 ms) for the swapping process's drawing to reach the GPU ring when none has arrived
++ * since its last swap; the CPU copy waits for that process's own last job (not everyone's) and never shows a
++ * frame whose drawing has not finished before 60 vsyncs (was 6); SwapWait (selector 6) blocks until the swap is
++ * on the panel (at most 50 ms). The 5 s statistics count all of this with or without the boot-arg.
++ */
++static bool sweet_fb_sync = true;
++extern "C" int proc_selfpid(void);
++extern "C" uint32_t sweet_mtl_pid_submits(int pid, uint32_t *last_fence);      /* SweetAccelerator.cpp, 0169 */
+ /* 0151: frame statistics, logged every 5 s while frames come (swaps; shown at the swap, at a vsync; GPU busy) */
+ static struct {
+ 	uint64_t window_start, last_swap, max_gap;
+@@ -54,6 +64,14 @@ static struct {
+ 	/* 0153: what CoreAnimation does between frames: vsyncs delivered, gaps between swaps, every selector */
+ 	uint32_t vsync_sent, gap17, gap34, gap50, gap_more;
+ 	uint32_t ticks, gpu_busy_ticks;         /* 0155: vsync ticks, and those with GPU work still running */
++	/*
++	 * 0169: nowork: swaps with no GPU job from the swapping process since its previous swap; late: of those, a
++	 * job came within the 4 ms wait; forced: frames copied by the CPU before their drawing finished; reswap: a
++	 * swap naming a surface of the frame still waiting to be shown (CoreAnimation draws into it again);
++	 * cpu_metal: Metal frames the CPU copied; gpu_skip: why (setup, layers, no layer, surface, bounds, slot);
++	 * swapwait / swapwait_to: SwapWait calls, and those that ran out.
++	 */
++	uint32_t nowork, late, forced, reswap, cpu_metal, gpu_skip[6], swapwait, swapwait_to;
+ 	uint32_t sel[128];
+ } sweet_fb_stats;
+ 
+@@ -68,6 +86,7 @@ static struct {
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/kern_types.h>   /* 0169: THREAD_UNINT, THREAD_TIMED_OUT */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -147,6 +166,9 @@ public:
+ 	uint16_t     *fColMap;        /* panel x -> logical x (fScaleUp) */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
++	uint32_t      fShownSwapID;   /* 0169: the latest swap on the panel (or queued on the GPU behind its drawing) */
++	uint32_t      fSwapSubmits;   /* 0169: the swapping process's GPU job count at its previous swap */
++	void          shown(const uint8_t *rec);
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -270,6 +292,10 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t presentAtSwap = 1;
+ 	(void)PE_parse_boot_argn("sweetfbatswap", &presentAtSwap, sizeof(presentAtSwap));
+ 	sweet_fb_present_at_swap = presentAtSwap != 0;
++	uint32_t sync = 1;
++	(void)PE_parse_boot_argn("sweetfbsync", &sync, sizeof(sync));
++	sweet_fb_sync = sync != 0;
++	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+ 	IOLog("SWEET FB: GPU present mode %s\n", sweet_fb_present_at_swap ? "at-swap" : "vsync-only");
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(sweet_fb_vsync_us);
+@@ -389,6 +415,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			    sweet_fb_stats.vsync_sent, sweet_fb_stats.gap17, sweet_fb_stats.gap34, sweet_fb_stats.gap50,
+ 			    sweet_fb_stats.gap_more, sweet_fb_stats.ticks ? sweet_fb_stats.gpu_busy_ticks * 100 / sweet_fb_stats.ticks : 0,
+ 			    sels);
++			IOLog("SWEET FB: 5s: sync %u; no new GPU work at swap %u (late %u); forced unfinished %u; re-swapped pending surface %u; "
++			    "CPU-copied Metal frames %u (skip setup %u, layers %u, none %u, surface %u, bounds %u, slot %u); SwapWait %u (timed out %u)\n",
++			    sweet_fb_sync, sweet_fb_stats.nowork, sweet_fb_stats.late, sweet_fb_stats.forced, sweet_fb_stats.reswap,
++			    sweet_fb_stats.cpu_metal, sweet_fb_stats.gpu_skip[0], sweet_fb_stats.gpu_skip[1], sweet_fb_stats.gpu_skip[2],
++			    sweet_fb_stats.gpu_skip[3], sweet_fb_stats.gpu_skip[4], sweet_fb_stats.gpu_skip[5], sweet_fb_stats.swapwait,
++			    sweet_fb_stats.swapwait_to);
+ 		}
+ 		uint64_t keep = sweet_fb_stats.last_swap;
+ 		bzero(&sweet_fb_stats, sizeof(sweet_fb_stats));
+@@ -439,9 +471,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * (mtl2 run 7: flicker whenever something moves). The frame waits for the GPU's last submit at its
+ 	 * swap, the previous one staying on the panel; after 6 vsyncs it is shown anyway (a hung GPU).
+ 	 */
+-	if (flush && fb->fPendingFence != 0 && sweet_gpu_wait_fence_ns(fb->fPendingFence, 0) != 0 &&
+-	    ++fb->fFenceTicks < 6) {
+-		flush = false;
++	if (flush && fb->fPendingFence != 0 && sweet_gpu_wait_fence_ns(fb->fPendingFence, 0) != 0) {
++		/* 0169: with sweetfbsync an unfinished frame waits up to a second (a hung GPU), not 6 vsyncs */
++		if (++fb->fFenceTicks < (sweet_fb_sync ? 60u : 6u)) {
++			flush = false;
++		} else {
++			sweet_fb_stats.forced++;
++		}
+ 	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -474,8 +510,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			return;
+ 		}
+ 		if (gpu == 0) {
++			if (sweet_fb_metal) {
++				sweet_fb_stats.cpu_metal++;
++			}
+ 			fb->present(rec);
+ 		}
++		fb->shown(rec);                         /* 0169 */
+ 		sweet_fb_stats.at_vsync++;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		spent += mach_absolute_time() - began;
+@@ -520,6 +560,32 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/* 0169: this swap (and every earlier one) is on the panel, or queued on the GPU behind its own drawing */
++void
++AppleCLCD::shown(const uint8_t *rec)
++{
++	uint32_t id = get32(rec, 0x50);
++	IOLockLock(fLock);
++	if ((int32_t)(id - fShownSwapID) > 0) {
++		fShownSwapID = id;
++	}
++	IOLockWakeup(fLock, &fShownSwapID, false);
++	IOLockUnlock(fLock);
++}
++
++/* 0169: does layer surface id appear among rec's enabled layers? */
++static bool
++sweet_fb_rec_has_surface(const uint8_t *rec, uint32_t id)
++{
++	uint32_t mask = get32(rec, 0x104);
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) == id) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -530,10 +596,54 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	/*
++	 * 0169: which GPU job ends this frame's drawing. The global last job (0145) is anyone's: a game's frames
++	 * kept CPU copies of backboardd's frames waiting. And CoreAnimation may swap before its Metal command
++	 * buffer reached the ring (metal2vulkan submits on its own thread): no job of the swapping process since its
++	 * previous swap then means the frame's drawing is still on its way, and a blit queued now would run before
++	 * it. Wait for it briefly (sweetfbsync); count it either way.
++	 */
++	uint32_t fence = redwood_gpu_last();
++	if (sweet_fb_metal) {
++		int pid = proc_selfpid();
++		uint32_t pidFence = 0;
++		uint32_t submits = sweet_mtl_pid_submits(pid, &pidFence);
++		if (submits != 0) {
++			if (submits == fSwapSubmits) {
++				sweet_fb_stats.nowork++;
++				if (sweet_fb_sync) {
++					uint64_t deadline = 0;
++					clock_interval_to_deadline(4, NSEC_PER_MSEC, &deadline);
++					while (submits == fSwapSubmits && mach_absolute_time() < deadline) {
++						IODelay(100);
++						submits = sweet_mtl_pid_submits(pid, &pidFence);
++					}
++					if (submits != fSwapSubmits) {
++						sweet_fb_stats.late++;
++					}
++				}
++			}
++			fSwapSubmits = submits;
++			if (sweet_fb_sync && pidFence != 0) {
++				fence = pidFence;
++			}
++		}
++	}
+ 	IOLockLock(fLock);
++	if (fDirty) {
++		/* the frame still waiting names a surface CoreAnimation now swaps again: it drew into it meanwhile */
++		uint32_t mask = get32(fPending, 0x104);
++		for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++			uint32_t id = get32(fPending, 0x54 + 4 * l);
++			if ((mask & (1u << l)) && id != 0 && sweet_fb_rec_has_surface(rec, id)) {
++				sweet_fb_stats.reswap++;
++				break;
++			}
++		}
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+-	fPendingFence = redwood_gpu_last();
++	fPendingFence = fence;
+ 	fFenceTicks = 0;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -576,6 +686,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 				fDirty = false;
+ 			}
+ 			IOLockUnlock(fLock);
++			this->shown(rec);               /* 0169 */
+ 		}
+ 	}
+ }
+@@ -912,7 +1023,11 @@ AppleCLCD::pauseConsole(void)
+ int
+ AppleCLCD::presentGPU(const uint8_t *rec)
+ {
+-	if (!sweet_fb_metal || !fScaleUp || !fbgpu_setup(fPhys, (uint64_t)fRowBytes * fHeight)) {
++	if (!sweet_fb_metal) {
++		return 0;
++	}
++	if (!fScaleUp || !fbgpu_setup(fPhys, (uint64_t)fRowBytes * fHeight)) {
++		sweet_fb_stats.gpu_skip[0]++;           /* 0169: why a Metal frame took the CPU path */
+ 		return 0;
+ 	}
+ 	pauseConsole();
+@@ -920,12 +1035,14 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+ 		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
+ 			if (layer != SWEET_FB_LAYERS) {
++				sweet_fb_stats.gpu_skip[1]++;
+ 				return 0;               /* two layers: the CPU path composes them */
+ 			}
+ 			layer = l;
+ 		}
+ 	}
+ 	if (layer == SWEET_FB_LAYERS) {
++		sweet_fb_stats.gpu_skip[2]++;
+ 		return 0;
+ 	}
+ 	unsigned k = sweet_fbgpu.next;
+@@ -937,6 +1054,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerRow & 63) ||
+ 	    (s->offset & 63)) {
+ 		OSSafeReleaseNULL(s);
++		sweet_fb_stats.gpu_skip[3]++;
+ 		return 0;
+ 	}
+ 	const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -951,6 +1069,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || w > (int32_t)s->width - sx || h > (int32_t)s->height - sy ||
+ 	    w > (int32_t)fLogicalW - dx || h > (int32_t)fLogicalH - dy) {
+ 		OSSafeReleaseNULL(s);
++		sweet_fb_stats.gpu_skip[4]++;
+ 		return 0;
+ 	}
+ 	bool busy = false;
+@@ -959,6 +1078,9 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	src += src ? s->offset : 0;
+ 	s->release();
+ 	if (src == 0) {
++		if (!busy) {
++			sweet_fb_stats.gpu_skip[5]++;
++		}
+ 		return busy ? -1 : 0;
+ 	}
+ 	/* the panel rectangle the logical one covers (presentScaled's rounding) */
+@@ -969,6 +1091,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	px1 = px1 > fWidth ? fWidth : px1;
+ 	py1 = py1 > fHeight ? fHeight : py1;
+ 	if (px1 <= px0 || py1 <= py0) {
++		sweet_fb_stats.gpu_skip[4]++;
+ 		return 0;
+ 	}
+ 	uint64_t dst = sweet_fbgpu.win + FBGPU_PANEL_OFF;
+@@ -1299,6 +1422,27 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		/*
++		 * 0169: [swap id, timeout, 0]: back once that swap is on the panel (or queued on the GPU behind its
++		 * drawing), so CoreAnimation does not draw into a surface the display still has to read. At most
++		 * 50 ms whatever the timeout says (its unit is not known); a swap never begun returns at once.
++		 */
++		if (sweet_fb_sync && args->scalarInputCount >= 1) {
++			uint32_t want = (uint32_t)args->scalarInput[0];
++			AbsoluteTime deadline;          /* a UInt64 on arm64; filled through its address either way */
++			clock_interval_to_deadline(50, NSEC_PER_MSEC, (uint64_t *)&deadline);
++			sweet_fb_stats.swapwait++;
++			IOLockLock(fFB->fLock);
++			while (want != 0 && (int32_t)(fFB->fSwapID - want) >= 0 && !fFB->fPowerOff &&
++			    (int32_t)(fFB->fShownSwapID - want) < 0) {
++				if (IOLockSleepDeadline(fFB->fLock, &fFB->fShownSwapID, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++					sweet_fb_stats.swapwait_to++;
++					break;
++				}
++			}
++			IOLockUnlock(fFB->fLock);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}

@@ -1,3 +1,39 @@
+# Active handoff — 0169 frame hand-over sync (2026-11-08, Claude)
+
+- Goal: Subway Surfers black-region flicker. Hypothesis (NOT yet confirmed on hardware): the display shows frames
+  whose drawing is unfinished or being redrawn, because (a) `AppleCLCD` never tells CoreAnimation when a swap is
+  on the panel (only vsync notifications; `SwapWait` sel 6 was a no-op), (b) 0145's fence is the global last GPU
+  job at swap time, which can predate the frame's own Metal submit (metal2vulkan may submit after CA swaps), and
+  (c) after 6 vsyncs 0145 showed an unfinished frame anyway. Fits all earlier A/Bs: CPU copy, vsync-only, 90 Hz,
+  1 Hz all still flickered; software screenshots are clean.
+- NEW `xnu/patches/0169-guacamole-fb-frame-handover-sync.patch` (SweetFramebuffer.cpp + SweetAccelerator.cpp).
+  Applies cleanly after 0168 and is now compiled locally with Xcode 27.2 and macOS 13.5 KDK 22G74.
+  - SweetAccelerator: per-pid table of last submitted fence + submit count (`sweet_mtl_pid_submits`).
+  - Boot-arg `sweetfbsync` (default 1; `sweetfbsync=0` = previous behaviour):
+    swap waits <= 4 ms for the swapping process's (backboardd's) Metal job if none arrived since its last swap;
+    CPU-path fence = that process's own last job, not everyone's; unfinished frames wait up to 60 vsyncs, not 6;
+    `SwapWait` (sel 6, [swap id, timeout, 0]) blocks until that swap is shown or queued behind its drawing (<= 50 ms).
+  - New 5 s log line (always on): `SWEET FB: 5s: sync 1; no new GPU work at swap N (late N); forced unfinished N;
+    re-swapped pending surface N; CPU-copied Metal frames N (skip setup/layers/none/surface/bounds/slot); SwapWait N
+    (timed out N)`.
+- Userland (optional, off by default): `userland/metal2/NativeBridgeMetalFrontend.mm`, backboardd only, boot-arg
+  `sweetmtlsyncsubmit=1` makes a commit that draws into IOSurfaces wait (runtime-level `nmb_command_buffer_wait_scheduled`)
+  until submitted. Rebuilt with `userland/metal2/build.sh`; this flag remains off unless added to boot args.
+- Test: boot the usual 60 Hz GPU-present args + 0169 kernel, play Subway Surfers ~30 s, then
+  `dmesg | grep 'SWEET FB: 5s'`. Read: `late`>0 or `no new GPU work` high → submit-after-swap race is real (then also try
+  `sweetmtlsyncsubmit=1`); `forced`>0 under old behaviour → showing unfinished frames; `re-swapped pending surface`>0 →
+  CA redraws surfaces before the display shows them (SwapWait/swap-complete matters); `CPU-copied Metal frames` and its
+  skip reasons say whether the game goes through the CPU path. A/B with `sweetfbsync=0` on the same kernel.
+- Reference copies of the reconstructed (0001–0168 applied) files: `work/claude-recon/` (not part of the build).
+- Build artifacts: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0169-60hz-gpupresent.img`
+  (SHA-256 `27532d3e026ce17e1108bf7c7daa9bf660f0eb2e08a5cddb1f13adbc4760c681`) and
+  `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-0169-handover-sync.tar.gz`
+  (SHA-256 `20a5c83e3742f5ef34516ecded74825333edd432d6593bf3a8be18d18f7f3503`). Image uses 60 Hz GPU framebuffer
+  presentation and `sweetfbsync=1`; Metal bundle was rebuilt from the current local sources and ad-hoc signature
+  verified. Neither artifact has been installed or booted on the phone.
+- Not done: real swap-complete notification (type number/payload of IOMobileFramebuffer's swap-done callback
+  still needs reverse engineering); SDE double-buffer page flip (only if a clean tear line remains after this).
+
 # Active handoff — guacamole Metal2 cold-boot initialization (2026-11-07)
 
 - User reports both the OpenGL-off and OpenGL-on boot images now seem to render
