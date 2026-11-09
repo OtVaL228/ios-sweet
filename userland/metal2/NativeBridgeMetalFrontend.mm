@@ -671,10 +671,27 @@ static void waitForResource(id resource) {
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ // 0182: a full-screen surface bound for the fragment stage (another process's picture in backboardd's compositions)
+ if(stage==2){
+  NSString *key=[NSString stringWithFormat:@"ftex%lu",(unsigned long)index];
+  IOSurfaceRef sf=texture?[(NBTexture *)texture surface]:nullptr;
+  NSString *v=(sf && IOSurfaceGetWidth(sf)>=1000 && IOSurfaceGetHeight(sf)>=2000)?
+   [NSString stringWithFormat:@"t%lu=surf %#x %lux%lu fmt %lu",(unsigned long)index,IOSurfaceGetID(sf),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat]:nil;
+  objc_setAssociatedObject(self,(const void *)NSSelectorFromString(key),v,OBJC_ASSOCIATION_RETAIN);
+  NSMutableDictionary *big=objc_getAssociatedObject(self,"bigtex");
+  if(!big){big=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"bigtex",big,OBJC_ASSOCIATION_RETAIN);}
+  if(v)big[@(index)]=v;else [big removeObjectForKey:@(index)];
+ }
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+ if(stage==2){   // 0182
+  NSMutableDictionary *smp=objc_getAssociatedObject(self,"smp");
+  if(!smp){smp=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"smp",smp,OBJC_ASSOCIATION_RETAIN);}
+  NSString *dsc=sampler?objc_getAssociatedObject(sampler,"desc"):nil;
+  if(dsc)smp[@(index)]=dsc;else [smp removeObjectForKey:@(index)];
+ }
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
@@ -727,10 +744,26 @@ static void waitForResource(id resource) {
 @interface NBRenderEncoder : NBEncoder
 @property(nonatomic) BOOL drawableTarget;
 @end
+// 0182: draws that sample a full-screen surface, with pipeline, samplers and target: each distinct combination once (<= 60)
+static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSUInteger instances) {
+ NSDictionary *big=objc_getAssociatedObject(encoder,"bigtex");
+ if(!big.count)return;
+ static std::mutex lock;static NSMutableSet<NSString *> *seen;
+ NSString *pipe=objc_getAssociatedObject(encoder,"pipe")?:@"(pipeline ?)";
+ NSDictionary *smp=objc_getAssociatedObject(encoder,"smp");
+ NSString *target=objc_getAssociatedObject(encoder,"target")?:@"?";
+ NSString *line=[NSString stringWithFormat:@"%@ | %@ | samplers %@ | target %@",
+  [[big allValues] componentsJoinedByString:@","],pipe,[[smp allValues] componentsJoinedByString:@" / "],target];
+ std::lock_guard<std::mutex> guard(lock);if(!seen)seen=[NSMutableSet set];
+ if([seen containsObject:line] || seen.count>=60)return;
+ [seen addObject:line];
+ NBLOG(@"native-metal: big-texture draw (%s %lu x%lu): %@",kind,(unsigned long)count,(unsigned long)instances,line);
+}
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
+ objc_setAssociatedObject(self,"pipe",objc_getAssociatedObject(state,"desc"),OBJC_ASSOCIATION_RETAIN);   // 0182
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -821,6 +854,7 @@ static void waitForResource(id resource) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ traceBigTextureDraw(self,"draw",n,i);
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
@@ -834,6 +868,7 @@ static void waitForResource(id resource) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ traceBigTextureDraw(self,"indexed",n,i);
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
@@ -1018,6 +1053,11 @@ static void scheduled(void *context);
  }
  id encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
  if([encoder isKindOfClass:[NBRenderEncoder class]])((NBRenderEncoder *)encoder).drawableTarget=drawableTarget;
+ if([encoder isKindOfClass:[NBRenderEncoder class]]){   // 0182: the pass's colour target, for the draw trace
+  id<MTLTexture> t0=d.colorAttachments[0].texture;IOSurfaceRef sf=[(id)t0 isKindOfClass:[NBTexture class]]?[(NBTexture *)t0 surface]:nullptr;
+  objc_setAssociatedObject(encoder,"target",[NSString stringWithFormat:@"%lux%lu fmt %lu surf %#x load %lu label %@",(unsigned long)t0.width,(unsigned long)t0.height,
+   (unsigned long)t0.pixelFormat,sf?IOSurfaceGetID(sf):0,(unsigned long)d.colorAttachments[0].loadAction,t0.label?:@""],OBJC_ASSOCIATION_RETAIN);
+ }
  return encoder;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
@@ -1743,8 +1783,29 @@ static char sweetMemoryOwnerKey;
     sys_dcache_flush(rowp,row);
     for(unsigned i=0;i<8;i++){const uint8_t *px=rowp+4*(w*(2*i+1)/16);if(px[0]+px[1]+px[2]<=24)black++;}
    }
-   NBLOG(@"native-metal: surface %#x %zux%zu seen here: %u/64 black (base %p, alloc %zu, seed %u, label %@)",IOSurfaceGetID(surface),w,h,black,
-    base,allocation,IOSurfaceGetSeed(surface),d.pixelFormat==MTLPixelFormatBGRA8Unorm?@"BGRA8":[NSString stringWithFormat:@"fmt %lu",(unsigned long)d.pixelFormat]);
+   // 0181: the same 64 points as this process's GPU reads them through the new texture (blit to a buffer)
+   unsigned gpuBlack=65;
+   @autoreleasepool {
+    static id<MTLCommandQueue> probeQueue;static dispatch_once_t once;
+    dispatch_once(&once,^{probeQueue=[(id<MTLDevice>)gDeviceObject newCommandQueue];});
+    id<MTLBuffer> out=[(id<MTLDevice>)gDeviceObject newBufferWithLength:256 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb=[probeQueue commandBuffer];
+    id<MTLBlitCommandEncoder> be=[cb blitCommandEncoder];
+    if(out && be){
+     memset(out.contents,0x7f,256);
+     for(unsigned j=0;j<8;j++)for(unsigned i=0;i<8;i++)
+      [be copyFromTexture:(id<MTLTexture>)texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(w*(2*i+1)/16,h*(2*j+1)/16,0)
+               sourceSize:MTLSizeMake(1,1,1) toBuffer:out destinationOffset:4*(j*8+i) destinationBytesPerRow:4 destinationBytesPerImage:4];
+     [be endEncoding];[cb commit];[cb waitUntilCompleted];
+     if(cb.status==MTLCommandBufferStatusCompleted){
+      const uint8_t *px=(const uint8_t *)out.contents;gpuBlack=0;
+      for(unsigned k=0;k<64;k++)if(px[4*k]+px[4*k+1]+px[4*k+2]<=24)gpuBlack++;
+     }
+    }
+   }
+   NBLOG(@"native-metal: surface %#x %zux%zu seen here: %u/64 black by CPU, %u/64 by GPU (65 = probe failed) (base %p, alloc %zu, label %@)",
+    IOSurfaceGetID(surface),w,h,black,gpuBlack,base,allocation,
+    d.pixelFormat==MTLPixelFormatBGRA8Unorm?@"BGRA8":[NSString stringWithFormat:@"fmt %lu",(unsigned long)d.pixelFormat]);
   }
  }
  return (id<MTLTexture>)texture;
@@ -1845,7 +1906,16 @@ static char sweetMemoryOwnerKey;
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle){NBLOG(@"native-metal: render pipeline refused (vertex %@, fragment %@): %@",d.vertexFunction.name,d.fragmentFunction.name,lastError());
   return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);}
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ {// 0182: what the pipeline is, for the draw trace of full-screen surface textures
+  MTLRenderPipelineColorAttachmentDescriptor *c=d.colorAttachments[0];
+  objc_setAssociatedObject(state,"desc",[NSString stringWithFormat:@"label=%@ vf=%@ ff=%@ fmt=%lu blend=%d rgb=%lu:%lu:%lu a=%lu:%lu:%lu mask=%lu samples=%lu",
+   d.label?:@"",d.vertexFunction.name?:@"-",d.fragmentFunction.name?:@"-",(unsigned long)c.pixelFormat,(int)c.blendingEnabled,
+   (unsigned long)c.sourceRGBBlendFactor,(unsigned long)c.destinationRGBBlendFactor,(unsigned long)c.rgbBlendOperation,
+   (unsigned long)c.sourceAlphaBlendFactor,(unsigned long)c.destinationAlphaBlendFactor,(unsigned long)c.alphaBlendOperation,
+   (unsigned long)c.writeMask,(unsigned long)d.rasterSampleCount],OBJC_ASSOCIATION_RETAIN);
+ }
+ return (id<MTLRenderPipelineState>)state;
 }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
  if(d.url && !d.url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -1863,7 +1933,11 @@ static char sweetMemoryOwnerKey;
      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
  NmbSampler *handle=nmb_sampler_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: sampler refused: %@",lastError());return nil;}
- NBSampler *sampler=[NBSampler new];sampler.handle=handle;return (id<MTLSamplerState>)sampler;
+ NBSampler *sampler=[NBSampler new];sampler.handle=handle;
+ objc_setAssociatedObject(sampler,"desc",[NSString stringWithFormat:@"min=%lu mag=%lu mip=%lu addr=%lu,%lu norm=%d border=%lu",
+  (unsigned long)d.minFilter,(unsigned long)d.magFilter,(unsigned long)d.mipFilter,(unsigned long)d.sAddressMode,(unsigned long)d.tAddressMode,
+  (int)d.normalizedCoordinates,(unsigned long)d.borderColor],OBJC_ASSOCIATION_RETAIN);
+ return (id<MTLSamplerState>)sampler;
 }
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
  auto face=[](MTLStencilDescriptor *s)->NmbStencil {

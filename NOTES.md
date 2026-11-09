@@ -1,3 +1,31 @@
+# Active handoff — the black is in CoreAnimation's draw of the game's texture (2026-11-08, Claude)
+
+- Probe result: game drawables 0x2f/0x30/0x31 in backboardd: 0/64 black by CPU AND 0/64 by GPU (blit through the
+  imported texture). Mapping and GPU import are correct. The composition draw that uses the texture yields black.
+- CHANGE (frontend, bundle rebuild): draw trace. Pipelines remember label/vertex+fragment function names/colour
+  format/blend factors/write mask; samplers their filter/address/normalized/border; render encoders their colour
+  target. Every draw while a >=1000x2000 surface is bound for the fragment stage logs each distinct combination once
+  (max 60): `native-metal: big-texture draw (draw N xI): t0=surf 0x2f 1125x2436 fmt 80 | label=... vf=... ff=...
+  fmt=... blend=... mask=... | samplers ... | target ...`.
+- Test: rebuild/install bundle, reboot, `: > /var/local/mtl2.log`, play ~20 s,
+  `grep -a backboardd /var/local/mtl2.log | grep 'big-texture draw'`.
+- Rebuilt with the draw-trace frontend change, signature-verified, and installed over SSH. Archive:
+  `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-big-texture-draw-trace.tar.gz`,
+  SHA-256 `88ffd2fd25845cf826deafe398d06661fd04dd3ada9af2502fb6d087e2492b40`.
+- Previous bundle preserved as `/System/Library/Extensions/SweetMetal2.bundle.pre-draw-trace-20261108-210725`.
+  Reboot before testing so the services load this build.
+
+# Active handoff — backboardd sees the game's pixels on the CPU (2026-11-08, Claude)
+
+- Result of the "seen here" probe in backboardd: game drawables 0x2f/0x30/0x31 (47/48/49, the game layer's
+  surfaces) 0/64 black through backboardd's own CPU mapping. Other 1125x2436 surfaces (2/3 = CA framebuffer surfaces,
+  etc.) 64/64 black at creation (not yet drawn). No "texture refused", no "command buffer refused" in backboardd.
+  So backboardd's IOSurface mapping is correct; the black compositions come from the GPU side (import or draw).
+- CHANGE (frontend, bundle rebuild): the probe also blits the same 64 points through the new texture with this
+  process's GPU (own queue, waitUntilCompleted) and logs `... N/64 black by CPU, M/64 by GPU (65 = probe failed)`.
+  GPU black while CPU has content -> the GPU import (pinned pages / Turnip host-pointer import) is not the
+  surface's memory. GPU content too -> the composition draw itself (pipeline/sampling) is the problem.
+
 # Active handoff — two separate bugs: wheel GPU hang, black compositions (2026-11-08, Claude)
 
 - HANG report (0179, daily-wheel screen): stuck job = SubwaySurf (3833), CP inside an IB1 with 0x3c3 dwords left,
