@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a25091c..12b7390 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2193,6 +2193,18 @@ redwood_gpu_last(void)
+ 	return be_seqno;
+ }
+ 
++/* 0175: the last fence the GPU has written (0 before the backend runs) */
++uint32_t sweet_gpu_done_fence(void);
++uint32_t
++sweet_gpu_done_fence(void)
++{
++	if (be_fence == NULL) {
++		return 0;
++	}
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCEMEM), 0x1000u, FALSE);
++	return *be_fence;
++}
++
+ void
+ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+ {
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index cd281dc..24b8e8f 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -44,6 +44,8 @@ uint64_t sweet_gpu_pool_avail(void);
+ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
+ int proc_selfpid(void);
+ uint32_t sweet_mtl_pid_submits(int pid, uint32_t *last_fence);
++uint32_t redwood_gpu_last(void);
++uint32_t sweet_gpu_done_fence(void);            /* 0175, sweet_gpu.c */
+ }
+ 
+ /*
+@@ -305,10 +307,28 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 	 * every composition it draws is black).
+ 	 */
+ 	if (r != kIOReturnSuccess) {
+-		uint32_t n = ++fFailLogs;
+-		if (n <= 40 || n % 1000 == 0) {
+-			IOLog("SWEET MTL: %s method %u failed: 0x%x (#%u; GPU pool free %llu MB)\n", fName,
+-			    isz >= 8 && w[0] == SWEET_V2_TUNNEL ? w[1] : selector, r, n, sweet_gpu_pool_avail() >> 20);
++		/*
++		 * 0175: a WaitFence with timeout 0 is Turnip polling ("done yet?"): its kIOReturnTimeout is the normal
++		 * "not yet", thousands a second, not a failure. Only real waits that ran out, and everything else, are logged.
++		 */
++		bool tunnel = isz >= 8 && w[0] == SWEET_V2_TUNNEL;
++		uint32_t method = tunnel ? w[1] : selector;
++		const void *payload = tunnel ? (const void *)(w + 2) : (const void *)args->structureInput;
++		uint32_t psz = tunnel ? isz - 8 : isz;
++		uint64_t timeout_ns = 0, fence = 0;
++		if (method == NativeAdrenoMethodWaitFence && payload != NULL && psz >= sizeof(NativeAdrenoAbiWaitFence)) {
++			const NativeAdrenoAbiWaitFence *wf = (const NativeAdrenoAbiWaitFence *)payload;
++			fence = wf->fence;
++			timeout_ns = wf->timeout_ns;
++		}
++		bool poll = method == NativeAdrenoMethodWaitFence && r == kIOReturnTimeout && timeout_ns == 0;
++		if (!poll) {
++			uint32_t n = ++fFailLogs;
++			if (n <= 60 || n % 100 == 0) {
++				IOLog("SWEET MTL: %s method %u failed: 0x%x (#%u; fence %llu, wait %llu ms; GPU done %u of %u; pool free %llu MB)\n",
++				    fName, method, r, n, fence, timeout_ns / 1000000ull, sweet_gpu_done_fence(), redwood_gpu_last(),
++				    sweet_gpu_pool_avail() >> 20);
++			}
+ 		}
+ 	}
+ 	return r;

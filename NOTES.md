@@ -1,3 +1,22 @@
+# Active handoff — 0175 log only real GPU failures (2026-11-08, Claude)
+
+- 0174 result: thousands/s of `method 6 failed: 0xe00002d6` (kIOReturnTimeout) in every process. These are Turnip's
+  WaitFence polls with timeout 0 ("not done yet"), normal; the flood hid the real failures (backboardd's first 40
+  lines were already gone). mtl2.log DeviceLost count 103470 is cumulative (file not cleared), so 0174's
+  ring-wait effect is unknown. Composited frames still 100% black.
+- NEW `xnu/patches/0175-guacamole-mtl-log-real-failures.patch` (SweetAccelerator.cpp + bsd/dev/sweet_gpu.c, after
+  0174): polls are not logged; every other failure (incl. WaitFence with a real timeout) logs fence, wait ms,
+  GPU done fence vs last submitted (`GPU done X of Y`: X stuck far behind Y = GPU hang), pool free.
+  First 60 per client, then every 100th. New `sweet_gpu_done_fence()` in sweet_gpu.c.
+- Test: `: > /var/local/mtl2.log`, reboot into 0169-0175, reproduce, then
+  `dmesg | grep 'SWEET MTL: .*failed'` and
+  `grep -a backboardd /var/local/mtl2.log | grep -B40 -m1 DeviceLost` (what backboardd did right before the loss).
+- Built kernel and boot image locally with Xcode 27.2 / macOS 13.5 KDK 22G74. Verified the kernel contains the
+  detailed failure log (`fence`, `wait`, `GPU done X of Y`, pool free) and ring-space wait message.
+- Boot image `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0175-60hz-gpu-two-layers.img`,
+  SHA-256 `3f0f45a78b0494b7d9f16f6b960b3759ab0f79fdc6e1e6d244b27385d5bc9441`. It uses the usual 60 Hz GPU-present
+  args with kernel patches 0169-0175. Not transferred or booted.
+
 # Active handoff — 0174 backboardd's Metal device is lost (2026-11-08, Claude)
 
 - backboardd's mtl2.log: dozens of `commandBuffer refused: command buffer: DeviceLost` (also texture / no-copy
