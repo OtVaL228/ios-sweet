@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 20847bb..155b90b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1299,10 +1299,25 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 				} else {
+ 					sweet_fb_stats.black_other++;
+ 				}
+-				if (sweet_fb_black_logged < 40) {
+-					sweet_fb_black_logged++;
+-					IOLog("SWEET FB: black at display: swap %u layer %u surface %u (%s, %u layer(s)) %u/64 black\n",
+-					    get32(rec, 0x50), l, s->id, game ? "game" : "other", layers, black);
++				/* 0183: the first 40, then every 150th (the first ones had rolled out of the log by the time it was read) */
++				uint32_t nb = ++sweet_fb_black_logged;
++				if (nb <= 40 || nb % 150 == 0) {
++					IOLog("SWEET FB: black at display #%u: swap %u layer %u surface %u (%s, %u layer(s)) %u/64 black\n",
++					    nb, get32(rec, 0x50), l, s->id, game ? "game" : "other", layers, black);
++					/* every enabled layer of that swap: surface, size, rects, the flag bytes */
++					uint32_t m = get32(rec, 0x104);
++					for (uint32_t q = 0; q < SWEET_FB_LAYERS; q++) {
++						uint32_t qid = get32(rec, 0x54 + 4 * q);
++						if (!(m & (1u << q))) {
++							continue;
++						}
++						const uint8_t *qa = rec + 0x64 + 16 * q, *qb = rec + 0xc4 + 16 * q;
++						IOLog("SWEET FB:   layer %u surface %u a %d,%d %dx%d b %d,%d %dx%d xform %u flags %02x %02x %02x %02x %02x %02x\n",
++						    q, qid, (int32_t)get32(qa, 0), (int32_t)get32(qa, 4), (int32_t)get32(qa, 8), (int32_t)get32(qa, 12),
++						    (int32_t)get32(qb, 0), (int32_t)get32(qb, 4), (int32_t)get32(qb, 8), (int32_t)get32(qb, 12),
++						    get32(rec, 0x114 + 4 * q), rec[0x2ca + q], rec[0x2cc + q], rec[0x2e3 + q], rec[0x2e5 + q],
++						    rec[0x2e6 + q], rec[0x467 + q]);
++					}
+ 				}
+ 			}
+ 			/* the top layer whole */

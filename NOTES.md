@@ -1,3 +1,18 @@
+# Active handoff — backboardd never draws the game's texture in black frames (2026-11-08, Claude)
+
+- Draw-trace result (bundle with 'big-texture draw' confirmed installed): while 60-68 black "other top layer"
+  frames per 5 s were shown, backboardd made NO draw sampling a >=1000x2000 surface. CoreAnimation does not draw the
+  game into those compositions at all; it presumably expects the game as a separate display layer.
+- NEW `xnu/patches/0183-guacamole-fb-black-frame-layout.patch` (SweetFramebuffer.cpp, after 0179; kernel patch
+  numbers 0180-0182 were used as labels for frontend changes): black-at-display lines now the first 40 then every
+  150th, each followed by every enabled layer of that swap (`SWEET FB:   layer q surface id a .. b .. xform flags`).
+- Test: build 0169-0183 kernel, play ~30 s, `dmesg | grep -A4 'black at display' | tail -40`.
+- Built the kernel with the prior XNU patches through 0179 plus 0183 using Xcode 27.2 / macOS 13.5 KDK 22G74.
+  Verified the image contains the new per-layer black-frame layout logs and boot arg `sweetgpuhangms=150`.
+- Boot image: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0183-60hz-gpu-two-layers.img`,
+  SHA-256 `98f11e70190bcb68c5a1a8cc4541e6a3337f61e303cba75b4055e573620f4948`. It uses the usual 60 Hz GPU-present
+  args; `sweetmtlringwait` is omitted. Not transferred or booted.
+
 # Active handoff — the black is in CoreAnimation's draw of the game's texture (2026-11-08, Claude)
 
 - Probe result: game drawables 0x2f/0x30/0x31 in backboardd: 0/64 black by CPU AND 0/64 by GPU (blit through the
