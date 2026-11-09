@@ -1,5 +1,37 @@
+# Active handoff — 0173 where does the black come from (2026-11-08, Claude)
+
+- 0172 user report: game is a bit better while running, menus flicker MORE; "still the original issue".
+  Slow-motion video (120 fps) frames: (a) menus: whole screen black except iOS home indicator and a thin edge strip;
+  (b) gameplay: HUD (score, coins, pause, GET) intact while the 3D scene is black, sometimes with one clean
+  rectangle of scene (GMEM-bin-like) drawn. The display-path hypotheses (0169-0172) did not explain this.
+- The frontend's old "frame grid" sampler showed 0 black regions, but it is NOT valid for Subway Surfers: every
+  drawable is presented from a present-only command buffer (work=0/0/0/0) and the sample ran before waiting for
+  the prior work buffers, i.e. possibly on the previous frame.
+- NEW measurement at both ends:
+  - `xnu/patches/0173-guacamole-fb-display-black-samples.patch` (after 0172): presentGPU samples the top layer
+    8x8 (rows cache-invalidated) as the blit is queued. 5 s line `display-time samples: game layer N frames, N black;
+    other top layer N frames, N black`, plus up to 40 `SWEET FB: black at display: ...` lines.
+  - `userland/metal2/NativeBridgeMetalFrontend.mm`: sample (8x8 via getBytes) inside the present block AFTER prior
+    work completed, right before `[drawable present]`: `pre-present black frame #...` (first 20) and
+  `pre-present totals: N frames, N black` every 120 frames (into /var/local/mtl2.log).
+- Built locally with Xcode 27.2 / macOS 13.5 KDK 22G74. Kernel contains both display-time sample strings; Metal bundle
+  contains both pre-present sample strings and passes `codesign --verify --deep --strict`.
+- Artifacts (not installed or booted):
+  - `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0173-60hz-gpu-two-layers.img`, SHA-256
+    `53631f0cd10b9a9461aa606155bdedd0d44daffe27314be0a65970f43d168857`.
+  - `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-0173-black-samples.tar.gz`, SHA-256
+    `326d5fcf7d35bb0353f996b02be2de681f2f96b1e83b6dd84af18ff505d96c86`.
+- Image uses the known 60 Hz GPU-present arguments (`sweetfbgpu=1 sweetfbsync=1 sweetfbcompose=1
+  sweetfbopaqueflag=1 sweetfb_refresh=60 sweetfb_vsync=60`) with the same existing 0172 kernel behavior plus
+  0173 display sampling. `sweetmtlsyncsubmit` remains off.
+- Reading: pre-present black > 0 → the game's finished frames are black (rendering/sync inside metal2vulkan/Turnip).
+  Pre-present 0 but display-time black > 0 → the surface changes after hand-over (drawable reused/re-rendered while
+  still on screen, or cache). "other top layer" black with home indicator → CA's own composite is black.
+
 # Active handoff — 0172 two layers on the GPU (2026-11-08, Claude)
 
+- 0172 hardware result (Subway Surfers): every frame on the GPU, CPU-composed 0, 51-59 swaps/s in play,
+  SwapWait never timed out. Flicker status after 0172: awaiting user's visual report.
 - 0171 hardware result: game visible; long stretches at ~60 fps with every frame GPU-blitted (top layer alone).
   Other stretches still CPU-composed (27-38 ms/frame) because (1) the game layer's alpha is not all 255
   (samples 255:61 mid:3) and (2) the game layer is sometimes 1125x2226 over CA's layer (bottom strip visible).

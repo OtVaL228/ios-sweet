@@ -1,0 +1,92 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 57598c6..20847bb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,11 @@ static struct {
+ 	/* 0170: composed frames, their layers drawn opaque / blended, GPU blits still running before one, its cost */
+ 	uint32_t composed, comp_opaque, comp_blend, comp_skipped, comp_gpu_wait;
+ 	uint32_t top_only;                      /* 0171: multi-layer frames shown as their opaque top layer, on the GPU */
++	/*
++	 * 0173: what the display reads. Top layer sampled (8x8 RGB) as the GPU blit is queued: frames of the game's
++	 * flagged layer / of any other top layer, and those with >= 16 of 64 samples black.
++	 */
++	uint32_t seen_game, black_game, seen_other, black_other;
+ 	uint64_t comp_time;
+ 	uint32_t sel[128];
+ } sweet_fb_stats;
+@@ -460,6 +465,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				    sweet_fb_stats.composed, us / sweet_fb_stats.composed, sweet_fb_stats.comp_opaque,
+ 				    sweet_fb_stats.comp_blend, sweet_fb_stats.comp_skipped, sweet_fb_stats.comp_gpu_wait);
+ 			}
++			IOLog("SWEET FB: 5s: display-time samples: game layer %u frames, %u black; other top layer %u frames, %u black\n",
++			    sweet_fb_stats.seen_game, sweet_fb_stats.black_game, sweet_fb_stats.seen_other, sweet_fb_stats.black_other);
+ 			if (sweet_fb_stats.top_only != 0) {
+ 				IOLog("SWEET FB: 5s: multi-layer frames shown on the GPU (opaque top layer, bottom layer around it): %u\n",
+ 				    sweet_fb_stats.top_only);
+@@ -1161,6 +1168,39 @@ sweet_fb_part(const AppleCLCD *fb, uint64_t src, SweetSurface *s, int32_t sx, in
+ 	return true;
+ }
+ 
++/* 0173: of 64 samples of the layer's source rectangle (rows cache-invalidated), how many are black (RGB sum <= 24) */
++static uint32_t
++sweet_fb_layer_black(SweetSurface *s, const uint8_t *a)
++{
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++	int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++	uintptr_t src = s->kernelAddress();
++	if (sw <= 0 || sh <= 0) {
++		sw = (int32_t)s->width;
++		sh = (int32_t)s->height;
++	}
++	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || sx < 0 || sy < 0 || sx + sw > (int32_t)s->width ||
++	    sy + sh > (int32_t)s->height ||
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++		return 0;
++	}
++	uint32_t black = 0;
++	for (int32_t j = 0; j < 8; j++) {
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
++		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
++		const uint32_t *row = (const uint32_t *)(src + off);
++		for (int32_t i = 0; i < 8; i++) {
++			uint32_t p = row[(sw * (2 * i + 1)) / 16];
++			if (((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff) <= 24) {
++				black++;
++			}
++		}
++	}
++	return black;
++}
++
++static uint32_t sweet_fb_black_logged;
++
+ /* 1 shown (queued on the GPU), 0 not for the GPU (the CPU path shows it), -1 the GPU is busy: next vsync */
+ int
+ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -1245,6 +1285,26 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		}
+ 		avoid = slot;
+ 		if (i == 0) {
++			/* 0173: is the picture the display is about to copy black already? */
++			uint32_t black = sweet_fb_layer_black(s, a);
++			bool game = rec[0x467 + l] != 0;
++			if (game) {
++				sweet_fb_stats.seen_game++;
++			} else {
++				sweet_fb_stats.seen_other++;
++			}
++			if (black >= 16) {
++				if (game) {
++					sweet_fb_stats.black_game++;
++				} else {
++					sweet_fb_stats.black_other++;
++				}
++				if (sweet_fb_black_logged < 40) {
++					sweet_fb_black_logged++;
++					IOLog("SWEET FB: black at display: swap %u layer %u surface %u (%s, %u layer(s)) %u/64 black\n",
++					    get32(rec, 0x50), l, s->id, game ? "game" : "other", layers, black);
++				}
++			}
+ 			/* the top layer whole */
+ 			tx0 = dx;
+ 			ty0 = dy;
