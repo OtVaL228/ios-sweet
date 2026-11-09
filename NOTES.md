@@ -1,3 +1,30 @@
+# Active handoff — two separate bugs: wheel GPU hang, black compositions (2026-11-08, Claude)
+
+- HANG report (0179, daily-wheel screen): stuck job = SubwaySurf (3833), CP inside an IB1 with 0x3c3 dwords left,
+  rptr == wptr, RBBM_STATUS 0xe795e5 (CP, TSE, RAS, RB, CCU, LRZ, PC_DCALL, VFD, VPC, UCHE, SP, HLSQ busy; A2D idle):
+  a 3D draw whose shader never finishes. SMMU FSR 0x400 = format field only, no fault; FAR stale. No GPU watchdog,
+  so the phone stays frozen. pipelines.log tail before the freeze: Unity shaders TextMeshPro/Mobile/Distance Field,
+  UI/Default, SYBO/Bend/Specials/Coin Glow, SYBO/Bend/Combined (no obvious wheel-only shader yet).
+  TODO: kernel GPU hang recovery (hangcheck + reset + fail the job) like msm's a6xx_recover; find the looping shader.
+- Flicker is a SEPARATE bug: with a cleared mtl2.log, backboardd DeviceLost = 0 and no refused submits, yet
+  composited ("other top layer") frames are still 100% black. Earlier DeviceLost lines were from old boots.
+- CHANGE (userland, bundle rebuild): `newTextureWithDescriptor:iosurface:plane:` returned nil SILENTLY when
+  IOSurfaceGetBaseAddress() is 0/misaligned in the calling process. Now logs once per surface ID:
+  `native-metal: surface 0x.. 'BGRA' WxH texture refused: base 0x0 alloc N (no mapping in this process?)`.
+  (Correction: the kernel `SWEET SURF: wk ... -> 0x0` lines are IOReturn success for WebKit surfaces only; not
+  evidence. The refused grep in backboardd was empty.)
+- CHANGE 2 (same file): when a process makes a texture from a >=1000x2000 BGRA/RGBA surface, once per surface ID it
+  samples 64 points through its own mapping (dcache invalidated) and logs
+  `native-metal: surface 0x.. WxH seen here: N/64 black (base, alloc, seed)`. In backboardd for the game's drawables:
+  mostly black -> backboardd's mapping is not the game's memory (kernel IOSurface mapping); content -> GPU-side
+  import/draw problem. Test: rebuild bundle, play ~20 s, `grep -a backboardd /var/local/mtl2.log | grep -E 'seen here|texture refused'`.
+- Rebuilt with the current userland sources and verified the ad-hoc signature. Archive:
+  `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-surface-map-sample.tar.gz`,
+  SHA-256 `1095bc94df5cddb2f643732df33eb22cd55374206c5644324de842d8bf02f7db`.
+- Installed over SSH at `/System/Library/Extensions/SweetMetal2.bundle`; previous bundle preserved as
+  `SweetMetal2.bundle.pre-surface-sample-20261108-203822`. The running services have not been restarted; reload the
+  bundle via reboot or service restart before testing.
+
 # Active handoff — 0179 hang report survives (2026-11-08, Claude)
 
 - 0178 frontend result: "is not a MTLFunction" boot spam GONE; composited frames still 100% black (not the cause;

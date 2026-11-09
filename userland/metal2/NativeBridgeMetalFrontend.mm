@@ -8,6 +8,7 @@
 // Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <os/lock.h>
 #import <objc/runtime.h>
@@ -20,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -41,6 +43,51 @@ static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gComp
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
+static std::atomic<uint64_t> gDrawablePresentQueued,gDrawablePresentIssued,gDrawablePresentSkipped,gDrawableSamples;
+static std::atomic<uint64_t> gDrawableActuallyPresented;
+static std::atomic<uint64_t> gWorkCommits;
+static std::atomic<uint64_t> gPresentPriorWorkWaits;
+static std::atomic<uint64_t> gPassDetailLogs;
+static std::atomic<uint64_t> gDrawableStoreOverrides;
+static std::atomic<uint64_t> gLateStoreActionLogs;
+static std::atomic<uint64_t> gLateStoreOverrides;
+static std::mutex gDrawableSampleLock;
+static uint64_t gBlackRegionSamples[5];
+static dispatch_queue_t gDrawablePresentQueue;
+// 0169 (kernel patch of the same number): in backboardd, a commit that draws into IOSurfaces returns only once the
+// runtime has submitted it to the GPU, so CoreAnimation's next IOMobileFramebuffer swap finds the frame's drawing
+// already on the ring (the display's blit is queued behind it). Boot-arg sweetmtlsyncsubmit=1 turns it on; off by default.
+static std::atomic<uint64_t> gSyncSubmitWaits;
+// 0173: the drawable sampled (8x8 grid) right before CoreAnimation gets it, after its drawing has completed: frames,
+// and those with >= 16 of 64 samples black. The older "frame grid" sample ran before a present-only command buffer
+// waited for the frame's work, so it could read the previous frame.
+static std::atomic<uint64_t> gPrePresentFrames,gPrePresentBlack;
+static unsigned prePresentBlackSamples(id<MTLTexture> texture) {
+ const MTLPixelFormat f=texture.pixelFormat;
+ if(![(id)texture isKindOfClass:NSClassFromString(@"NBTexture")] || texture.width<16 || texture.height<16 ||
+    !(f==MTLPixelFormatBGRA8Unorm || f==MTLPixelFormatRGBA8Unorm || f==MTLPixelFormatBGRA8Unorm_sRGB || f==MTLPixelFormatRGBA8Unorm_sRGB))return 0;
+ unsigned black=0;
+ for(unsigned j=0;j<8;j++)for(unsigned i=0;i<8;i++){
+  uint8_t px[4]={};
+  [texture getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(texture.width*(2*i+1)/16,texture.height*(2*j+1)/16,1,1) mipmapLevel:0];
+  if(px[0]+px[1]+px[2]<=24)black++;
+ }
+ return black;
+}
+static bool syncSubmitEnabled(void) {
+ static bool on;static dispatch_once_t once;
+ dispatch_once(&once,^{
+  if(strcmp(getprogname(),"backboardd")!=0)return;
+  char args[1024]={};size_t size=sizeof(args)-1;
+  if(sysctlbyname("kern.bootargs",args,&size,NULL,0)==0)on=strstr(args,"sweetmtlsyncsubmit=1")!=NULL;
+ });
+ return on;
+}
+static dispatch_queue_t drawablePresentQueue(void) {
+ static dispatch_once_t once;
+ dispatch_once(&once,^{gDrawablePresentQueue=dispatch_queue_create("org.blu-sharky.metal2.drawable-present",DISPATCH_QUEUE_SERIAL);});
+ return gDrawablePresentQueue;
+}
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -362,6 +409,8 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+- (MTLPatchType)patchType {return MTLPatchTypeNone;}
+- (NSInteger)patchControlPointCount {return 0;}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -567,6 +616,8 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+@property(nonatomic,strong) NSMutableArray<id<MTLDrawable>> *presentDrawables;
+@property(nonatomic,strong) NSArray *priorWorkBuffers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
 @property(atomic,strong) NSMutableDictionary *userDictionary;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
@@ -674,6 +725,7 @@ static void waitForResource(id resource) {
 @end
 
 @interface NBRenderEncoder : NBEncoder
+@property(nonatomic) BOOL drawableTarget;
 @end
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
@@ -699,6 +751,12 @@ static void waitForResource(id resource) {
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])samplers withRange:(NSRange)range {
+ for(NSUInteger k=0;k<range.length;k++)[self sampler:samplers[k] index:range.location+k stage:1];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])samplers withRange:(NSRange)range {
+ for(NSUInteger k=0;k<range.length;k++)[self sampler:samplers[k] index:range.location+k stage:2];
+}
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
@@ -725,6 +783,23 @@ static void waitForResource(id resource) {
 - (void)setLineWidth:(float)width {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
  [self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];
+}
+- (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index {
+ MTLStoreAction effective=action;
+ const uint64_t logIndex=++gLateStoreActionLogs;
+ if(self.drawableTarget && index==0 && action==MTLStoreActionUnknown){
+  effective=MTLStoreActionStore;
+  const uint64_t overrideIndex=++gLateStoreOverrides;
+  if(overrideIndex<=3 || overrideIndex%120==0)NBLOG(@"native-metal: late drawable store Unknown overridden to Store #%llu",(unsigned long long)overrideIndex);
+ }
+ if(logIndex<=3 || logIndex%120==0)NBLOG(@"native-metal: setColorStoreAction index=%lu requested=%lu effective=%lu drawable=%d",(unsigned long)index,(unsigned long)action,(unsigned long)effective,(int)self.drawableTarget);
+ [self check:nmb_render_set_color_store_action(self.handle,effective,(uint32_t)index) what:"setColorStoreAction"];
+}
+- (void)setDepthStoreAction:(MTLStoreAction)action {
+ [self check:nmb_render_set_depth_store_action(self.handle,action) what:"setDepthStoreAction"];
+}
+- (void)setStencilStoreAction:(MTLStoreAction)action {
+ [self check:nmb_render_set_stencil_store_action(self.handle,action) what:"setStencilStoreAction"];
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
  [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
@@ -793,6 +868,14 @@ static void waitForResource(id resource) {
  }
  return true;
 }
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture {
+ if(![self textures:NB_OBJECTS(texture) count:1])return;
+ // Turnip has no separate texture residency optimization step; Metal's operation is a no-op here.
+}
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {
+ (void)slice;(void)level;
+ if(![self textures:NB_OBJECTS(texture) count:1])return;
+}
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
  [self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"];
@@ -840,7 +923,7 @@ static void completed(void *context);
 static void scheduled(void *context);
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_userDictionary=[NSMutableDictionary dictionary];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentDrawables=[NSMutableArray array];_surfaces=[NSMutableSet set];_userDictionary=[NSMutableDictionary dictionary];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self)createdUs=nowUs();
  return self;
 }
@@ -893,11 +976,15 @@ static void scheduled(void *context);
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
  NmbRenderPassDescriptor pass={};
+ BOOL drawableTarget=NO;
  {
   id<MTLTexture> first=d.colorAttachments[0].texture;
   if(first) {
+   drawableTarget=[first.label isEqualToString:@"CAMetalLayer Display Drawable"];
    const uint64_t pixels=(uint64_t)first.width*first.height;
    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
+   const uint64_t passIndex=++gPassDetailLogs;
+   if(passIndex<=3 || passIndex%30==0)NBLOG(@"native-metal: render target #%llu %lux%lu format=%lu load=%lu store=%lu label=%@",(unsigned long long)passIndex,(unsigned long)first.width,(unsigned long)first.height,(unsigned long)first.pixelFormat,(unsigned long)d.colorAttachments[0].loadAction,(unsigned long)d.colorAttachments[0].storeAction,first.label?:@"");
    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
    if(pixels>=2000000)gFullScreenPasses++;
   }
@@ -913,6 +1000,12 @@ static void scheduled(void *context);
  for(unsigned i=0;i<8;i++) {
   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
   if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
+  if(c.texture && c.storeAction==MTLStoreActionUnknown &&
+     [c.texture.label isEqualToString:@"CAMetalLayer Display Drawable"]){
+   pass.colors[i].store=MTLStoreActionStore;
+   const uint64_t overrideIndex=++gDrawableStoreOverrides;
+   if(overrideIndex<=3 || overrideIndex%120==0)NBLOG(@"native-metal: CAMetalLayer drawable store Unknown overridden to Store #%llu attachment=%u",(unsigned long long)overrideIndex,i);
+  }
   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
  }
  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
@@ -923,10 +1016,25 @@ static void scheduled(void *context);
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ id encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if([encoder isKindOfClass:[NBRenderEncoder class]])((NBRenderEncoder *)encoder).drawableTarget=drawableTarget;
+ return encoder;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+- (void)presentDrawable:(id<MTLDrawable>)drawable {
+ if(!drawable || ![drawable respondsToSelector:@selector(present)]){[self refuse:@"presentDrawable: invalid drawable"];return;}
+ id<MTLTexture> texture=((id<CAMetalDrawable>)drawable).texture;
+ const uint64_t queued=++gDrawablePresentQueued;
+ if(queued<=3 || queued%120==0) {
+  const uint32_t surface=[(id)texture isKindOfClass:[NBTexture class]] && ((NBTexture *)texture).surface ? IOSurfaceGetID(((NBTexture *)texture).surface) : 0;
+  NBLOG(@"native-metal: drawable queued #%llu class=%@ texture=%@ %lux%lu IOSurface=%u",(unsigned long long)queued,NSStringFromClass([(id)drawable class]),NSStringFromClass([(id)texture class]),(unsigned long)texture.width,(unsigned long)texture.height,surface);
+ }
+ @synchronized(self){
+  if(self.committed){[self refuse:@"presentDrawable: after commit"];return;}
+  [_presentDrawables addObject:drawable];
+ }
+}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
@@ -937,7 +1045,6 @@ static void scheduled(void *context);
 }
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:true];}
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
-// The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
 - (void)didSchedule {
  {
   const uint64_t took=nowUs()-self.committedUs;
@@ -960,6 +1067,78 @@ static void scheduled(void *context);
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
+ NSArray<id<MTLDrawable>> *drawables;
+ @synchronized(self){drawables=[_presentDrawables copy];[_presentDrawables removeAllObjects];}
+ const MTLCommandBufferStatus status=self.status;
+ if(status==MTLCommandBufferStatusCompleted)for(id<MTLDrawable> drawable in drawables){
+  @try {
+   // The Metal bridge's Vulkan fence is not visible to CoreAnimation. Do not
+   // publish a drawable until Turnip has finished writing its IOSurface.
+   id<MTLDrawable> retainedDrawable=drawable;
+   const uint32_t commitIndex=self.commitIndex;
+   const BOOL hasWork=encodedWork.passes || encodedWork.draws || encodedWork.dispatches || encodedWork.blits;
+   NSArray<NBCommandBuffer *> *priorWorkBuffers=self.priorWorkBuffers;
+   dispatch_async(drawablePresentQueue(),^{
+    @try {
+     if(!hasWork){
+      const uint64_t waitBegan=nowUs();
+      for(NBCommandBuffer *workBuffer in priorWorkBuffers)[workBuffer waitUntilCompleted];
+      const uint64_t waitUs=nowUs()-waitBegan;
+      const uint64_t waited=++gPresentPriorWorkWaits;
+      if(waited<=3 || waited%120==0)NBLOG(@"native-metal: present-only prior work fences complete #%llu commit=%u buffers=%lu wait=%llu us",(unsigned long long)waited,commitIndex,(unsigned long)priorWorkBuffers.count,(unsigned long long)waitUs);
+     }
+     [retainedDrawable addPresentedHandler:^(id<MTLDrawable> presented){
+      const uint64_t count=++gDrawableActuallyPresented;
+      if(count<=3 || count%120==0)NBLOG(@"native-metal: CoreAnimation presented #%llu drawableID=%lu time=%.6f",(unsigned long long)count,(unsigned long)presented.drawableID,presented.presentedTime);
+     }];
+     {
+      // 0173: what CoreAnimation is about to be given
+      const unsigned black=prePresentBlackSamples(((id<CAMetalDrawable>)retainedDrawable).texture);
+      const uint64_t frames=++gPrePresentFrames;
+      if(black>=16){
+       const uint64_t b=++gPrePresentBlack;
+       if(b<=20)NBLOG(@"native-metal: pre-present black frame #%llu commit=%u %u/64 black",(unsigned long long)b,commitIndex,black);
+      }
+      if(frames%120==0)NBLOG(@"native-metal: pre-present totals: %llu frames, %llu black",(unsigned long long)frames,(unsigned long long)gPrePresentBlack.load());
+     }
+     [retainedDrawable present];
+     const uint64_t issued=++gDrawablePresentIssued;
+     if(issued<=3 || issued%120==0)NBLOG(@"native-metal: drawable presented after Vulkan completion #%llu commit=%u work=%d",(unsigned long long)issued,commitIndex,(int)hasWork);
+    } @catch(NSException *exception){NBLOG(@"native-metal: completed drawable present exception: %@",exception.reason);}
+   });
+   const uint64_t sampleIndex=++gDrawableSamples;
+   id<MTLTexture> texture=((id<CAMetalDrawable>)drawable).texture;
+   const MTLPixelFormat format=texture.pixelFormat;
+   if([texture isKindOfClass:[NBTexture class]] &&
+      (format==MTLPixelFormatBGRA8Unorm || format==MTLPixelFormatRGBA8Unorm ||
+       format==MTLPixelFormatBGRA8Unorm_sRGB || format==MTLPixelFormatRGBA8Unorm_sRGB) && texture.width>=8 && texture.height>=8) {
+    const NSUInteger xs[5]={texture.width/4,3*texture.width/4,texture.width/2,texture.width/4,3*texture.width/4};
+    const NSUInteger ys[5]={texture.height/4,texture.height/4,texture.height/2,3*texture.height/4,3*texture.height/4};
+    unsigned nonblack[5]={};uint64_t means[5]={};
+    for(unsigned regionIndex=0;regionIndex<5;regionIndex++){
+     uint8_t pixels[8*8*4]={};
+     const MTLRegion region=MTLRegionMake2D(xs[regionIndex]-4,ys[regionIndex]-4,8,8);
+     [texture getBytes:pixels bytesPerRow:8*4 bytesPerImage:8*8*4 fromRegion:region mipmapLevel:0 slice:0];
+     uint64_t sum=0;
+     for(unsigned p=0;p<64;p++){const unsigned rgb=pixels[p*4]+pixels[p*4+1]+pixels[p*4+2];sum+=rgb;if(rgb>24)nonblack[regionIndex]++;}
+     means[regionIndex]=sum/(64*3);
+    }
+    if(sampleIndex<=3 || sampleIndex%30==0){
+     NBLOG(@"native-metal: frame grid #%llu commit=%u work=%u/%u/%u/%u pixels=%llu nonblack=%u,%u,%u,%u,%u mean=%llu,%llu,%llu,%llu,%llu",(unsigned long long)sampleIndex,self.commitIndex,self->encodedWork.draws,self->encodedWork.passes,self->encodedWork.dispatches,self->encodedWork.blits,(unsigned long long)(self->encodedWork.pixels>>10),nonblack[0],nonblack[1],nonblack[2],nonblack[3],nonblack[4],(unsigned long long)means[0],(unsigned long long)means[1],(unsigned long long)means[2],(unsigned long long)means[3],(unsigned long long)means[4]);
+    }
+    {std::lock_guard<std::mutex> lock(gDrawableSampleLock);for(unsigned i=0;i<5;i++)if(!nonblack[i])gBlackRegionSamples[i]++;}
+    if(sampleIndex%120==0){
+     std::lock_guard<std::mutex> lock(gDrawableSampleLock);
+     NBLOG(@"native-metal: black-region totals at #%llu TL,TR,C,BL,BR=%llu,%llu,%llu,%llu,%llu",(unsigned long long)sampleIndex,(unsigned long long)gBlackRegionSamples[0],(unsigned long long)gBlackRegionSamples[1],(unsigned long long)gBlackRegionSamples[2],(unsigned long long)gBlackRegionSamples[3],(unsigned long long)gBlackRegionSamples[4]);
+    }
+   } else if(sampleIndex<=3 || sampleIndex%30==0) {
+    NBLOG(@"native-metal: frame grid #%llu skipped format=%lu texture=%@",(unsigned long long)sampleIndex,(unsigned long)format,NSStringFromClass([(id)texture class]));
+   }
+  } @catch(NSException *exception){NBLOG(@"native-metal: drawable present exception: %@",exception.reason);}
+ } else if(drawables.count) {
+  const uint64_t skipped=++gDrawablePresentSkipped;
+  NBLOG(@"native-metal: drawable present skipped #%llu command status=%u",(unsigned long long)skipped,(unsigned)status);
+ }
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
@@ -981,22 +1160,54 @@ static void scheduled(void *context);
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
- {
-  std::lock_guard<std::mutex> lock(gCommitLock);
-  // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
-  const uint32_t index=(uint32_t)(gCommits.fetch_add(1)+1);self.commitIndex=index;
-  CommitRecord &r=gCommitRing[index%32];
-  r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
- }
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
- @synchronized(gInFlight){[gInFlight addObject:self];}
+ @synchronized(gInFlight){
+  // Serialize commit indices with publication to gInFlight. A presentation-only buffer
+  // captures every earlier GPU-work submission still outstanding, including work on
+  // another logical Metal command queue in this process.
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   const uint32_t index=(uint32_t)(gCommits.fetch_add(1)+1);self.commitIndex=index;
+   CommitRecord &r=gCommitRing[index%32];
+   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
+   if(encodedWork.passes || encodedWork.draws || encodedWork.dispatches || encodedWork.blits){
+    const uint64_t workIndex=++gWorkCommits;
+    if(workIndex<=3 || workIndex%30==0){
+     NSUInteger drawableCount=0;@synchronized(self){drawableCount=_presentDrawables.count;}
+     NBLOG(@"native-metal: work commit #%llu index=%u drawables=%lu draws=%u passes=%u dispatches=%u blits=%u pixels=%llu",(unsigned long long)workIndex,index,(unsigned long)drawableCount,encodedWork.draws,encodedWork.passes,encodedWork.dispatches,encodedWork.blits,(unsigned long long)(encodedWork.pixels>>10));
+    }
+   }
+  }
+  if(!encodedWork.passes && !encodedWork.draws && !encodedWork.dispatches && !encodedWork.blits){
+   NSMutableArray *prior=[NSMutableArray array];
+   for(NBCommandBuffer *buffer in gInFlight){
+    const BOOL hasWork=buffer->encodedWork.passes || buffer->encodedWork.draws || buffer->encodedWork.dispatches || buffer->encodedWork.blits;
+    if(buffer.commitIndex<self.commitIndex && hasWork)[prior addObject:buffer];
+   }
+   self.priorWorkBuffers=[prior copy];
+  }
+  [gInFlight addObject:self];
+ }
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
-  if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
+  const bool callbacks=nmb_command_buffer_on_completed(_handle,completed,context) &&
+                       nmb_command_buffer_on_scheduled(_handle,scheduled,context);
+  if(callbacks){
+   // decided before the commit: completion (another thread) empties _surfaces
+   const BOOL syncWait=_surfaces.count && syncSubmitEnabled();
+   if(nmb_command_buffer_commit(_handle)){
+    if(syncWait){
+     // runtime-level wait only: no dispatch-group wait on scheduled handlers from CoreAnimation's render thread
+     (void)nmb_command_buffer_wait_scheduled(_handle);
+     const uint64_t n=++gSyncSubmitWaits;
+     if(n<=3 || n%600==0)NBLOG(@"native-metal: sync submit #%llu waited %llu us",(unsigned long long)n,(unsigned long long)(nowUs()-self.committedUs));
+    }
+    return;
+   }
+  }
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
@@ -1344,6 +1555,12 @@ static char sweetMemoryOwnerKey;
 - (NSString *)name {return gName;}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+// Metal's measured heap placement contract: the requested byte count, aligned to 256 bytes.
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ (void)options;
+ MTLSizeAndAlign result = {length, 256};
+ return result;
+}
 - (BOOL)hasUnifiedMemory {return YES;}
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
@@ -1477,7 +1694,18 @@ static char sweetMemoryOwnerKey;
  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
  if(!surface || !d || (planes?plane>=planes:plane!=0)){NBLOG(@"native-metal: surface texture refused: plane %lu of %lu",(unsigned long)plane,(unsigned long)planes);return nil;}
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){
+  // 0180: this refusal was silent; a backboardd composition of another process's surface (a game's drawable) then
+  // drew nothing (suspected: the black compositions). Logged once per surface ID.
+  static std::mutex lock;static NSMutableSet<NSNumber *> *said;
+  std::lock_guard<std::mutex> guard(lock);if(!said)said=[NSMutableSet set];
+  NSNumber *sid=@(IOSurfaceGetID(surface));
+  if(![said containsObject:sid] && said.count<200){[said addObject:sid];
+   const uint32_t f=IOSurfaceGetPixelFormat(surface);
+   NBLOG(@"native-metal: surface %#x '%c%c%c%c' %zux%zu texture refused: base %p alloc %zu (no mapping in this process?)",
+    IOSurfaceGetID(surface),(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),base,allocation);}
+  return nil;
+ }
  const size_t bytes=(allocation+page-1)&~(page-1);
  const uintptr_t at=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
@@ -1498,7 +1726,28 @@ static char sweetMemoryOwnerKey;
   NBLOG(@"native-metal: surface %#x '%c%c%c%c' %zux%zu plane %lu: format %lu %lux%lu, row %zu refused",IOSurfaceGetID(surface),
    (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),
    (unsigned long)plane,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,row);return nil;}
- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ texture.surface=(IOSurfaceRef)CFRetain(surface);
+ // 0180: is another process's full-screen picture (a game's drawable) visible here? Once per surface ID: 64 samples
+ // through this process's own mapping (caches invalidated first), black = RGB sum <= 24. In backboardd: content here
+ // but black compositions -> the GPU side; black here while the game's own pre-present samples have content -> the
+ // mapping in this process is not the game's memory.
+ if(IOSurfaceGetWidth(surface)>=1000 && IOSurfaceGetHeight(surface)>=2000 && !planes &&
+    (IOSurfaceGetPixelFormat(surface)=='BGRA' || IOSurfaceGetPixelFormat(surface)=='RGBA')){
+  static std::mutex lock;static NSMutableSet<NSNumber *> *seen;
+  std::lock_guard<std::mutex> guard(lock);if(!seen)seen=[NSMutableSet set];
+  NSNumber *sid=@(IOSurfaceGetID(surface));
+  if(![seen containsObject:sid] && seen.count<64){[seen addObject:sid];
+   const size_t w=IOSurfaceGetWidth(surface),h=IOSurfaceGetHeight(surface);unsigned black=0;
+   for(unsigned j=0;j<8;j++){
+    uint8_t *rowp=(uint8_t *)base+row*(h*(2*j+1)/16);
+    sys_dcache_flush(rowp,row);
+    for(unsigned i=0;i<8;i++){const uint8_t *px=rowp+4*(w*(2*i+1)/16);if(px[0]+px[1]+px[2]<=24)black++;}
+   }
+   NBLOG(@"native-metal: surface %#x %zux%zu seen here: %u/64 black (base %p, alloc %zu, seed %u, label %@)",IOSurfaceGetID(surface),w,h,black,
+    base,allocation,IOSurfaceGetSeed(surface),d.pixelFormat==MTLPixelFormatBGRA8Unorm?@"BGRA8":[NSString stringWithFormat:@"fmt %lu",(unsigned long)d.pixelFormat]);
+  }
+ }
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
@@ -1708,6 +1957,23 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+ // 0178: the same check for the rest. QuartzCore in backboardd logged "fragmentFunction is not a MTLFunction." /
+ // "vertexFunction is not a MTLFunction." from boot on: Metal's pipeline descriptor checks conformance, and these classes
+ // only answered the selectors. A refused function leaves CoreAnimation without that pipeline, and what it would have
+ // drawn is skipped (suspected: the black compositions of a game's layer).
+ {
+  struct {Class cls;const char *names[3];} adopt[]={
+   // Public protocols only, named by the message: a private one could make callers take SPI paths this file lacks.
+   {[NBFunction class],{"MTLFunction",nullptr,nullptr}},
+   {[NBLibrary class],{"MTLLibrary",nullptr,nullptr}},
+  };
+  for(auto &a:adopt)for(const char *name:a.names){
+   if(!name)continue;
+   Protocol *p=objc_getProtocol(name);
+   if(p && !class_conformsToProtocol(a.cls,p))class_addProtocol(a.cls,p);
+   NBLOG(@"native-metal: %s %s %s",class_getName(a.cls),name,p?([a.cls conformsToProtocol:p]?"adopted":"not adopted"):"missing");
+  }
+ }
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;

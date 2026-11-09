@@ -240,6 +240,9 @@ bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
 bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
 bool nmb_render_set_line_width(NmbEncoder *, float width);
 bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
+bool nmb_render_set_color_store_action(NmbEncoder *, uint64_t action, uint32_t index);
+bool nmb_render_set_depth_store_action(NmbEncoder *, uint64_t action);
+bool nmb_render_set_stencil_store_action(NmbEncoder *, uint64_t action);
 bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
 bool nmb_render_draw_indexed(NmbEncoder *, uint64_t primitive, uint32_t count, uint64_t index_type, NmbBuffer *indices, uint64_t offset,
                              uint32_t instances, int32_t base_vertex, uint32_t base_instance);

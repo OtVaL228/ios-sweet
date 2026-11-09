@@ -1948,6 +1948,33 @@ pub extern "C" fn nmb_render_set_visibility_mode(encoder: *mut NmbEncoder, mode:
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_color_store_action(encoder: *mut NmbEncoder, action: u64, index: u32) -> bool {
+    guard(false, || {
+        let action = StoreAction::from_raw(action).map_err(e("color store action"))?;
+        render(encoder)?.set_color_store_action(action, index).map_err(e("color store action"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_depth_store_action(encoder: *mut NmbEncoder, action: u64) -> bool {
+    guard(false, || {
+        let action = StoreAction::from_raw(action).map_err(e("depth store action"))?;
+        render(encoder)?.set_depth_store_action(action).map_err(e("depth store action"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_stencil_store_action(encoder: *mut NmbEncoder, action: u64) -> bool {
+    guard(false, || {
+        let action = StoreAction::from_raw(action).map_err(e("stencil store action"))?;
+        render(encoder)?.set_stencil_store_action(action).map_err(e("stencil store action"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_set_blend_color(encoder: *mut NmbEncoder, color: *const f32) -> bool {
     guard(false, || {
         if color.is_null() {
