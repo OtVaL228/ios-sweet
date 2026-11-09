@@ -488,6 +488,29 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   AVDTP_Start follows. Next: where VirtualAudio gets that policy and the
   port properties. Video in Safari crashes mediaserverd separately
   (exception in FigGetAlignmentForIOSurfaceOutputToDisplayService).
+- Why no route: the rule is AND (Aggregate Connection Inclusion Policy,
+  0xeb494), and "out of band speech input support" asks the A2DP port for
+  an OOB speech input device UUID (Port_BluetoothA2DP vtable 0x62a2d8, slot
+  +0x1c0 -> 0x404b9c; other ports answer no). AirPods have one, other
+  headphones do not: on an iPhone ordinary playback reaches them from the
+  codec's ports, and here the only source port is Application Processor.
+  userland/jb/mswrap.c + vabt.c (mediaserverd through mswrap in
+  launchd.plist, libsweet-vabt patching that slot for VirtualAudio LC_UUID
+  3196333F-...-0146DC1177FB) remove the rejection, but the playback handler
+  still builds AP -> Null_Device: with no persistent route from
+  MediaExperience (picked endpoints empty) and no codec it never offers the
+  A2DP port ("Redundant concrete route"). Next: make VirtualAudio see a
+  codec device (DeviceFactory_Aspen sorts physical devices by transport
+  type; Device_Codec_Aspen), likely a HAL plug-in of ours; the same is
+  needed for the speakers.
+- With VirtualAudio.plugin in place the volume is stuck at maximum (the
+  route ends on Null_Device, whose port has no volume properties). Both are
+  off again: VirtualAudio.plugin back in HAL.disabled, /var/local/mswrap.off
+  present (mswrap then execs mediaserverd plainly).
+- Safari downloads (fixed, xnu 0164): LocalStorageFileProvider issues the
+  APFS-private _IOW('J', 2, u64) on the placeholder it creates in Downloads;
+  ENOTTY on HFS failed the import ("failed to import placeholder"). 0164
+  takes it as done for regular files on HFS; downloads now land in Files.
 - Result: bluetoothd stays up (STACK_READY), LE scanning delivers
   advertisements. Jobs (sweet-root-tweaks.py --net): com.sweet.btd,
   com.apple.BlueTool -> bluetoold, bluetoothd env. /var/local/btd.off

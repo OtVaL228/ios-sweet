@@ -1,0 +1,38 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -12544,6 +12544,14 @@
+ #define SWEET_FPFS_GET_SYNCROOT         _IOR('J', 72, uint32_t)
+ #define SWEET_FPFS_GET_PARENT_SYNCROOT  _IOR('J', 74, uint64_t)
+ #define SWEET_FPFS_DIRSTAT              _IOWR('J', 32, uint8_t[40])
++/*
++ * APFS-private _IOW('J', 2, u64) on a file: LocalStorageFileProvider issues it on
++ * the placeholder Safari has it import into Downloads (DOCDownloadImportManager),
++ * ENOTTY on HFS ("[25: Inappropriate ioctl for device]") fails the import and the
++ * download never leaves Safari's own directory. Taken as done: the placeholder stays
++ * an ordinary empty file that the finished download replaces.
++ */
++#define SWEET_FPFS_FILE_J2              _IOW('J', 2, uint64_t)
+ #define SWEET_FPFS_SYNCROOT_XATTR       "com.apple.sweet.syncroot"
+ 
+ static bool
+@@ -12559,11 +12567,18 @@
+ sweet_fpfs_fsctl(vnode_t vp, u_long cmd, caddr_t data, vfs_context_t ctx, int *errorp)
+ {
+ 	if (cmd != SWEET_FPFS_SET_SYNCROOT && cmd != SWEET_FPFS_GET_SYNCROOT &&
+-	    cmd != SWEET_FPFS_GET_PARENT_SYNCROOT) {
++	    cmd != SWEET_FPFS_GET_PARENT_SYNCROOT && cmd != SWEET_FPFS_FILE_J2) {
+ 		return false;
+ 	}
+ 	if (vp->v_mount == NULL || strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "hfs", MFSNAMELEN) != 0) {
+ 		return false;
++	}
++	if (cmd == SWEET_FPFS_FILE_J2) {
++		if (!vnode_isreg(vp)) {
++			return false;
++		}
++		*errorp = 0;
++		return true;
+ 	}
+ 	if (cmd == SWEET_FPFS_SET_SYNCROOT) {
+ 		if (!vnode_isdir(vp)) {
