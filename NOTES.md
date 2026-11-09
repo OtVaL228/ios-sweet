@@ -1,3 +1,29 @@
+# Active handoff — Angry Birds (2026-11-08, Claude)
+
+- User: 0185 works "well enough" (flicker gone, overlays visible). Now Angry Birds Classic and Angry Birds 2 crash.
+- /var/local/mtl2-clients contains "*" (every process gets a Metal device).
+- Angry Birds Classic (GLES2 only): crash 22:06:51, EXC_CRASH SIGABRT, abort() from std::terminate inside a
+  FrontBoard main-queue block during launch (uncaught C++/ObjC exception, ~0.3 s after launch). Consistent with the
+  app's own "Failed to create EAGLContext" path: no OpenGL ES driver in app processes. libsweet-gl (eagl.c) is a
+  window-server-only EAGL (replaces initWithAPI/API/setParameter/getMacroContextPrivate/texImageIOSurface/
+  attachImage); it has no CAEAGLLayer path (renderbufferStorage:fromDrawable:, presentRenderbuffer:) and is only
+  injected into backboardd. Running GL apps needs: app-side injection + a CAEAGLLayer drawable implementation.
+- SubwaySurf report 22:06:54 is FrontBoard 0x8BADF00D "failed to terminate gracefully after 5.0s" in background
+  (not a game crash).
+- Angry Birds 2 (com.rovio.baba, Unity 6000.3.6f1, il2cpp, Metal via UnityFramework; IPA carries injected
+  CydiaSubstrate/iGameGod/AngryBirds2.dylib tweak): ran fine from SSH, but SpringBoard never exec'd it.
+  Info.plist UIRequiredDeviceCapabilities = arm64, metal, gamekit; MobileGestalt answers fixed with
+  userland/jb mgtool (setbool metal/gamekit true) -> now launches, shows the notification prompt, then crashes
+  Crash 22:27:20: EXC_BAD_ACCESS at 0xc0 after the frontend logged
+  `MISSING NBBlitEncoder -copyFromBuffer:...toTexture:...destinationOrigin:options:` (every launch).
+  CHANGE (frontend, bundle rebuild): added the MTLBlitOption forms of copyFromBuffer:toTexture: and
+  copyFromTexture:toBuffer:, forwarding to the existing copies (aspect options logged once, not honoured).
+- Rebuilt the bundle, verified its signature and blit-option selectors, then installed over SSH. Archive:
+  `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-blit-options.tar.gz`,
+  SHA-256 `79f3865c21cb07c40ebbfcfe59bfee42bf388f1e37570e6f332f1fc828853f32`.
+- Previous bundle preserved as `/System/Library/Extensions/SweetMetal2.bundle.pre-blit-options-20261108-222944`.
+  Reboot before retesting Angry Birds 2 so it loads the new bundle.
+
 # Active handoff — 0185 layer order: higher index on top (2026-11-08, Claude)
 
 - After 0184 (flicker gone) the game "froze" mid-run: GPU fine (no HANG), game process alive but idle (1.7% CPU),

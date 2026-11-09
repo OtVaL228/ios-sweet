@@ -947,6 +947,31 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
 }
+// 0186: the forms with MTLBlitOption (Unity 6 / Angry Birds 2 calls the buffer-to-texture one on its first frame; the
+// missing selector ended in a crash). None is the plain copy. The depth/stencil-aspect options choose which half of a
+// combined depth/stencil texture is copied; the bridge copies the texture as it is, so those are passed through with
+// a note (once each). PVRTC row layout does not occur here (no PVRTC formats are offered).
+static void blitOptionNote(MTLBlitOption options,const char *what) {
+ if(options==MTLBlitOptionNone)return;
+ static std::atomic<uint32_t> said{0};
+ const uint32_t bit=1u<<((options&7u)%8u);
+ if(said.fetch_or(bit)&bit)return;
+ NBLOG(@"native-metal: %s with MTLBlitOption %lu: copied without the option (aspect selection not supported)",what,(unsigned long)options);
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+            sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+     destinationOrigin:(MTLOrigin)dO options:(MTLBlitOption)options {
+ blitOptionNote(options,"copyFromBuffer:toTexture:");
+ [self copyFromBuffer:s sourceOffset:o sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:z toTexture:d destinationSlice:slice
+     destinationLevel:level destinationOrigin:dO];
+}
+- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image
+                options:(MTLBlitOption)options {
+ blitOptionNote(options,"copyFromTexture:toBuffer:");
+ [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:o
+  destinationBytesPerRow:row destinationBytesPerImage:image];
+}
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
