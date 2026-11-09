@@ -1,3 +1,26 @@
+# Active handoff — ROOT CAUSE of the Subway Surfers flicker: IOMFB layers persist (2026-11-08, Claude)
+
+- 0183 result: every black frame is a swap with ONE enabled layer, layer 1 = CA framebuffer surface 2/3, no layer 0.
+  IOMobileFramebuffer keeps layers across swaps: a swap only sets the layers that changed (rec+0x104). CA sends only
+  its UI layer (1) when just the UI changed and expects the game layer (0) to stay. Our AppleCLCD treated every swap
+  as the whole screen -> CA's layer alone, its transparent hole where the game is -> black. Explains: menus flicker
+  more (UI changes more), backboardd never samples the game texture (it never has to), game frames always fine.
+- NEW `xnu/patches/0184-guacamole-fb-layers-persist.patch` (SweetFramebuffer.cpp, after 0183): swap() merges the
+  incoming record with the remembered layers (id, rects a/b, transform, rec[0x467+l]) for layers the swap does not
+  set; rec+0x108 bits = turn layer off; id 0 = off. Boot-arg `sweetfbpersist=0` = old behaviour.
+  Logs the first 30 merges: `SWEET FB: swap N sets 0x.. off 0x.. kept 0x.. -> layers on 0x.. (surfaces ...)` and a
+  5 s line `swaps that kept an earlier layer: N`. Note: 0169's "re-swapped pending surface" counter now also counts
+  kept layers (harmless).
+- Risk to check: when the game closes, CA must turn layer 0 off (NULL surface or 0x108). If the last game frame
+  stays on screen after leaving the game, the "off" signal is something else; the merge log shows it.
+- Test: build 0169-0184, play ~30 s incl. menus; flicker should be gone and `display-time samples` other-top-layer
+  black ~0. Then leave the game and confirm the home screen shows normally.
+- Built kernel with the previous XNU patches through 0183 plus 0184, using Xcode 27.2 / macOS 13.5 KDK 22G74.
+  Boot image uses 60 Hz GPU-present args plus `sweetgpuhangms=150`; persistence is enabled by default
+  (`sweetfbpersist=0` omitted), and ring waiting remains off.
+- Image: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0184-60hz-gpu-two-layers.img`,
+  SHA-256 `d74172928049346deed5f27318003f4c9b54b029aaf146e2e281618a102d7550`. Not transferred or booted.
+
 # Active handoff — backboardd never draws the game's texture in black frames (2026-11-08, Claude)
 
 - Draw-trace result (bundle with 'big-texture draw' confirmed installed): while 60-68 black "other top layer"

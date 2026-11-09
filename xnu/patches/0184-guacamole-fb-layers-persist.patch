@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 155b90b..49d7a2d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,14 @@ static bool sweet_fb_sync = true;
+  */
+ static bool sweet_fb_compose = true;
+ static bool sweet_fb_opaque_flag = true;   /* 0172: sweetfbopaqueflag, see sweet_fb_layer_is_opaque */
++/*
++ * 0184: IOMobileFramebuffer layers persist across swaps. A swap carries only the layers it sets (rec+0x104; a NULL
++ * surface = enable bit with id 0 = layer off); one it does not mention keeps its previous surface and rects.
++ * CoreAnimation sends just its own layer (1) when only the UI changed and leaves the game's (0) as it was: the kernel
++ * took each swap as the whole screen and showed CA's layer alone, with a transparent hole where the game is ->
++ * black (Subway Surfers: every "other top layer" frame was layer 1 alone). Boot-arg sweetfbpersist=0: as before.
++ */
++static bool sweet_fb_persist = true;
+ /*
+  * 0171: layer order. Subway Surfers (0170 log): layer 0 = the game's drawable (flag byte 0x467+layer = 1),
+  * layer 1 = CoreAnimation's own framebuffer surface (2/3), fully opaque or fully transparent. Drawing layer 0
+@@ -92,6 +100,7 @@ static struct {
+ 	/* 0170: composed frames, their layers drawn opaque / blended, GPU blits still running before one, its cost */
+ 	uint32_t composed, comp_opaque, comp_blend, comp_skipped, comp_gpu_wait;
+ 	uint32_t top_only;                      /* 0171: multi-layer frames shown as their opaque top layer, on the GPU */
++	uint32_t persisted;                     /* 0184: swaps that kept a layer from earlier swaps */
+ 	/*
+ 	 * 0173: what the display reads. Top layer sampled (8x8 RGB) as the GPU blit is queued: frames of the game's
+ 	 * flagged layer / of any other top layer, and those with >= 16 of 64 samples black.
+@@ -194,6 +203,8 @@ public:
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fShownSwapID;   /* 0169: the latest swap on the panel (or queued on the GPU behind its drawing) */
+ 	uint32_t      fSwapSubmits;   /* 0169: the swapping process's GPU job count at its previous swap */
++	uint8_t       fLayers[SWEET_FB_SWAP_REC_SIZE];  /* 0184: the screen's layers as the swaps so far left them */
++	uint32_t      fLayerMask;     /* 0184: layers in fLayers that are on (a surface set) */
+ 	void          shown(const uint8_t *rec);
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -330,6 +341,10 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t opaqueFlag = 1;
+ 	(void)PE_parse_boot_argn("sweetfbopaqueflag", &opaqueFlag, sizeof(opaqueFlag));
+ 	sweet_fb_opaque_flag = opaqueFlag != 0;
++	uint32_t persist = 1;
++	(void)PE_parse_boot_argn("sweetfbpersist", &persist, sizeof(persist));
++	sweet_fb_persist = persist != 0;
++	IOLog("SWEET FB: layers persist across swaps %s (0184)\n", sweet_fb_persist ? "on" : "off");
+ 	IOLog("SWEET FB: multi-layer composition %s (0170)\n", sweet_fb_compose ? "on" : "off");
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+ 	IOLog("SWEET FB: GPU present mode %s\n", sweet_fb_present_at_swap ? "at-swap" : "vsync-only");
+@@ -467,6 +482,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 			IOLog("SWEET FB: 5s: display-time samples: game layer %u frames, %u black; other top layer %u frames, %u black\n",
+ 			    sweet_fb_stats.seen_game, sweet_fb_stats.black_game, sweet_fb_stats.seen_other, sweet_fb_stats.black_other);
++			if (sweet_fb_stats.persisted != 0) {
++				IOLog("SWEET FB: 5s: swaps that kept an earlier layer: %u\n", sweet_fb_stats.persisted);
++			}
+ 			if (sweet_fb_stats.top_only != 0) {
+ 				IOLog("SWEET FB: 5s: multi-layer frames shown on the GPU (opaque top layer, bottom layer around it): %u\n",
+ 				    sweet_fb_stats.top_only);
+@@ -645,9 +663,61 @@ sweet_fb_rec_has_surface(const uint8_t *rec, uint32_t id)
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++static void
++put32(uint8_t *p, uint32_t off, uint32_t v)
++{
++	memcpy(p + off, &v, 4);
++}
++
++static uint32_t sweet_fb_persist_logged;
++
+ void
+-AppleCLCD::swap(const uint8_t *rec)
++AppleCLCD::swap(const uint8_t *rec_in)
+ {
++	/*
++	 * 0184: the layers this swap does not set keep what earlier swaps gave them (surface, rects, transform, the
++	 * opaque flag byte); rec+0x108 (cleared by kern_SwapSetLayer) is taken as "turn this layer off".
++	 */
++	uint8_t merged[SWEET_FB_SWAP_REC_SIZE];
++	const uint8_t *rec = rec_in;
++	if (sweet_fb_persist) {
++		memcpy(merged, rec_in, sizeof(merged));
++		uint32_t set = get32(rec_in, 0x104), clear = get32(rec_in, 0x108), mask = set, kept = 0;
++		IOLockLock(fLock);
++		for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++			uint32_t bit = 1u << l;
++			if ((set & bit) || (clear & bit) || !(fLayerMask & bit)) {
++				continue;
++			}
++			memcpy(merged + 0x54 + 4 * l, fLayers + 0x54 + 4 * l, 4);
++			memcpy(merged + 0x64 + 16 * l, fLayers + 0x64 + 16 * l, 16);
++			memcpy(merged + 0xc4 + 16 * l, fLayers + 0xc4 + 16 * l, 16);
++			memcpy(merged + 0x114 + 4 * l, fLayers + 0x114 + 4 * l, 4);
++			merged[0x467 + l] = fLayers[0x467 + l];
++			mask |= bit;
++			kept |= bit;
++		}
++		put32(merged, 0x104, mask);
++		memcpy(fLayers, merged, sizeof(merged));
++		fLayerMask = 0;
++		for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++			if ((mask & (1u << l)) && get32(merged, 0x54 + 4 * l) != 0) {
++				fLayerMask |= 1u << l;
++			}
++		}
++		uint32_t on = fLayerMask;
++		IOLockUnlock(fLock);
++		if (kept) {
++			sweet_fb_stats.persisted++;
++		}
++		if ((kept || clear) && sweet_fb_persist_logged < 30) {
++			sweet_fb_persist_logged++;
++			IOLog("SWEET FB: swap %u sets %#x, off %#x, kept %#x -> layers on %#x (surfaces %u %u %u %u)\n",
++			    get32(rec_in, 0x50), set, clear, kept, on, get32(merged, 0x54), get32(merged, 0x58), get32(merged, 0x5c),
++			    get32(merged, 0x60));
++		}
++		rec = merged;
++	}
+ 	/*
+ 	 * 0169: which GPU job ends this frame's drawing. The global last job (0145) is anyone's: a game's frames
+ 	 * kept CPU copies of backboardd's frames waiting. And CoreAnimation may swap before its Metal command
