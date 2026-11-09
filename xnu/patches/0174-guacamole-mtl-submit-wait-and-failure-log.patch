@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index a8bf266..cd281dc 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -124,6 +124,7 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	char fName[32];
+ 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
+ 	bool fCapLogged;
++	uint32_t fFailLogs;             /* 0174: failed methods logged */
+ 
+ 	bool v2PoolAllowed(uint64_t len);
+ 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
+@@ -298,6 +299,18 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 	if (o != NULL) {
+ 		args->structureOutputSize = osz;
+ 	}
++	/*
++	 * 0174: every refused method, by client (the first 40, then every 1000th): Turnip turns a refused submit or a
++	 * timed-out wait into VK_ERROR_DEVICE_LOST for good (backboardd: "commandBuffer refused: DeviceLost", then
++	 * every composition it draws is black).
++	 */
++	if (r != kIOReturnSuccess) {
++		uint32_t n = ++fFailLogs;
++		if (n <= 40 || n % 1000 == 0) {
++			IOLog("SWEET MTL: %s method %u failed: 0x%x (#%u; GPU pool free %llu MB)\n", fName,
++			    isz >= 8 && w[0] == SWEET_V2_TUNNEL ? w[1] : selector, r, n, sweet_gpu_pool_avail() >> 20);
++		}
++	}
+ 	return r;
+ }
+ 
+@@ -623,6 +636,17 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		}
+ 		bool busy = false;
+ 		uint32_t fence = sweet_gpu_submit_v2(iova, dw, rq->buffer_count, &busy);
++		/*
++		 * 0174: a full ring is not an error: the GPU is behind (a game plus backboardd plus the display's blits),
++		 * and refusing made Turnip declare the device lost. Wait for room, up to 2 s (a hung GPU stays an error).
++		 */
++		for (unsigned waited = 0; fence == 0 && busy && waited < 2000; waited++) {
++			IOSleep(1);
++			fence = sweet_gpu_submit_v2(iova, dw, rq->buffer_count, &busy);
++			if (fence != 0 && waited >= 20) {
++				IOLog("SWEET MTL: %s waited %u ms for ring space\n", fName, waited + 1);
++			}
++		}
+ 		if (fence == 0) {
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}

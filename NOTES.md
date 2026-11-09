@@ -1,4 +1,38 @@
+# Active handoff — 0174 backboardd's Metal device is lost (2026-11-08, Claude)
+
+- backboardd's mtl2.log: dozens of `commandBuffer refused: command buffer: DeviceLost` (also texture / no-copy
+  buffer refused: DeviceLost). Once Turnip marks the VkDevice lost it stays lost for that process, so every
+  composition backboardd draws afterwards fails -> black (0173: 274/274 composited frames black). This is the
+  root of the Subway Surfers flicker. backboardd also held 162 -> 229 MB of GPU pool.
+- The kernel never reports faults (fFaults is never incremented), so the loss comes from a failed method:
+  Submit returns kIOReturnBusy at once when the 32 KB ring is full, or kIOReturnTimeout/NotReady; or WaitFence
+  times out. Likeliest: ring full under game + backboardd + display blits.
+- NEW `xnu/patches/0174-guacamole-mtl-submit-wait-and-failure-log.patch` (SweetAccelerator.cpp, after 0173):
+  Submit waits up to 2 s for ring room instead of refusing (logs `waited N ms for ring space` when >= 20 ms);
+  every failed method is logged: `SWEET MTL: <proc> method N failed: 0x... (#n; GPU pool free N MB)`
+  (first 40 per client, then every 1000th).
+- Test: build 0169-0174, play/menus until flicker would start, then
+  `dmesg | grep -E 'SWEET MTL: .*(failed|ring space)|display-time samples'` and
+  `grep -a backboardd /var/local/mtl2.log | grep -c DeviceLost`. If DeviceLost still appears, the failed-method
+  lines name the cause (SweetGPUABI.h: 2 BoAlloc, 3 BoMap, 5 Submit, 6 WaitFence, 16 BoImport).
+- Built locally with Xcode 27.2 / macOS 13.5 KDK 22G74. Kernel has the 0174 ring-wait and failure-log strings;
+  the rebuilt Metal bundle retains the 0173 pre-present sampling and passes strict codesign verification.
+- Artifacts (not transferred or booted):
+  - `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0174-60hz-gpu-two-layers.img`, SHA-256
+    `9c5c61a6f3e4ec581ce73ea4fd64ef7b4dd324be74d50e0ba7834e1d9505d9e0`.
+  - `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-0174-device-lost-diagnostics.tar.gz`, SHA-256
+    `13e3e0de55b3ebd72f76b1ce47bbad2ee00c949e26c12a6b2eb7ffadbb91152e`.
+- Image keeps the known 60 Hz GPU-present arguments; 0174 adds ring-space waiting and per-client failed-method logs.
+
 # Active handoff — 0173 where does the black come from (2026-11-08, Claude)
+
+- RESULT (decisive): pre-present (game process, after completion) 1080 frames, 0 black. Display-time: game-layer
+  frames 0 black of ~880; frames whose top layer is NOT the game layer (CA's own framebuffer surface 2/3, i.e.
+  backboardd composited the game itself) 274 of 274 black. Flicker = alternation between direct game-layer frames
+  (good) and backboardd-composited frames (game content black, home indicator drawn). Menus composite more often →
+  more flicker. Root cause is in backboardd's compositing of the game's IOSurface (texture import / sampling in
+  the backboardd Metal frontend, or IOSurface lookup/mapping), not the game's rendering and not the display copy.
+  Next: backboardd mtl2.log refusals/missing selectors and SWEET SURF kernel lines for the game's drawable surfaces.
 
 - 0172 user report: game is a bit better while running, menus flicker MORE; "still the original issue".
   Slow-motion video (120 fps) frames: (a) menus: whole screen black except iOS home indicator and a thin edge strip;
