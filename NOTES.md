@@ -1,5 +1,26 @@
+# Active handoff — 0185 layer order: higher index on top (2026-11-08, Claude)
+
+- After 0184 (flicker gone) the game "froze" mid-run: GPU fine (no HANG), game process alive but idle (1.7% CPU),
+  last 51 swaps set only CA's layer 1 and kept the game's layer 0; WebKit.GPU had just allocated ~150 MB (likely an
+  ad/overlay). `killall SubwaySurf` -> home screen back: CA turns the layer off correctly on app exit (0184 handles
+  it). So during the "freeze" CA still had layer 0 on and showed something in layer 1, which 0171's "layer 0 on top"
+  covered. Conclusion: higher index = top (app Metal layer under CA's layer with a transparent hole).
+- NEW `xnu/patches/0185-guacamole-fb-higher-layer-on-top.patch` (after 0184): order[0] = highest index; a 2-layer
+  frame whose top layer samples are all alpha 0 (and not flagged opaque) shows the lower layer alone on the GPU
+  (`5s: two-layer frames with a transparent top layer (lower layer alone): N`); a partly transparent top goes to the
+  CPU compose, which now draws layer 0 first, blends upper layers, and leaves out all-transparent upper layers.
+  Boot-arg `sweetfbtop=0` restores 0171's order. Known gap: 8x8 sampling can miss tiny overlays (home indicator).
+- Test: build 0169-0185; play incl. menus and an ad/popup; check flicker stays gone, overlays visible, and
+  `dmesg | grep 'SWEET FB: 5s' | tail` (composed frames cost CPU time; if frequent, GPU blending is the next step).
+- Built kernel with the previous XNU patches through 0184 plus 0185 using Xcode 27.2 / macOS 13.5 KDK 22G74.
+- Boot image: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0185-60hz-gpu-two-layers.img`,
+  SHA-256 `7d73b4c9d42e5f3ae99b2710b431a4fb6919eb98705ad01d33ade571af0c724f`. It uses the known 60 Hz GPU-present
+  args plus `sweetgpuhangms=150`; `sweetfbtop` is omitted (higher index on top by default). Not transferred or booted.
+
 # Active handoff — ROOT CAUSE of the Subway Surfers flicker: IOMFB layers persist (2026-11-08, Claude)
 
+- RESULT (user, 0169-0184): FLICKER GONE. A freeze happened mid-game (diagnosis pending; likely the GPU hang
+  seen at the daily wheel, see 0179 HANG report).
 - 0183 result: every black frame is a swap with ONE enabled layer, layer 1 = CA framebuffer surface 2/3, no layer 0.
   IOMobileFramebuffer keeps layers across swaps: a swap only sets the layers that changed (rec+0x104). CA sends only
   its UI layer (1) when just the UI changed and expects the game layer (0) to stay. Our AppleCLCD treated every swap

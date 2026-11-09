@@ -1,0 +1,141 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 49d7a2d..5bcecde 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -73,6 +73,15 @@ static bool sweet_fb_opaque_flag = true;   /* 0172: sweetfbopaqueflag, see sweet
+  * black (Subway Surfers: every "other top layer" frame was layer 1 alone). Boot-arg sweetfbpersist=0: as before.
+  */
+ static bool sweet_fb_persist = true;
++/*
++ * 0185: layer order. With 0184's persistent layers Subway Surfers "froze": the game paused under an overlay that
++ * CoreAnimation drew in its own layer 1 while it kept the game's layer 0 on; 0171 drew layer 0 on top and hid it
++ * (killing the game brought the home screen back). So the higher index is the TOP: the app's Metal layer lies under
++ * CA's layer, which is transparent where the game shows. (0171's opposite conclusion came from 0170 treating an
++ * all-alpha-0 layer as opaque.) An upper layer whose samples are all alpha 0 is left out (GPU path: the lower layer
++ * alone); a partly transparent one is blended on the CPU. Boot-arg sweetfbtop=0: layer 0 on top, as 0171.
++ */
++static bool sweet_fb_high_on_top = true;
+ /*
+  * 0171: layer order. Subway Surfers (0170 log): layer 0 = the game's drawable (flag byte 0x467+layer = 1),
+  * layer 1 = CoreAnimation's own framebuffer surface (2/3), fully opaque or fully transparent. Drawing layer 0
+@@ -101,6 +110,7 @@ static struct {
+ 	uint32_t composed, comp_opaque, comp_blend, comp_skipped, comp_gpu_wait;
+ 	uint32_t top_only;                      /* 0171: multi-layer frames shown as their opaque top layer, on the GPU */
+ 	uint32_t persisted;                     /* 0184: swaps that kept a layer from earlier swaps */
++	uint32_t top_clear;                     /* 0185: two-layer frames whose top layer was all transparent */
+ 	/*
+ 	 * 0173: what the display reads. Top layer sampled (8x8 RGB) as the GPU blit is queued: frames of the game's
+ 	 * flagged layer / of any other top layer, and those with >= 16 of 64 samples black.
+@@ -344,6 +354,9 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t persist = 1;
+ 	(void)PE_parse_boot_argn("sweetfbpersist", &persist, sizeof(persist));
+ 	sweet_fb_persist = persist != 0;
++	uint32_t highTop = 1;
++	(void)PE_parse_boot_argn("sweetfbtop", &highTop, sizeof(highTop));
++	sweet_fb_high_on_top = highTop != 0;
+ 	IOLog("SWEET FB: layers persist across swaps %s (0184)\n", sweet_fb_persist ? "on" : "off");
+ 	IOLog("SWEET FB: multi-layer composition %s (0170)\n", sweet_fb_compose ? "on" : "off");
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+@@ -482,6 +495,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 			IOLog("SWEET FB: 5s: display-time samples: game layer %u frames, %u black; other top layer %u frames, %u black\n",
+ 			    sweet_fb_stats.seen_game, sweet_fb_stats.black_game, sweet_fb_stats.seen_other, sweet_fb_stats.black_other);
++			if (sweet_fb_stats.top_clear != 0) {
++				IOLog("SWEET FB: 5s: two-layer frames with a transparent top layer (lower layer alone): %u\n",
++				    sweet_fb_stats.top_clear);
++			}
+ 			if (sweet_fb_stats.persisted != 0) {
+ 				IOLog("SWEET FB: 5s: swaps that kept an earlier layer: %u\n", sweet_fb_stats.persisted);
+ 			}
+@@ -1238,6 +1255,35 @@ sweet_fb_part(const AppleCLCD *fb, uint64_t src, SweetSurface *s, int32_t sx, in
+ 	return true;
+ }
+ 
++/* 0185: are all 64 alpha samples of the layer 0 (rows cache-invalidated): nothing of it would show */
++static bool
++sweet_fb_layer_transparent(SweetSurface *s, const uint8_t *a)
++{
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++	int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++	uintptr_t src = s->kernelAddress();
++	if (sw <= 0 || sh <= 0) {
++		sw = (int32_t)s->width;
++		sh = (int32_t)s->height;
++	}
++	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || sx < 0 || sy < 0 || sx + sw > (int32_t)s->width ||
++	    sy + sh > (int32_t)s->height ||
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++		return false;
++	}
++	for (int32_t j = 0; j < 8; j++) {
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
++		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
++		const uint32_t *row = (const uint32_t *)(src + off);
++		for (int32_t i = 0; i < 8; i++) {
++			if ((row[(sw * (2 * i + 1)) / 16] >> 24) != 0) {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
+ /* 0173: of 64 samples of the layer's source rectangle (rows cache-invalidated), how many are black (RGB sum <= 24) */
+ static uint32_t
+ sweet_fb_layer_black(SweetSurface *s, const uint8_t *a)
+@@ -1285,7 +1331,8 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	pauseConsole();
+ 	/* 0171: the lowest index is the top layer. 0172: up to two layers, the top one opaque */
+ 	uint32_t mask = get32(rec, 0x104), order[SWEET_FB_LAYERS], layers = 0;
+-	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++	for (uint32_t n = 0; n < SWEET_FB_LAYERS; n++) {
++		uint32_t l = sweet_fb_high_on_top ? SWEET_FB_LAYERS - 1 - n : n;      /* 0185: order[0] is the top */
+ 		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
+ 			order[layers++] = l;
+ 		}
+@@ -1294,6 +1341,18 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		sweet_fb_stats.gpu_skip[2]++;
+ 		return 0;
+ 	}
++	if (layers == 2 && sweet_fb_compose) {
++		/* 0185: a top layer with nothing visible (all alpha 0, not flagged opaque): the lower layer alone */
++		SweetSurface *top = sweet_surface_copy(get32(rec, 0x54 + 4 * order[0]));
++		bool clear = top != NULL && !(sweet_fb_opaque_flag && rec[0x467 + order[0]] != 0) &&
++		    sweet_fb_layer_transparent(top, rec + 0x64 + 16 * order[0]);
++		OSSafeReleaseNULL(top);
++		if (clear) {
++			order[0] = order[1];
++			layers = 1;
++			sweet_fb_stats.top_clear++;
++		}
++	}
+ 	if (layers > 2 || (layers == 2 && !sweet_fb_compose)) {
+ 		sweet_fb_stats.gpu_skip[1]++;
+ 		return 0;
+@@ -1599,7 +1658,9 @@ AppleCLCD::presentComposed(const uint8_t *rec)
+ 		sweet_fb_comp_logged++;
+ 	}
+ 	bool first = true;
+-	for (uint32_t l = SWEET_FB_LAYERS; l-- > 0;) {     /* 0171: highest index lowest, layer 0 on top */
++	for (uint32_t n = 0; n < SWEET_FB_LAYERS; n++) {
++		/* 0185: drawn bottom first: layer 0 first when the higher index is on top (0171: the reverse) */
++		uint32_t l = sweet_fb_high_on_top ? n : SWEET_FB_LAYERS - 1 - n;
+ 		uint32_t id = get32(rec, 0x54 + 4 * l);
+ 		if (!(mask & (1u << l)) || id == 0) {
+ 			continue;
+@@ -1630,7 +1691,14 @@ AppleCLCD::presentComposed(const uint8_t *rec)
+ 			const uint8_t *base = (const uint8_t *)(src + s->offset);
+ 			sweet_fb_alpha_samples(base, s->bytesPerRow, sx, sy, sw, sh, &zero, &full, &part);
+ 			/* 0172: a layer flagged opaque is copied, its alpha ignored */
+-			blend = !first && zero != 64 && !(sweet_fb_opaque_flag && rec[0x467 + l] != 0);
++			bool flagged = sweet_fb_opaque_flag && rec[0x467 + l] != 0;
++			blend = !first && !flagged && full != 64;
++			if (!first && !flagged && zero == 64) {
++				/* 0185: an upper layer with nothing visible is left out (0170 drew it opaque: black) */
++				sweet_fb_stats.comp_skipped++;
++				OSSafeReleaseNULL(s);
++				continue;
++			}
+ 			/* destination clipped to the logical display; each kept column/row maps back to the source */
+ 			int32_t x0 = dx < 0 ? 0 : dx, y0 = dy < 0 ? 0 : dy;
+ 			int32_t x1 = dx + dw > (int32_t)fLogicalW ? (int32_t)fLogicalW : dx + dw;
