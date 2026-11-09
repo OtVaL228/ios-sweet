@@ -58,6 +58,16 @@ static dispatch_queue_t gDrawablePresentQueue;
 // runtime has submitted it to the GPU, so CoreAnimation's next IOMobileFramebuffer swap finds the frame's drawing
 // already on the ring (the display's blit is queued behind it). Boot-arg sweetmtlsyncsubmit=1 turns it on; off by default.
 static std::atomic<uint64_t> gSyncSubmitWaits;
+// 0188: surfaces that already held another process's picture when this process imported them (the "seen here" probe
+// found content): every use of one in an encoder is logged (first 80), whatever the shader.
+static std::mutex gWatchLock;
+static NSMutableSet<NSNumber *> *gWatchedSurfaces;
+static std::atomic<uint32_t> gWatchLogs{0};
+static bool watchedSurface(IOSurfaceRef sf) {
+ if(!sf)return false;
+ std::lock_guard<std::mutex> guard(gWatchLock);
+ return [gWatchedSurfaces containsObject:@(IOSurfaceGetID(sf))];
+}
 // 0173: the drawable sampled (8x8 grid) right before CoreAnimation gets it, after its drawing has completed: frames,
 // and those with >= 16 of 64 samples black. The older "frame grid" sample ran before a present-only command buffer
 // waited for the frame's work, so it could read the previous frame.
@@ -671,11 +681,18 @@ static void waitForResource(id resource) {
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ // 0188: a watched surface, any stage: the encoder, its pipeline (render) and target, where it is bound
+ if(texture && watchedSurface([(NBTexture *)texture surface]) && gWatchLogs.fetch_add(1)<80){
+  IOSurfaceRef sf=[(NBTexture *)texture surface];
+  NBLOG(@"native-metal: watched surface %#x bound: %@ stage %u index %lu view %lux%lu fmt %lu type %lu | pipe %@ | target %@",IOSurfaceGetID(sf),
+   NSStringFromClass([self class]),stage,(unsigned long)index,(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat,
+   (unsigned long)texture.textureType,objc_getAssociatedObject(self,"pipe")?:@"-",objc_getAssociatedObject(self,"target")?:@"-");
+ }
  // 0182: a full-screen surface bound for the fragment stage (another process's picture in backboardd's compositions)
  if(stage==2){
   NSString *key=[NSString stringWithFormat:@"ftex%lu",(unsigned long)index];
   IOSurfaceRef sf=texture?[(NBTexture *)texture surface]:nullptr;
-  NSString *v=(sf && IOSurfaceGetWidth(sf)>=1000 && IOSurfaceGetHeight(sf)>=2000)?
+  NSString *v=(sf && IOSurfaceGetWidth(sf)*IOSurfaceGetHeight(sf)>=2000000 /* 0187: landscape too */)?
    [NSString stringWithFormat:@"t%lu=surf %#x %lux%lu fmt %lu",(unsigned long)index,IOSurfaceGetID(sf),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat]:nil;
   objc_setAssociatedObject(self,(const void *)NSSelectorFromString(key),v,OBJC_ASSOCIATION_RETAIN);
   NSMutableDictionary *big=objc_getAssociatedObject(self,"bigtex");
@@ -922,6 +939,11 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if((watchedSurface([(NBTexture *)s surface]) || watchedSurface([(NBTexture *)d surface])) && gWatchLogs.fetch_add(1)<80)   // 0188
+  NBLOG(@"native-metal: watched surface blit: %#x %lux%lu fmt %lu -> %#x %lux%lu fmt %lu, origin %lu,%lu size %lux%lu",
+   [(NBTexture *)s surface]?IOSurfaceGetID([(NBTexture *)s surface]):0,(unsigned long)s.width,(unsigned long)s.height,(unsigned long)s.pixelFormat,
+   [(NBTexture *)d surface]?IOSurfaceGetID([(NBTexture *)d surface]):0,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,
+   (unsigned long)so.x,(unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height);
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
 }
@@ -1787,6 +1809,24 @@ static char sweetMemoryOwnerKey;
  }
  NBTexture *texture=textureOnBuffer(buffer,d,at-(uintptr_t)base,row,true,hasYCbCrPlanes,plane,IOSurfaceGetPixelFormat(surface),
                                     IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);
+ if(!texture && d.width==IOSurfaceGetHeight(surface) && d.height==IOSurfaceGetWidth(surface) && d.width!=d.height){
+  // 0189: a landscape view of a portrait surface (CoreAnimation's framebuffer while a landscape app is in front). Apple's
+  // driver takes such a texture with a private rotation on the descriptor; log what the descriptor carries, once each.
+  static std::atomic<uint32_t> said{0};
+  if(said.fetch_add(1)<6){
+   NSMutableString *spi=[NSMutableString string];
+   for(NSString *key in @[@"rotation",@"swizzle",@"compressionType",@"framebufferOnly",@"forceResourceIndex",@"textureLayout"]){
+    SEL sel=NSSelectorFromString(key);
+    if([d respondsToSelector:sel]){
+     id value=nil;@try{value=[d valueForKey:key];}@catch(NSException *e){value=@"?";}
+     [spi appendFormat:@" %@=%@",key,value];
+    }
+   }
+   NBLOG(@"native-metal: rotated view asked: surface %#x %zux%zu as %lux%lu usage %lu storage %lu type %lu;%@",IOSurfaceGetID(surface),
+    IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.usage,
+    (unsigned long)d.storageMode,(unsigned long)d.textureType,spi.length?spi:@" (no rotation property on the descriptor)");
+  }
+ }
  if(!texture){const uint32_t f=IOSurfaceGetPixelFormat(surface);
   NBLOG(@"native-metal: surface %#x '%c%c%c%c' %zux%zu plane %lu: format %lu %lux%lu, row %zu refused",IOSurfaceGetID(surface),
    (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),
@@ -1796,7 +1836,7 @@ static char sweetMemoryOwnerKey;
  // through this process's own mapping (caches invalidated first), black = RGB sum <= 24. In backboardd: content here
  // but black compositions -> the GPU side; black here while the game's own pre-present samples have content -> the
  // mapping in this process is not the game's memory.
- if(IOSurfaceGetWidth(surface)>=1000 && IOSurfaceGetHeight(surface)>=2000 && !planes &&
+ if(IOSurfaceGetWidth(surface)*IOSurfaceGetHeight(surface)>=2000000 /* 0187: landscape too */ && !planes &&
     (IOSurfaceGetPixelFormat(surface)=='BGRA' || IOSurfaceGetPixelFormat(surface)=='RGBA')){
   static std::mutex lock;static NSMutableSet<NSNumber *> *seen;
   std::lock_guard<std::mutex> guard(lock);if(!seen)seen=[NSMutableSet set];
@@ -1828,6 +1868,7 @@ static char sweetMemoryOwnerKey;
      }
     }
    }
+   if(black<32){std::lock_guard<std::mutex> g2(gWatchLock);if(!gWatchedSurfaces)gWatchedSurfaces=[NSMutableSet set];[gWatchedSurfaces addObject:@(IOSurfaceGetID(surface))];}
    NBLOG(@"native-metal: surface %#x %zux%zu seen here: %u/64 black by CPU, %u/64 by GPU (65 = probe failed) (base %p, alloc %zu, label %@)",
     IOSurfaceGetID(surface),w,h,black,gpuBlack,base,allocation,
     d.pixelFormat==MTLPixelFormatBGRA8Unorm?@"BGRA8":[NSString stringWithFormat:@"fmt %lu",(unsigned long)d.pixelFormat]);

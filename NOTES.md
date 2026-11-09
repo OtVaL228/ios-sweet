@@ -1,3 +1,46 @@
+# Active handoff — AB2 black = CA's rotated framebuffer textures refused (2026-11-08, Claude)
+
+- Before this rebuild the phone ran the 22:29 bundle (no `watched surface` string); the new diagnostic build below
+  is now installed.
+- That old bundle already shows the cause: with a landscape app in front, backboardd asks for its portrait framebuffer
+  surfaces 0x2/0x3 (1125x2436, row 4608) as 2436x1125 textures (format 80) -> `texture over buffer refused:
+  RowPitch { bytes_per_row: 4608, row_bytes: 9744 }`. CA then has no render target -> black screen.
+  Hypothesis: Apple's driver supports a private texture rotation (descriptor SPI) so CA renders "landscape" into the
+  portrait scanout surface; our frontend ignores it.
+- CHANGE (frontend, bundle rebuild): on such a refusal (descriptor w/h = surface h/w) log once (max 6)
+  `rotated view asked: surface .. as WxH usage storage type; rotation=.. swizzle=.. ...` (descriptor SPI values).
+- Planned fix if confirmed: a landscape shadow texture per surface for rendering, rotated into the surface by a
+  compute kernel (compiled at runtime via newLibraryWithSource) at the end of each command buffer, and rotated back
+  in before passes that load it.
+- Rebuilt with the latest frontend probes, verified the ad-hoc signature and diagnostic strings, and installed over
+  SSH. Archive: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-SweetMetal2-ab2-rotated-framebuffer-probe.tar.gz`,
+  SHA-256 `8164d0e714623b63f324a85c10edb872a360f3e14e19d9820c96e7c5b634d560`.
+- Previous bundle preserved as `/System/Library/Extensions/SweetMetal2.bundle.pre-ab2-probe-20261108-224909`.
+  Reboot before testing so backboardd loads the `watched surface` and `rotated view asked` probes.
+
+# Active handoff — AB2: watch the game's surface in backboardd (2026-11-08, Claude)
+
+- Landscape probe result: AB2's drawable IOSurface 58 (0x3a) is stored 1125x2436 (portrait) and backboardd sees it
+  with content (CPU and GPU 0/64 black). The big-texture trace hit its 60-entry cap on CA's own blur/downsample
+  passes over surfaces 2/3/0x17/0x18 and never showed a use of the game's surfaces.
+- CHANGE (frontend, bundle rebuild): surfaces whose "seen here" CPU probe finds content (black < 32/64) go on a
+  watch set; every binding of such a surface (any encoder, any stage, incl. texture views) logs
+  `watched surface 0x.. bound: <encoder class> stage S index I view WxH fmt type | pipe ... | target ...`, and blit
+  copies from/to it log `watched surface blit: ...` (first 80 total).
+- Test: bundle rebuild + reboot, `: > /var/local/mtl2.log`, open AB2 ~20 s,
+  `grep -a backboardd /var/local/mtl2.log | grep -E 'watched surface|seen here' | head -40`.
+
+# Active handoff — Angry Birds 2 black: backboardd's rotated composite (2026-11-08, Claude)
+
+- With the MTLBlitOption fix AB2 runs and renders (pre-present 240+ frames, 0 black; landscape drawables 2436x1125).
+  Screen black: every swap is ONE layer = CA framebuffer surface 3 with rec[0x467]=1, 64/64 black at display. So for
+  a landscape app CA does not scan the game layer out directly; backboardd composites it (rotated) into its portrait
+  framebuffer surface, and that composite is black.
+- CHANGE (frontend, bundle rebuild): the "seen here" CPU/GPU probe and the big-texture draw trace now trigger on
+  w*h >= 2,000,000 (they required h >= 2000 and skipped the 2436x1125 landscape drawables).
+- Test: rebuild/install bundle, reboot (backboardd loads it at start), `: > /var/local/mtl2.log`, open AB2 ~20 s,
+  `grep -a backboardd /var/local/mtl2.log | grep -E 'seen here|big-texture draw'`.
+
 # Active handoff — Angry Birds (2026-11-08, Claude)
 
 - User: 0185 works "well enough" (flicker gone, overlays visible). Now Angry Birds Classic and Angry Birds 2 crash.
