@@ -1,3 +1,38 @@
+# Active handoff — 0179 hang report survives (2026-11-08, Claude)
+
+- 0178 frontend result: "is not a MTLFunction" boot spam GONE; composited frames still 100% black (not the cause;
+  keep the fix). Daily-wheel screen in Subway Surfers freezes the UI reproducibly, also without sweetmtlringwait:
+  `GPU done 9436 of 9482`, game waits 9437 (its own job), killing the game does not recover (no GPU reset exists).
+- Phone runs payload-guac-0177.bin (contains HANG strings; boot args sweetgpuhangms=150) yet no HANG line in dmesg:
+  the 12-report cap was spent on short loading stalls (150 ms), and the 0175 1 ms-wait log flood rotated them out.
+- NEW `xnu/patches/0179-guacamole-gpu-hang-report-keep-long.patch` (after 0177): WaitFence timeouts < 20 ms are
+  not logged (Turnip's 1 ms loop); stalls >= 2 s are always reported (`SWEET GPU: HANG (long): ...`), own cap of 12,
+  separate from the short-stall reports.
+- Test: build 0169-0179, keep sweetgpuhangms=150, open the game until the wheel freezes it, then
+  `dmesg | grep -E 'SWEET GPU: (HANG|report)'` (and the `GPU present: window` boot line if still there).
+- TODO after diagnosis: GPU hang recovery (reset CP/ring, fail the stuck job's fences) so one hang does not
+  freeze the phone until reboot.
+- Built the kernel with all XNU patches 0169-0177 plus 0179 (0178 is the userland-only Metal frontend change),
+  using Xcode 27.2 / macOS 13.5 KDK 22G74. Kernel strings confirm long-hang reporting and the ring-wait toggle.
+- Boot image `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0179-60hz-gpu-two-layers.img`,
+  SHA-256 `b7b41e2e9ef5b8a80b93b16d31a0bc664c0f10ae691ec96ec7a417713df22339`. It has the usual 60 Hz GPU-present
+  args plus `sweetgpuhangms=150`, with `sweetmtlringwait` omitted. Not transferred or booted.
+
+# Active handoff — 0178 MTLFunction conformance in the Metal frontend (2026-11-08, Claude)
+
+- User: with 0176/0177 safe boot no freeze, still flicker. Freeze seems tied to Subway Surfers' daily-wheel
+  screen (does not always appear). Boot console always shows backboardd QuartzCore spam:
+  `fragmentFunction is not a MTLFunction.` / `vertexFunction is not a MTLFunction.` (also in NOTES cgtest 2026-11-06).
+- Suspect: Metal's pipeline descriptor rejects NBFunction (no formal protocol conformance; same as the earlier
+  "texture is not a MTLTextureImplementation" fixed by class_addProtocol), so CoreAnimation lacks some pipelines
+  and skips those draws -> backboardd's compositions of the game black, home indicator fine.
+- CHANGE (userland only, bundle rebuild): `NativeBridgeMetalFrontend.mm` adds MTLFunction to NBFunction and
+  MTLLibrary to NBLibrary via class_addProtocol, logging `native-metal: NBFunction MTLFunction adopted`.
+  Public protocols only (private SPI conformance could route callers into unimplemented SPI).
+- Test: rebuild SweetMetal2.bundle, install, reboot (kernel unchanged, 0169-0177 fine). Check the boot console no
+  longer shows "is not a MTLFunction", flicker status, and `dmesg | grep 'display-time samples' | tail` while playing
+  (other top layer black should drop).
+
 # Active handoff — 0177 catch short GPU stalls (2026-11-08, Claude)
 
 - User: on a boot without `sweetmtlringwait=1` the game flickers again (expected: ring refusal -> DeviceLost).

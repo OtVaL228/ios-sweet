@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ca19de5..277553c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2258,14 +2258,28 @@ sweet_gpu_hang_check(void)
+ 		(void)PE_parse_boot_argn("sweetgpuhangms", &ms, sizeof(ms));
+ 		sweet_gpu_hang_ms = ms < 20 ? 20 : ms;
+ 	}
+-	if (ns < (uint64_t)sweet_gpu_hang_ms * 1000000ull || sweet_gpu_hang_reported == done + 1 ||
+-	    sweet_gpu_hang_reports >= 12) {
+-		return;
++	/*
++	 * 0179: the 12 reports went on short stalls while loading (threshold 150 ms), before the hang that mattered.
++	 * A stall of 2 s or more is always reported (once per stuck job, at most 12 of those too), whatever the cap.
++	 */
++	static uint32_t long_reported, long_reports;
++	bool is_long = ns >= 2000000000ull;
++	if (is_long) {
++		if (long_reported == done + 1 || long_reports >= 12) {
++			return;
++		}
++		long_reported = done + 1;
++		long_reports++;
++	} else {
++		if (ns < (uint64_t)sweet_gpu_hang_ms * 1000000ull || sweet_gpu_hang_reported == done + 1 ||
++		    sweet_gpu_hang_reports >= 12) {
++			return;
++		}
++		sweet_gpu_hang_reported = done + 1;
++		sweet_gpu_hang_reports++;
+ 	}
+-	sweet_gpu_hang_reported = done + 1;
+-	sweet_gpu_hang_reports++;
+ 	vm_offset_t g = (vm_offset_t)be_gpu;
+-	printf("SWEET GPU: HANG: done %u, queued up to %u, stuck %llu ms\n", done, last, ns / 1000000ull);
++	printf("SWEET GPU: HANG%s: done %u, queued up to %u, stuck %llu ms\n", is_long ? " (long)" : "", done, last, ns / 1000000ull);
+ 	printf("SWEET GPU: HANG: RBBM_STATUS %#x STATUS3 %#x CP rptr %#x wptr %#x HW_FAULT %#x INT %#x STATUS_1 %#x\n",
+ 	    grd(g, 0x210), grd(g, 0x213), grd(g, 0x806), be_wptr % RB_DWORDS, grd(g, 0x821), grd(g, 0x823), grd(g, 0x825));
+ 	printf("SWEET GPU: HANG: IB1 %#llx rem %#x  IB2 %#llx rem %#x\n",
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 08eab3a..d12c786 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -321,7 +321,8 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 			fence = wf->fence;
+ 			timeout_ns = wf->timeout_ns;
+ 		}
+-		bool poll = method == NativeAdrenoMethodWaitFence && r == kIOReturnTimeout && timeout_ns == 0;
++		/* 0179: Turnip's 1 ms wait loop is polling too (hundreds of lines a second pushed everything else out) */
++		bool poll = method == NativeAdrenoMethodWaitFence && r == kIOReturnTimeout && timeout_ns < 20000000ull;
+ 		if (!poll) {
+ 			uint32_t n = ++fFailLogs;
+ 			if (n <= 60 || n % 100 == 0) {
