@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4cbd8e5..ca19de5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2230,8 +2230,13 @@ sweet_gpu_hist_note(uint32_t fence, const uint64_t *iova, const uint32_t *dwords
+ 	sweet_gpu_hist[i].iova = n ? iova[0] : 0;
+ }
+ 
+-static uint32_t sweet_gpu_hang_seen_done, sweet_gpu_hang_reported;
++static uint32_t sweet_gpu_hang_seen_done, sweet_gpu_hang_reported, sweet_gpu_hang_reports;
+ static uint64_t sweet_gpu_hang_since;
++/*
++ * 0177: stall threshold, boot-arg sweetgpuhangms (default 2000). A short one (e.g. 150) catches the stalls that,
++ * with the ring refusing work, end as DeviceLost/flicker instead of a frozen UI. At most 12 reports a boot.
++ */
++static uint32_t sweet_gpu_hang_ms;
+ 
+ static void
+ sweet_gpu_hang_check(void)
+@@ -2248,10 +2253,17 @@ sweet_gpu_hang_check(void)
+ 	}
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(now - sweet_gpu_hang_since, &ns);
+-	if (ns < 2000000000ull || sweet_gpu_hang_reported == done + 1) {
++	if (sweet_gpu_hang_ms == 0) {
++		uint32_t ms = 2000;
++		(void)PE_parse_boot_argn("sweetgpuhangms", &ms, sizeof(ms));
++		sweet_gpu_hang_ms = ms < 20 ? 20 : ms;
++	}
++	if (ns < (uint64_t)sweet_gpu_hang_ms * 1000000ull || sweet_gpu_hang_reported == done + 1 ||
++	    sweet_gpu_hang_reports >= 12) {
+ 		return;
+ 	}
+ 	sweet_gpu_hang_reported = done + 1;
++	sweet_gpu_hang_reports++;
+ 	vm_offset_t g = (vm_offset_t)be_gpu;
+ 	printf("SWEET GPU: HANG: done %u, queued up to %u, stuck %llu ms\n", done, last, ns / 1000000ull);
+ 	printf("SWEET GPU: HANG: RBBM_STATUS %#x STATUS3 %#x CP rptr %#x wptr %#x HW_FAULT %#x INT %#x STATUS_1 %#x\n",

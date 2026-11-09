@@ -1,3 +1,39 @@
+# Active handoff — 0177 catch short GPU stalls (2026-11-08, Claude)
+
+- User: on a boot without `sweetmtlringwait=1` the game flickers again (expected: ring refusal -> DeviceLost).
+  Working model: one underlying fault, a game GPU job that stalls; refusing work turns it into DeviceLost/flicker,
+  waiting for ring room (0174) turns it into a permanent hang. Need the CP state during the stall.
+- NEW `xnu/patches/0177-guacamole-gpu-hang-threshold-bootarg.patch` (sweet_gpu.c, after 0176): boot-arg
+  `sweetgpuhangms` (default 2000, min 20) sets the stall time that triggers the 0176 HANG report; max 12 reports.
+- Test (no freeze expected): build 0169-0177, boot args + `sweetgpuhangms=150` (NO sweetmtlringwait), play until
+  it flickers, then `dmesg | grep -E 'SWEET GPU: (HANG|report)|SWEET MTL: .* method 5 failed'`.
+- Built the kernel with the full 0169-0177 patch chain using Xcode 27.2 / macOS 13.5 KDK 22G74, then rebuilt
+  the 60 Hz GPU-present boot image. Verified the kernel contains the HANG report, threshold boot-arg and
+  opt-in ring-wait strings.
+- Image: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0177-60hz-gpu-two-layers.img`,
+  SHA-256 `9a286a3b31953655f7680d4cda647ab7c6e1c6e3f0a941b98d2ac3972bff814d`. Boot args include
+  `sweetgpuhangms=150`; `sweetmtlringwait` is omitted (default off) as specified for the no-freeze test.
+  Not transferred or booted.
+
+# Active handoff — 0176 GPU hang report; 0174 ring wait now opt-in (2026-11-08, Claude)
+
+- With 0169-0175 (0174 = Submit waits for ring room): after clearing mtl2.log, backboardd DeviceLost = 0, but the
+  UI FROZE in Subway Surfers. SSH still worked. dmesg: `GPU done 3746 of 3755` constant in every line: the GPU
+  is hung on job 3747, the first fence SubwaySurf waits on. backboardd, WebKit.GPU and the game all spin in 1 ms
+  WaitFence loops behind it. Only functional change from the non-freezing build is 0174.
+  Hypothesis (unverified): a game job waits on the GPU (CP_WAIT_REG_MEM: event/semaphore) for a signal that is
+  submitted later or set from the CPU by a thread that is blocked; earlier the ring-full refusal (-> DeviceLost)
+  broke the cycle instead.
+- NEW `xnu/patches/0176-guacamole-gpu-hang-report-ringwait-optin.patch` (sweet_gpu.c + SweetAccelerator.cpp,
+  after 0175): 0174's ring wait only with `sweetmtlringwait=1` (default off = old refuse-when-full). Kernel keeps
+  a 128-entry history of submits (fence, pid, first IB iova/dwords, IB count) and, when the done fence has not
+  moved for 2 s with later jobs queued, prints once: `SWEET GPU: HANG: ...` RBBM_STATUS/STATUS3, CP rptr/wptr,
+  HW_FAULT, INT, STATUS_1, IB1/IB2 base + remaining dwords, redwood_gpu_report (SMMU FSR/FAR), and the jobs
+  around the stuck one (">>" = stuck). Display blits queued from swap() show backboardd's pid; their IB iova lies
+  in the display's GPU window (`SWEET FB: GPU present: window ...` at boot).
+- Test 1 (safe, default): flicker expected back, no freeze. Test 2: add `sweetmtlringwait=1`, reproduce the freeze,
+  then `dmesg | grep 'SWEET GPU: HANG\|SWEET GPU: report\|GPU present: window'`.
+
 # Active handoff — 0175 log only real GPU failures (2026-11-08, Claude)
 
 - 0174 result: thousands/s of `method 6 failed: 0xe00002d6` (kIOReturnTimeout) in every process. These are Turnip's

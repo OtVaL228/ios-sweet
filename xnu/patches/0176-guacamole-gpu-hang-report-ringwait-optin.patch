@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 12b7390..4cbd8e5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2205,6 +2205,77 @@ sweet_gpu_done_fence(void)
+ 	return *be_fence;
+ }
+ 
++/*
++ * 0176: who queued each recent job (fence, pid, first IB and its size, IB count), and a report when the GPU
++ * stops: the CP's position (ring and IB1/IB2 pointers, remaining dwords), RBBM/CP status and the SMMU fault
++ * registers, with the jobs around the stuck one. A hang = the done fence has not moved for 2 s while later
++ * jobs are queued. Reported once per stuck fence.
++ */
++extern int proc_selfpid(void);
++extern void proc_name(int pid, char *buf, int size);
++#define SWEET_GPU_HIST  128
++static struct {
++	uint32_t fence, pid, n, dwords;
++	uint64_t iova;
++} sweet_gpu_hist[SWEET_GPU_HIST];
++
++static void
++sweet_gpu_hist_note(uint32_t fence, const uint64_t *iova, const uint32_t *dwords, unsigned n)
++{
++	unsigned i = fence % SWEET_GPU_HIST;
++	sweet_gpu_hist[i].fence = fence;
++	sweet_gpu_hist[i].pid = (uint32_t)proc_selfpid();
++	sweet_gpu_hist[i].n = n;
++	sweet_gpu_hist[i].dwords = n ? dwords[0] : 0;
++	sweet_gpu_hist[i].iova = n ? iova[0] : 0;
++}
++
++static uint32_t sweet_gpu_hang_seen_done, sweet_gpu_hang_reported;
++static uint64_t sweet_gpu_hang_since;
++
++static void
++sweet_gpu_hang_check(void)
++{
++	if (be_fence == NULL || be_gpu == 0) {
++		return;
++	}
++	uint32_t done = *be_fence, last = be_seqno;
++	uint64_t now = mach_absolute_time();
++	if (done != sweet_gpu_hang_seen_done || done == last) {
++		sweet_gpu_hang_seen_done = done;
++		sweet_gpu_hang_since = now;
++		return;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(now - sweet_gpu_hang_since, &ns);
++	if (ns < 2000000000ull || sweet_gpu_hang_reported == done + 1) {
++		return;
++	}
++	sweet_gpu_hang_reported = done + 1;
++	vm_offset_t g = (vm_offset_t)be_gpu;
++	printf("SWEET GPU: HANG: done %u, queued up to %u, stuck %llu ms\n", done, last, ns / 1000000ull);
++	printf("SWEET GPU: HANG: RBBM_STATUS %#x STATUS3 %#x CP rptr %#x wptr %#x HW_FAULT %#x INT %#x STATUS_1 %#x\n",
++	    grd(g, 0x210), grd(g, 0x213), grd(g, 0x806), be_wptr % RB_DWORDS, grd(g, 0x821), grd(g, 0x823), grd(g, 0x825));
++	printf("SWEET GPU: HANG: IB1 %#llx rem %#x  IB2 %#llx rem %#x\n",
++	    ((uint64_t)grd(g, 0x929) << 32) | grd(g, 0x928), grd(g, 0x92a),
++	    ((uint64_t)grd(g, 0x92c) << 32) | grd(g, 0x92b), grd(g, 0x92d));
++	redwood_gpu_report("hang");
++	for (uint32_t f = done > 3 ? done - 3 : 1; f <= done + 4 && f <= last; f++) {
++		unsigned i = f % SWEET_GPU_HIST;
++		char name[32] = "?";
++		if (sweet_gpu_hist[i].fence == f) {
++			if (sweet_gpu_hist[i].pid == 0) {
++				strlcpy(name, "kernel (display blit)", sizeof(name));
++			} else {
++				proc_name((int)sweet_gpu_hist[i].pid, name, sizeof(name));
++			}
++		}
++		printf("SWEET GPU: HANG: %s job %u: pid %u %s, %u IB(s), first %#llx (%u dwords)\n",
++		    f == done + 1 ? ">>" : "  ", f, sweet_gpu_hist[i].pid, name, sweet_gpu_hist[i].n,
++		    (unsigned long long)sweet_gpu_hist[i].iova, sweet_gpu_hist[i].dwords);
++	}
++}
++
+ void
+ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+ {
+@@ -2459,6 +2530,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
+ 		be_seqno = 1;
+ 	}
+ 	uint32_t fence = be_seqno;
++	sweet_gpu_hist_note(fence, iova, dwords, n);           /* 0176 */
+ 	be_emit(pkt7(70, 4));
+ 	be_emit(0x4u | 0x80000000u);                   /* CACHE_FLUSH_TS | IRQ */
+ 	be_emit((uint32_t)GVA_FENCEMEM);
+@@ -2483,6 +2555,7 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+ 			return 0;
+ 		}
+ 		if (timeout_ns == 0 || mach_absolute_time() >= deadline) {
++			sweet_gpu_hang_check();                 /* 0176 */
+ 			return ETIMEDOUT;
+ 		}
+ 		if (spin < 64) {
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 24b8e8f..08eab3a 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -660,7 +660,17 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		 * 0174: a full ring is not an error: the GPU is behind (a game plus backboardd plus the display's blits),
+ 		 * and refusing made Turnip declare the device lost. Wait for room, up to 2 s (a hung GPU stays an error).
+ 		 */
+-		for (unsigned waited = 0; fence == 0 && busy && waited < 2000; waited++) {
++		/*
++		 * 0176: only with boot-arg sweetmtlringwait=1. With the wait the GPU hung for good in Subway Surfers (UI
++		 * frozen, done fence stuck one job into the game's work): off by default again until that is understood.
++		 */
++		static int ringWait = -1;
++		if (ringWait < 0) {
++			uint32_t on = 0;
++			(void)PE_parse_boot_argn("sweetmtlringwait", &on, sizeof(on));
++			ringWait = on != 0;
++		}
++		for (unsigned waited = 0; ringWait && fence == 0 && busy && waited < 2000; waited++) {
+ 			IOSleep(1);
+ 			fence = sweet_gpu_submit_v2(iova, dw, rq->buffer_count, &busy);
+ 			if (fence != 0 && waited >= 20) {
