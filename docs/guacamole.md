@@ -516,6 +516,16 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   com.apple.BlueTool -> bluetoold, bluetoothd env. /var/local/btd.off
   keeps btd from starting; /var/local/btd.trace logs every command.
 
+## USB (not working)
+
+- sweet's USB device mode (xnu 0072-0081: DWC3, ep0, VBUS override,
+  CDC-ECM ue0) relied on ABL leaving the USB30_PRIM GDSC and the USB clocks
+  on. On guacamole `sweetusb=2` (image with USB=2, 2026-11-10) sends the SoC
+  to crashdump right away: most likely an access to the unclocked block.
+  Next: read GCC (USB30_PRIM GDSC, USB clock branches) from iOS with
+  `peek`, then power and clock the block as Linux gcc-sm8150 / dwc3-qcom do,
+  stage by stage behind boot-args with checkpoints, before touching DWC3.
+
 ## SWEETBOX file drop
 
 `tools/sweet-mailbox.py pack out.img NAME SRC [NAME SRC ...]`, then in TWRP
