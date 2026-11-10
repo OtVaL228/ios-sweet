@@ -1,0 +1,113 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -380,5 +380,19 @@
+ static unsigned sweet_containers_next, sweet_containers_said;
+ static LCK_GRP_DECLARE(sweet_containers_grp, "sweet_containers");
+ static LCK_MTX_DECLARE(sweet_containers_lock, &sweet_containers_grp);
++/*
++ * 0202: containers by code signing identity. 0201 learned none (sbpath, 2026-11-09: 0 of 301 processes): this
++ * iOS's launcher gives the Sandbox no container at exec. The other way iOS has is
++ * sandbox_set_container_path_for_signing_id[_with_persona] / _for_application_group (op 0xd: { identity, path,
++ * kind (0 signing id, 1 app group), persona }), which containermanagerd can call and userland/jb/sweet-containers
++ * calls for every container's metadata (MCMMetadataIdentifier -> its directory). A process with no container of
++ * its own (0201) gets the one of its code signing identity (cs_identity_get). App groups are kept apart.
++ */
++#define SWEET_IDENT_CONTAINERS  640
++static struct {
++	char ident[128];
++	char path[192];
++} sweet_ident_containers[SWEET_IDENT_CONTAINERS];
++static unsigned sweet_ident_count, sweet_ident_said;
+ 
+ /* path of len bytes for p (len 0: p has none any more) */
+@@ -420,7 +434,12 @@
+ 	if (p == NULL) {
+ 		return ESRCH;
+ 	}
+ 	uint64_t uniqueid = proc_uniqueid(p);
++	char ident[128] = "";
++	const char *signing = cs_identity_get(p);     /* 0202 */
++	if (signing != NULL) {
++		strlcpy(ident, signing, sizeof(ident));
++	}
+ 	proc_rele(p);
+ 	int error = ENOENT;
+ 	lck_mtx_lock(&sweet_containers_lock);
+@@ -430,7 +449,13 @@
+ 			error = 0;
+ 			break;
+ 		}
+ 	}
++	for (unsigned i = 0; error != 0 && ident[0] != '\0' && i < sweet_ident_count; i++) {
++		if (strcmp(sweet_ident_containers[i].ident, ident) == 0) {
++			strlcpy(out, sweet_ident_containers[i].path, size);
++			error = 0;
++		}
++	}
+ 	lck_mtx_unlock(&sweet_containers_lock);
+ 	return error;
+ }
+@@ -470,6 +495,56 @@
+ 	return 0;
+ }
+ 
++/* 0202: op 0xd, { identity, path, kind, persona }: signing identities only (kind 0), the last path wins */
++static int
++sweet_sandbox_container_for_identity(struct proc *p, user_addr_t arg)
++{
++	uint64_t args[4];
++	char ident[128], path[192];
++	size_t done = 0;
++	int error = copyin(arg, args, sizeof(args));
++	if (error == 0) {
++		error = copyinstr((user_addr_t)args[0], ident, sizeof(ident), &done);
++	}
++	if (error == 0) {
++		error = copyinstr((user_addr_t)args[1], path, sizeof(path), &done);
++	}
++	if (error) {
++		return error == ENAMETOOLONG ? 0 : error;   /* too long to keep: accepted, not kept */
++	}
++	if (args[2] != 0 || ident[0] == '\0' || path[0] != '/') {
++		return 0;                       /* app groups: not asked for here */
++	}
++	int said = 0, added = 0;
++	lck_mtx_lock(&sweet_containers_lock);
++	unsigned i;
++	for (i = 0; i < sweet_ident_count; i++) {
++		if (strcmp(sweet_ident_containers[i].ident, ident) == 0) {
++			break;
++		}
++	}
++	if (i == sweet_ident_count && sweet_ident_count < SWEET_IDENT_CONTAINERS) {
++		sweet_ident_count++;
++		added = 1;
++	}
++	if (i < sweet_ident_count) {
++		strlcpy(sweet_ident_containers[i].ident, ident, sizeof(sweet_ident_containers[i].ident));
++		strlcpy(sweet_ident_containers[i].path, path, sizeof(sweet_ident_containers[i].path));
++	}
++	if (added && sweet_ident_said < 12) {
++		sweet_ident_said++;
++		said = 1;
++	}
++	unsigned count = sweet_ident_count;
++	lck_mtx_unlock(&sweet_containers_lock);
++	if (said) {
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET Sandbox: %s: container of %s is %s (%u known)\n", name, ident, path, count);
++	}
++	return 0;
++}
++
+ static int
+ sweet_sandbox_container_path(user_addr_t arg)
+ {
+@@ -510,4 +585,6 @@
+ 	case 0x42:      /* set container path for audit token */
+ 		return sweet_sandbox_container_set(arg);
++	case 0xd:       /* set container path for signing identity / application group (0202) */
++		return sweet_sandbox_container_for_identity(p, arg);
+ 	case 5:
+ 		return sweet_sandbox_extension_issue(arg);

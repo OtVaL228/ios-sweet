@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -285,6 +285,15 @@
+ 	setProperty("device UID", "SweetBuiltInAudio");
+ 	setProperty("device name", "Built-In Audio");
+ 	setProperty("clock domain", 1ULL, 32);
++	/*
++	 * 0232: the device's own nominal rate (32.32). Without it CoreAudio reported kAudioDevicePropertyNominalSampleRate
++	 * 0 for the device: VirtualAudio set 48000, read 0, waited 2 s ("timed out ... [nsrt/glob/0] ... on id 33", "Error
++	 * 'what' setting sample rate to 48000.000000 Hz on HAL device 33"), fell back to 44100 and failed. The IOAudio2
++	 * key is not confirmed, so the likely names are all published (an unread key is harmless).
++	 */
++	setProperty("sample rate", (unsigned long long)SWEET_AUDIO_RATE << 32, 64);
++	setProperty("nominal sample rate", (unsigned long long)SWEET_AUDIO_RATE << 32, 64);
++	setProperty("current sample rate", (unsigned long long)SWEET_AUDIO_RATE << 32, 64);
+ 	setProperty("io buffer frame size", 512ULL, 32);
+ 	/*
+ 	 * 0228: VirtualAudio's DeviceFactory_Aspen has no case for 'bltn' (no device object: listed, never adopted).
+@@ -517,6 +526,11 @@
+ 		}
+ 		notify(0x636f6e66 /* 'conf' */, args->scalarInputCount ? (uint32_t)args->scalarInput[0] : 0);
+ 		break;
++	case 4:         /* 0232: set sample rate (32.32): only 48000 exists; logged, confirmed with 'conf' as a real driver does */
++		IOLog("SWEET AUDIO: %s set sample rate %#llx (%llu Hz)\n", name, args->scalarInputCount ? args->scalarInput[0] : 0ULL,
++		    args->scalarInputCount ? args->scalarInput[0] >> 32 : 0ULL);
++		notify(0x636f6e66 /* 'conf' */, 0);
++		break;
+ 	case 3:         /* 0230: the HAL acknowledges a 'conf' */
+ 		IOLog("SWEET AUDIO: %s config change ack (%u bytes)\n", name, args->structureInputSize);
+ 		break;

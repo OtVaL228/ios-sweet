@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -81,9 +81,14 @@
+ 	if (f == NULL) {
+ 		return NULL;
+ 	}
++	/*
++	 * 0231: min / max as 32.32 too. Plain 48000 read as 32.32 is 0 Hz: VirtualAudio's list of physical formats held
++	 * [16/0/2] only, so it "did not contain the current physical stream format" [16/48000/2], set 16/0/2 and timed
++	 * out after 2 s waiting for it ("property [pft /glob/0]", "Error 'what' ensuring valid physical stream format").
++	 */
+ 	sweet_set_num(f, "sample rate", (uint64_t)SWEET_AUDIO_RATE << 32);
+-	sweet_set_num(f, "min sample rate", SWEET_AUDIO_RATE);
+-	sweet_set_num(f, "max sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(f, "min sample rate", (uint64_t)SWEET_AUDIO_RATE << 32);
++	sweet_set_num(f, "max sample rate", (uint64_t)SWEET_AUDIO_RATE << 32);
+ 	sweet_set_num(f, "format ID", 0x6c70636d)  /* 'lpcm' */;
+ 	sweet_set_num(f, "format flags", 0x4 | 0x8);    /* signed integer, packed */
+ 	sweet_set_num(f, "bytes per packet", 2 * channels);
+@@ -110,8 +115,8 @@
+ 	sweet_set_num(s, "ring buffer frame size", SWEET_AUDIO_RING);
+ 	sweet_set_num(s, "latency", 0);
+ 	sweet_set_num(s, "safety offset", 64);
+-	sweet_set_num(s, "min sample rate", SWEET_AUDIO_RATE);
+-	sweet_set_num(s, "max sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(s, "min sample rate", (uint64_t)SWEET_AUDIO_RATE << 32);   /* 0231: 32.32 */
++	sweet_set_num(s, "max sample rate", (uint64_t)SWEET_AUDIO_RATE << 32);
+ 	/*
+ 	 * the current format both as a dictionary and as the first supported / available one. 0227: CoreAudio reads it
+ 	 * as "current format" ("there is no current format" with 0226's "format") and wants "starting channel" (UInt32,

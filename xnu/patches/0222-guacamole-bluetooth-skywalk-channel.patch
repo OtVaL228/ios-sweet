@@ -1,0 +1,400 @@
+--- a/bsd/dev/sweet_btuart.c
++++ b/bsd/dev/sweet_btuart.c
+@@ -10,6 +10,12 @@
+  * (userland/bt/btbridge.c), which connects to the privileged control "com.sweet.bt.host". Bytes sent by the iOS
+  * side go to the bridge and the bridge's go to the iOS side (the most recent iOS connection; BlueTool and
+  * bluetoothd take turns). The termios options are kept and answered (the link speed is the bridge's business).
++ * 0222: bluetoothd's stack does not read or write that socket: it asks it for a Skywalk channel and moves the bytes
++ * through the channel's rings (research/bluetooth/transport.md, H4 open callback): getsockopt 0x40487413 (termios),
++ * setsockopt 0x800c5414 (12 bytes: open the channel), getsockopt 0x40105412 (16 bytes: the channel's nexus UUID),
++ * os_channel_create, then setsockopt 0x80487414 (termios). The channel is a kernel-pipe nexus as XNU's utun makes
++ * one (bsd/net/if_utun.c utun_enable_channel / utun_kpipe_sync_tx / _rx), bound to the asking process; its slots
++ * carry the H4 byte stream in chunks (no packet boundaries), so the bridge sees the same bytes either way.
+  * Nothing else: no hardware access here.
+  * Boot-arg sweetbt=0 leaves both controls out.
+  */
+@@ -23,6 +29,7 @@
+ #include <sys/termios.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
++#include <skywalk/os_skywalk_private.h>
+ 
+ void sweet_btuart_init(void);
+ 
+@@ -35,7 +42,300 @@
+ static struct termios sweet_bt_termios;
+ static uint64_t sweet_bt_to_host, sweet_bt_to_ios, sweet_bt_lost;
+ 
++/* ---- 0222: the Skywalk kernel-pipe channel for bluetoothd ---- */
++#define SWEET_BT_OPT_CHANNEL_OPEN   0x800c5414u     /* setsockopt, 12 bytes */
++#define SWEET_BT_OPT_CHANNEL_UUID   0x40105412u     /* getsockopt, 16 bytes */
++#define SWEET_BT_SLOT_SIZE          2048
++#define SWEET_BT_RING_SLOTS         64
++#define SWEET_BT_PENDING            (64 * 1024)
++
++static nexus_controller_t sweet_bt_ncd;
++static uuid_t sweet_bt_prov_uuid;               /* the provider, registered once */
++static uuid_t sweet_bt_inst_uuid;               /* the open channel's nexus instance */
++static kern_pbufpool_t sweet_bt_pp;
++static kern_channel_ring_t sweet_bt_rxring, sweet_bt_txring;
++static bool sweet_bt_chan;                      /* a channel instance exists */
++static uint8_t sweet_bt_pending[SWEET_BT_PENDING];      /* bridge -> channel bytes not yet in a slot */
++static size_t sweet_bt_pend_head, sweet_bt_pend_len;
++static void sweet_bt_to_bridge(const void *buf, size_t n);
++
++static errno_t
++sweet_bt_pre_connect(__unused kern_nexus_provider_t nxprov, __unused proc_t p, __unused kern_nexus_t nexus,
++    __unused nexus_port_t port, __unused kern_channel_t channel, __unused void **ch_ctx)
++{
++	return 0;
++}
++
++static errno_t
++sweet_bt_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
++{
++	printf("SWEET BT: channel connected\n");
++	return 0;
++}
++
++static void
++sweet_bt_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
++    __unused kern_channel_t channel)
++{
++}
++
++static void
++sweet_bt_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
++    __unused kern_channel_t channel)
++{
++	printf("SWEET BT: channel disconnected\n");
++}
++
++static errno_t
++sweet_bt_ring_init(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel,
++    kern_channel_ring_t ring, boolean_t is_tx_ring, __unused void **ring_ctx)
++{
++	lck_mtx_lock(&sweet_bt_lock);
++	if (is_tx_ring) {
++		sweet_bt_txring = ring;
++	} else {
++		sweet_bt_rxring = ring;
++	}
++	lck_mtx_unlock(&sweet_bt_lock);
++	return 0;
++}
++
++static void
++sweet_bt_ring_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring)
++{
++	lck_mtx_lock(&sweet_bt_lock);
++	if (sweet_bt_rxring == ring) {
++		sweet_bt_rxring = NULL;
++	} else if (sweet_bt_txring == ring) {
++		sweet_bt_txring = NULL;
++	}
++	lck_mtx_unlock(&sweet_bt_lock);
++}
++
++/* bluetoothd wrote: every filled slot's bytes go to the bridge */
++static errno_t
++sweet_bt_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t tx_ring,
++    __unused uint32_t flags)
++{
++	kern_channel_slot_t pslot = NULL, slot = kern_channel_get_next_slot(tx_ring, NULL, NULL);
++	struct kern_channel_ring_stat_increment stats = {};
++	while (slot != NULL) {
++		kern_packet_t ph = kern_channel_slot_get_packet(tx_ring, slot);
++		pslot = slot;
++		slot = kern_channel_get_next_slot(tx_ring, slot, NULL);
++		if (ph == 0) {
++			continue;
++		}
++		kern_buflet_t buf = kern_packet_get_next_buflet(ph, NULL);
++		if (buf == NULL) {
++			continue;
++		}
++		uint8_t *addr = (uint8_t *)kern_buflet_get_data_address(buf);
++		if (addr == NULL) {
++			continue;
++		}
++		addr += kern_buflet_get_data_offset(buf);
++		size_t len = MIN(kern_packet_get_data_length(ph), SWEET_BT_SLOT_SIZE);
++		sweet_bt_to_bridge(addr, len);
++		stats.kcrsi_slots_transferred++;
++		stats.kcrsi_bytes_transferred += len;
++	}
++	if (pslot != NULL) {
++		kern_channel_advance_slot(tx_ring, pslot);
++		kern_channel_increment_ring_stats(tx_ring, &stats);
++		(void) kern_channel_reclaim(tx_ring);
++	}
++	return 0;
++}
++
++/* bluetoothd reads: pending bridge bytes into free slots, up to a slot's size each */
++static errno_t
++sweet_bt_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t rx_ring,
++    __unused uint32_t flags)
++{
++	struct kern_channel_ring_stat_increment stats = {};
++	(void) kern_channel_reclaim(rx_ring);
++	if (kern_channel_available_slot_count(rx_ring) == 0) {
++		return 0;
++	}
++	struct kern_pbufpool *pp = rx_ring->ckr_pp;
++	kern_channel_slot_t pslot = NULL, slot = kern_channel_get_next_slot(rx_ring, NULL, NULL);
++	while (slot != NULL) {
++		kern_packet_t ph = 0;
++		if (sweet_bt_pend_len == 0 || kern_pbufpool_alloc_nosleep(pp, 1, &ph) != 0) {
++			break;
++		}
++		kern_buflet_t buf = kern_packet_get_next_buflet(ph, NULL);
++		uint8_t *addr = buf ? (uint8_t *)kern_buflet_get_data_address(buf) : NULL;
++		if (addr == NULL) {
++			kern_pbufpool_free(pp, ph);
++			break;
++		}
++		size_t n = 0;
++		lck_mtx_lock(&sweet_bt_lock);
++		while (n < SWEET_BT_SLOT_SIZE && n < PP_BUF_SIZE_DEF(pp) && sweet_bt_pend_len > 0) {
++			size_t run = MIN(MIN(sweet_bt_pend_len, SWEET_BT_PENDING - sweet_bt_pend_head),
++			    MIN((size_t)SWEET_BT_SLOT_SIZE, (size_t)PP_BUF_SIZE_DEF(pp)) - n);
++			memcpy(addr + n, sweet_bt_pending + sweet_bt_pend_head, run);
++			n += run;
++			sweet_bt_pend_head = (sweet_bt_pend_head + run) % SWEET_BT_PENDING;
++			sweet_bt_pend_len -= run;
++		}
++		lck_mtx_unlock(&sweet_bt_lock);
++		kern_buflet_set_data_offset(buf, 0);
++		kern_buflet_set_data_length(buf, (uint32_t)n);
++		kern_packet_finalize(ph);
++		if (kern_channel_slot_attach_packet(rx_ring, slot, ph) != 0) {
++			kern_pbufpool_free(pp, ph);
++			break;
++		}
++		stats.kcrsi_slots_transferred++;
++		stats.kcrsi_bytes_transferred += n;
++		pslot = slot;
++		slot = kern_channel_get_next_slot(rx_ring, slot, NULL);
++	}
++	if (pslot != NULL) {
++		kern_channel_advance_slot(rx_ring, pslot);
++		kern_channel_increment_ring_stats(rx_ring, &stats);
++	}
++	return 0;
++}
++
++static errno_t
++sweet_bt_channel_open(void)
++{
++	errno_t e;
++	if (sweet_bt_ncd == NULL) {
++		uuid_t dom;
++		nexus_attr_t nxa = NULL;
++		struct kern_nexus_provider_init prov = {
++			.nxpi_version = KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION,
++			.nxpi_flags = NXPIF_VIRTUAL_DEVICE,
++			.nxpi_pre_connect = sweet_bt_pre_connect,
++			.nxpi_connected = sweet_bt_connected,
++			.nxpi_pre_disconnect = sweet_bt_pre_disconnect,
++			.nxpi_disconnected = sweet_bt_disconnected,
++			.nxpi_ring_init = sweet_bt_ring_init,
++			.nxpi_ring_fini = sweet_bt_ring_fini,
++			.nxpi_sync_tx = sweet_bt_sync_tx,
++			.nxpi_sync_rx = sweet_bt_sync_rx,
++		};
++		if ((e = kern_nexus_controller_create(&sweet_bt_ncd)) != 0) {
++			sweet_bt_ncd = NULL;
++			return e;
++		}
++		if ((e = kern_nexus_get_default_domain_provider(NEXUS_TYPE_KERNEL_PIPE, &dom)) != 0 ||
++		    (e = kern_nexus_attr_create(&nxa)) != 0) {
++			return e;
++		}
++		kern_nexus_attr_set(nxa, NEXUS_ATTR_SLOT_BUF_SIZE, SWEET_BT_SLOT_SIZE);
++		kern_nexus_attr_set(nxa, NEXUS_ATTR_TX_SLOTS, SWEET_BT_RING_SLOTS);
++		kern_nexus_attr_set(nxa, NEXUS_ATTR_RX_SLOTS, SWEET_BT_RING_SLOTS);
++		e = kern_nexus_controller_register_provider(sweet_bt_ncd, dom, (const uint8_t *)"com.sweet.nexus.bt.kpipe",
++		    &prov, sizeof(prov), nxa, &sweet_bt_prov_uuid);
++		kern_nexus_attr_destroy(nxa);
++		if (e != 0) {
++			kern_nexus_controller_destroy(sweet_bt_ncd);
++			sweet_bt_ncd = NULL;
++			return e;
++		}
++	}
++	if (sweet_bt_chan) {
++		return 0;
++	}
++	struct kern_pbufpool_init ppi;
++	bzero(&ppi, sizeof(ppi));
++	ppi.kbi_version = KERN_PBUFPOOL_CURRENT_VERSION;
++	ppi.kbi_flags = KBIF_VIRTUAL_DEVICE | KBIF_QUANTUM;
++	ppi.kbi_packets = SWEET_BT_RING_SLOTS * 4;
++	ppi.kbi_bufsize = SWEET_BT_SLOT_SIZE;
++	ppi.kbi_buf_seg_size = skmem_usr_buf_seg_size;
++	ppi.kbi_max_frags = 1;
++	(void) snprintf((char *)ppi.kbi_name, sizeof(ppi.kbi_name), "com.sweet.kpipe.bt");
++	if ((e = kern_pbufpool_create(&ppi, &sweet_bt_pp, NULL)) != 0) {
++		sweet_bt_pp = NULL;
++		return e;
++	}
++	struct kern_nexus_init init;
++	bzero(&init, sizeof(init));
++	init.nxi_version = KERN_NEXUS_CURRENT_VERSION;
++	init.nxi_tx_pbufpool = sweet_bt_pp;
++	if ((e = kern_nexus_controller_alloc_provider_instance(sweet_bt_ncd, sweet_bt_prov_uuid, NULL, NULL,
++	    &sweet_bt_inst_uuid, &init)) != 0) {
++		kern_pbufpool_destroy(sweet_bt_pp);
++		sweet_bt_pp = NULL;
++		return e;
++	}
++	nexus_port_t port = NEXUS_PORT_KERNEL_PIPE_CLIENT;
++	if ((e = kern_nexus_controller_bind_provider_instance(sweet_bt_ncd, sweet_bt_inst_uuid, &port, proc_selfpid(),
++	    NULL, NULL, 0, NEXUS_BIND_PID)) != 0) {
++		kern_nexus_controller_free_provider_instance(sweet_bt_ncd, sweet_bt_inst_uuid);
++		uuid_clear(sweet_bt_inst_uuid);
++		kern_pbufpool_destroy(sweet_bt_pp);
++		sweet_bt_pp = NULL;
++		return e;
++	}
++	lck_mtx_lock(&sweet_bt_lock);
++	sweet_bt_pend_head = sweet_bt_pend_len = 0;
++	sweet_bt_chan = true;
++	lck_mtx_unlock(&sweet_bt_lock);
++	printf("SWEET BT: channel open for pid %d\n", proc_selfpid());
++	return 0;
++}
++
++static void
++sweet_bt_channel_close(void)
++{
++	lck_mtx_lock(&sweet_bt_lock);
++	bool was = sweet_bt_chan;
++	sweet_bt_chan = false;
++	lck_mtx_unlock(&sweet_bt_lock);
++	if (!was) {
++		return;
++	}
++	if (kern_nexus_controller_free_provider_instance(sweet_bt_ncd, sweet_bt_inst_uuid) == 0 && sweet_bt_pp != NULL) {
++		kern_pbufpool_destroy(sweet_bt_pp);
++		sweet_bt_pp = NULL;
++	}
++	uuid_clear(sweet_bt_inst_uuid);
++	printf("SWEET BT: channel closed\n");
++}
++
+ /* bytes from one side to the other's socket (dropped, and counted, when the other side is not there) */
++static void
++sweet_bt_to_bridge(const void *buf, size_t n)
++{
++	lck_mtx_lock(&sweet_bt_lock);
++	kern_ctl_ref ref = sweet_bt_host_ref;
++	u_int32_t unit = sweet_bt_host_unit;
++	lck_mtx_unlock(&sweet_bt_lock);
++	if (unit == 0 || ctl_enqueuedata(ref, unit, (void *)(uintptr_t)buf, n, 0) != 0) {
++		sweet_bt_lost += n;
++	} else {
++		sweet_bt_to_host += n;
++	}
++}
++
++/* bridge -> bluetoothd's channel (0222): queued, then the channel is told to read */
++static void
++sweet_bt_to_channel(const uint8_t *buf, size_t n)
++{
++	lck_mtx_lock(&sweet_bt_lock);
++	size_t room = SWEET_BT_PENDING - sweet_bt_pend_len, k = MIN(n, room);
++	for (size_t i = 0; i < k; i++) {
++		sweet_bt_pending[(sweet_bt_pend_head + sweet_bt_pend_len + i) % SWEET_BT_PENDING] = buf[i];
++	}
++	sweet_bt_pend_len += k;
++	sweet_bt_lost += n - k;
++	sweet_bt_to_ios += k;
++	kern_channel_ring_t rx = sweet_bt_rxring;
++	lck_mtx_unlock(&sweet_bt_lock);
++	if (rx != NULL) {
++		kern_channel_notify(rx, 0);
++	}
++}
++
++/* bytes from one side to the other (dropped, and counted, when the other side is not there) */
+ static void
+ sweet_bt_pass(mbuf_t m, bool to_host)
+ {
+@@ -44,16 +344,19 @@
+ 	lck_mtx_lock(&sweet_bt_lock);
+ 	kern_ctl_ref ref = to_host ? sweet_bt_host_ref : sweet_bt_ios_cur;
+ 	u_int32_t unit = to_host ? sweet_bt_host_unit : sweet_bt_ios_unit;
++	bool channel = !to_host && sweet_bt_chan && sweet_bt_ios_cur == sweet_bt_sk_ref;
+ 	lck_mtx_unlock(&sweet_bt_lock);
+ 	while (off < len) {
+ 		size_t n = MIN(len - off, sizeof(buf));
+ 		if (mbuf_copydata(m, off, n, buf) != 0) {
+ 			break;
+ 		}
+-		if (unit == 0 || ctl_enqueuedata(ref, unit, buf, n, 0) != 0) {
++		if (to_host) {
++			sweet_bt_to_bridge(buf, n);
++		} else if (channel) {
++			sweet_bt_to_channel((const uint8_t *)buf, n);
++		} else if (unit == 0 || ctl_enqueuedata(ref, unit, buf, n, 0) != 0) {
+ 			sweet_bt_lost += n;
+-		} else if (to_host) {
+-			sweet_bt_to_host += n;
+ 		} else {
+ 			sweet_bt_to_ios += n;
+ 		}
+@@ -84,6 +387,9 @@
+ 		sweet_bt_ios_unit = 0;
+ 	}
+ 	lck_mtx_unlock(&sweet_bt_lock);
++	if (ref == sweet_bt_sk_ref) {
++		sweet_bt_channel_close();       /* 0222: bluetoothd went away (it crashes on purpose when it gives up) */
++	}
+ 	printf("SWEET BT: unit %u disconnected (%llu bytes to the bridge, %llu back, %llu lost so far)\n", unit,
+ 	    sweet_bt_to_host, sweet_bt_to_ios, sweet_bt_lost);
+ 	return 0;
+@@ -98,9 +404,17 @@
+ 
+ /* termios at level SYSPROTO_CONTROL: kept as given, answered as kept */
+ static errno_t
+-sweet_bt_ios_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, __unused int opt,
++sweet_bt_ios_setopt(kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, int opt,
+     void *data, size_t len)
+ {
++	if ((u_int32_t)opt == SWEET_BT_OPT_CHANNEL_OPEN) {
++		/* 0222: bluetoothd asks for its channel (12 bytes of parameters, not needed here) */
++		errno_t e = ref == sweet_bt_sk_ref ? sweet_bt_channel_open() : ENOTSUP;
++		if (e != 0) {
++			printf("SWEET BT: channel open failed: %d\n", e);
++		}
++		return e;
++	}
+ 	if (data != NULL && len == sizeof(sweet_bt_termios)) {
+ 		lck_mtx_lock(&sweet_bt_lock);
+ 		memcpy(&sweet_bt_termios, data, len);
+@@ -110,9 +424,22 @@
+ }
+ 
+ static errno_t
+-sweet_bt_ios_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, __unused int opt,
++sweet_bt_ios_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *info, int opt,
+     void *data, size_t *len)
+ {
++	if ((u_int32_t)opt == SWEET_BT_OPT_CHANNEL_UUID) {
++		/* 0222: the nexus instance bluetoothd's os_channel_create opens */
++		if (data == NULL) {
++			*len = sizeof(uuid_t);
++			return 0;
++		}
++		if (!sweet_bt_chan || *len < sizeof(uuid_t)) {
++			return ENXIO;
++		}
++		uuid_copy(data, sweet_bt_inst_uuid);
++		*len = sizeof(uuid_t);
++		return 0;
++	}
+ 	if (data == NULL) {
+ 		*len = sizeof(sweet_bt_termios);
+ 		return 0;

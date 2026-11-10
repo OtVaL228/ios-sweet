@@ -1,0 +1,10 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -267,6 +267,6 @@
+ 		sweet_set_num(c, "control ID", 1000 + el);
+ 		sweet_set_num(c, "class", 0x6d757465);         /* 'mute' */
+-		sweet_set_num(c, "base class", 0x746f676c);    /* 0233: 'togl' (boolean: mute's base class), was 'ctrl' */
++		sweet_set_num(c, "base class", 0x6374726c);    /* 'ctrl': IOAudio2 control base class */
+ 		sweet_set_num(c, "scope", 0x6f757470);         /* 'outp' */
+ 		sweet_set_num(c, "element", el);
+ 		sweet_set_num(c, "value", 0);

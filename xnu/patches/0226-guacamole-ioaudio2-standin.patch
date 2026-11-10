@@ -1,0 +1,408 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetAudio.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -52,6 +52,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOAudio2Device;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAudio2Device;"
++    "   },"
+     "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -0,0 +1,381 @@
++/*
++ * Built-in IOAudio2 stand-in for SWEET (0226): a silent "IOAudio2Device" so CoreAudio has a built-in device.
++ *
++ * Why: on iOS every audio route (speaker, receiver, Bluetooth A2DP/HFP) is a port of VirtualAudio's default virtual
++ * device ('vdef'), which aggregates the physical built-in devices. On an iPhone X those are IOAudio2 devices of the
++ * CS42L75 codec / CS35L26 amp kexts (not in this kernel), so VirtualAudio crashed (image v12 removed it) and
++ * Bluetooth headphones could be listed but never selected ("Unable to find endpoint", "Couldn't get the VAD",
++ * -66680 Default-InputOutput; research/audio/README.md).
++ *
++ * Contract (research/audio/coreaudio-ioa2-client-contract.md, iOS 16.7 CoreAudio HALS_IOA2*): matched by class name
++ * IOServiceMatching("IOAudio2Device"), user client type 0; registry: device UID / device name / input streams /
++ * output streams / controls / clock domain / io buffer frame size / transport type / latencies / safety offsets;
++ * stream dictionaries with stream ID, ring buffer frame size and format dictionaries; selectors 2 set control
++ * (2 scalars in, 1 out), 3 config change ack (32-byte struct), 5 set stream format (1 scalar + 40-byte ASBD),
++ * 6 set stream active (2 scalars), 10 / 11 start / stop IO with flags (1 scalar in, 1 out); memory type 0 = engine
++ * status page (>= 0x28 bytes), 0x10000000 + stream ID = that stream's ring.
++ *
++ * NOT known and guessed here (first round, to be corrected from logs): the identity values (UID/name), the format
++ * dictionary layout, and the status page fields. The page is written as AOP's status page is read: 0x00 sample time
++ * of the last ring wrap, 0x08 host time (mach_absolute_time) of it, 0x10 and 0x18 an equal sequence counter.
++ * Output is discarded, input is zeros; a thread call advances the clock once per ring pass.
++ * Every selector, memory type and format is logged ("SWEET AUDIO: ..."). Boot-arg sweetaudio=0: not published.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++#define SWEET_AUDIO_RATE        48000u
++#define SWEET_AUDIO_RING        4096u           /* frames per ring pass: 85.3 ms */
++#define SWEET_AUDIO_IN_STREAM   1u              /* IOAudio2 convention: 1 input, 2 output */
++#define SWEET_AUDIO_OUT_STREAM  2u
++
++static void
++sweet_set_num(OSDictionary *d, const char *key, uint64_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 64);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++static void
++sweet_set_str(OSDictionary *d, const char *key, const char *v)
++{
++	OSString *s = OSString::withCString(v);
++	if (s != NULL) {
++		d->setObject(key, s);
++		s->release();
++	}
++}
++
++/* one linear PCM format: signed 16-bit packed, interleaved */
++static OSDictionary *
++sweet_audio_format(uint32_t channels)
++{
++	OSDictionary *f = OSDictionary::withCapacity(10);
++	if (f == NULL) {
++		return NULL;
++	}
++	sweet_set_num(f, "sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(f, "min sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(f, "max sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(f, "format ID", 0x6c70636d)  /* 'lpcm' */;
++	sweet_set_num(f, "format flags", 0x4 | 0x8);    /* signed integer, packed */
++	sweet_set_num(f, "bytes per packet", 2 * channels);
++	sweet_set_num(f, "frames per packet", 1);
++	sweet_set_num(f, "bytes per frame", 2 * channels);
++	sweet_set_num(f, "channels per frame", channels);
++	sweet_set_num(f, "bits per channel", 16);
++	return f;
++}
++
++static OSDictionary *
++sweet_audio_stream(uint32_t id, uint32_t channels)
++{
++	OSDictionary *s = OSDictionary::withCapacity(12);
++	OSDictionary *f = sweet_audio_format(channels);
++	OSArray *formats = f != NULL ? OSArray::withObjects((const OSObject **)&f, 1, 1) : NULL;
++	if (s == NULL || f == NULL || formats == NULL) {
++		OSSafeReleaseNULL(s);
++		OSSafeReleaseNULL(f);
++		OSSafeReleaseNULL(formats);
++		return NULL;
++	}
++	sweet_set_num(s, "stream ID", id);
++	sweet_set_num(s, "ring buffer frame size", SWEET_AUDIO_RING);
++	sweet_set_num(s, "latency", 0);
++	sweet_set_num(s, "safety offset", 64);
++	sweet_set_num(s, "min sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(s, "max sample rate", SWEET_AUDIO_RATE);
++	/* the current format both as a dictionary and as the first supported / available one */
++	s->setObject("format", f);
++	s->setObject("supported formats", formats);
++	s->setObject("available formats", formats);
++	f->release();
++	formats->release();
++	return s;
++}
++
++class IOAudio2Device : public IOService {
++	OSDeclareDefaultStructors(IOAudio2Device);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++
++	IOBufferMemoryDescriptor *status;
++	IOBufferMemoryDescriptor *ring[3];      /* by stream ID (1 input, 2 output) */
++	thread_call_t clockCall;
++	uint64_t anchor, period, passes, seq;
++	bool running;
++
++	void publish(void);
++	void tick(void);
++	void startIO(void);
++	void stopIO(void);
++};
++
++OSDefineMetaClassAndStructors(IOAudio2Device, IOService);
++
++static IOAudio2Device *sweet_audio;
++static IOLock *sweet_audio_lock;
++
++static void
++sweet_audio_tick(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	((IOAudio2Device *)p0)->tick();
++}
++
++void
++IOAudio2Device::publish(void)
++{
++	volatile uint64_t *w = (volatile uint64_t *)status->getBytesNoCopy();
++	seq++;
++	w[2] = seq;
++	__builtin_arm_dmb(0xb);                 /* ish: counter before the values (seqlock writer) */
++	w[0] = passes * SWEET_AUDIO_RING;
++	w[1] = anchor + passes * period;
++	__builtin_arm_dmb(0xb);
++	w[3] = seq;
++}
++
++void
++IOAudio2Device::tick(void)
++{
++	IOLockLock(sweet_audio_lock);
++	if (running) {
++		/* catch up if the call ran late, so sample and host time stay on one line */
++		uint64_t now = mach_absolute_time();
++		while (anchor + (passes + 1) * period <= now) {
++			passes++;
++		}
++		/* input stays silent: the ring is never written */
++		publish();
++		thread_call_enter_delayed(clockCall, anchor + (passes + 1) * period);
++	}
++	IOLockUnlock(sweet_audio_lock);
++}
++
++void
++IOAudio2Device::startIO(void)
++{
++	IOLockLock(sweet_audio_lock);
++	if (!running) {
++		running = true;
++		anchor = mach_absolute_time();
++		passes = 0;
++		publish();
++		thread_call_enter_delayed(clockCall, anchor + period);
++	}
++	IOLockUnlock(sweet_audio_lock);
++}
++
++void
++IOAudio2Device::stopIO(void)
++{
++	IOLockLock(sweet_audio_lock);
++	running = false;
++	IOLockUnlock(sweet_audio_lock);
++	thread_call_cancel(clockCall);
++}
++
++bool
++IOAudio2Device::start(IOService *provider)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetaudio", &on, sizeof(on));
++	if (!on) {
++		IOLog("SWEET AUDIO: off (sweetaudio=0)\n");
++		return false;
++	}
++	if (sweet_audio != NULL || !IOService::start(provider)) {
++		return false;
++	}
++	sweet_audio_lock = IOLockAlloc();
++	status = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	ring[SWEET_AUDIO_IN_STREAM] = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared,
++	    round_page(SWEET_AUDIO_RING * 2), page_size);
++	ring[SWEET_AUDIO_OUT_STREAM] = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared,
++	    round_page(SWEET_AUDIO_RING * 4), page_size);
++	clockCall = thread_call_allocate_with_options(sweet_audio_tick, this, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
++	if (sweet_audio_lock == NULL || status == NULL || ring[1] == NULL || ring[2] == NULL || clockCall == NULL) {
++		IOLog("SWEET AUDIO: out of memory\n");
++		return false;
++	}
++	bzero(status->getBytesNoCopy(), page_size);
++	bzero(ring[1]->getBytesNoCopy(), ring[1]->getLength());
++	bzero(ring[2]->getBytesNoCopy(), ring[2]->getLength());
++	nanoseconds_to_absolutetime((uint64_t)SWEET_AUDIO_RING * NSEC_PER_SEC / SWEET_AUDIO_RATE, &period);
++
++	OSDictionary *in = sweet_audio_stream(SWEET_AUDIO_IN_STREAM, 1);
++	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, 2);
++	OSArray *ins = in != NULL ? OSArray::withObjects((const OSObject **)&in, 1, 1) : NULL;
++	OSArray *outs = out != NULL ? OSArray::withObjects((const OSObject **)&out, 1, 1) : NULL;
++	OSArray *controls = OSArray::withCapacity(1);
++	if (ins != NULL) {
++		setProperty("input streams", ins);
++	}
++	if (outs != NULL) {
++		setProperty("output streams", outs);
++	}
++	if (controls != NULL) {
++		setProperty("controls", controls);
++	}
++	OSSafeReleaseNULL(in);
++	OSSafeReleaseNULL(out);
++	OSSafeReleaseNULL(ins);
++	OSSafeReleaseNULL(outs);
++	OSSafeReleaseNULL(controls);
++	setProperty("device UID", "SweetBuiltInAudio");
++	setProperty("device name", "Built-In Audio");
++	setProperty("clock domain", 1ULL, 32);
++	setProperty("io buffer frame size", 512ULL, 32);
++	setProperty("transport type", 0x626c746eULL, 32)   /* 'bltn' (built-in) */;
++	setProperty("input latency", 0ULL, 32);
++	setProperty("output latency", 0ULL, 32);
++	setProperty("input safety offset", 64ULL, 32);
++	setProperty("output safety offset", 64ULL, 32);
++	setProperty(kIOUserClientClassKey, "IOAudio2DeviceUserClient");
++	sweet_audio = this;
++	registerService();
++	IOLog("SWEET AUDIO: IOAudio2Device \"SweetBuiltInAudio\" registered (silent: %u Hz, out stream %u 2 ch, in stream %u "
++	    "1 ch, s16, ring %u frames)\n", SWEET_AUDIO_RATE, SWEET_AUDIO_OUT_STREAM, SWEET_AUDIO_IN_STREAM, SWEET_AUDIO_RING);
++	return true;
++}
++
++class IOAudio2DeviceUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOAudio2DeviceUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	bool started;
++};
++
++OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient);
++
++static uint64_t sweet_audio_logged;     /* selectors already logged (< 64) */
++static uint32_t sweet_audio_maps_logged;
++
++IOReturn
++IOAudio2DeviceUserClient::clientClose(void)
++{
++	if (started && sweet_audio != NULL) {
++		sweet_audio->stopIO();
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::registerNotificationPort(__unused mach_port_t port, UInt32 type, __unused io_user_reference_t refCon)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET AUDIO: %s notification port type %u (accepted; no notifications are sent)\n", name, type);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOBufferMemoryDescriptor *md = NULL;
++	if (sweet_audio != NULL) {
++		if (type == 0) {
++			md = sweet_audio->status;
++		} else if (type == 0x10000000 + SWEET_AUDIO_IN_STREAM || type == 0x10000000 + SWEET_AUDIO_OUT_STREAM) {
++			md = sweet_audio->ring[type - 0x10000000];
++		}
++	}
++	if (sweet_audio_maps_logged < 16) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AUDIO: %s map type %#x -> %s\n", name, type, md != NULL ? "ok" : "unsupported");
++		sweet_audio_maps_logged++;
++	}
++	if (md == NULL) {
++		return kIOReturnUnsupported;
++	}
++	md->retain();
++	*memory = md;
++	*options = 0;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	switch (selector) {
++	case 2:         /* set control value: echo the requested value */
++		if (args->scalarInputCount >= 2 && args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = args->scalarInput[1];
++		}
++		break;
++	case 5:         /* set stream format: log the ASBD (only the one published format exists) */
++		if (args->structureInputSize >= 40 && args->structureInput != NULL) {
++			const uint8_t *a = (const uint8_t *)args->structureInput;
++			uint64_t rate;
++			uint32_t fmt, flags, bpf, ch, bits;
++			memcpy(&rate, a, 8);
++			memcpy(&fmt, a + 8, 4);
++			memcpy(&flags, a + 12, 4);
++			memcpy(&bpf, a + 24, 4);
++			memcpy(&ch, a + 28, 4);
++			memcpy(&bits, a + 32, 4);
++			IOLog("SWEET AUDIO: %s set format stream %llu: rate bits %#llx fmt %#x flags %#x %u B/frame %u ch %u bits\n",
++			    name, args->scalarInputCount ? args->scalarInput[0] : 0ULL, rate, fmt, flags, bpf, ch, bits);
++		}
++		break;
++	case 10:        /* start IO */
++		if (sweet_audio != NULL) {
++			sweet_audio->startIO();
++			started = true;
++		}
++		IOLog("SWEET AUDIO: %s start IO (flags %#llx)\n", name, args->scalarInputCount ? args->scalarInput[0] : 0ULL);
++		break;
++	case 11:        /* stop IO */
++		if (sweet_audio != NULL && started) {
++			sweet_audio->stopIO();
++			started = false;
++		}
++		IOLog("SWEET AUDIO: %s stop IO (flags %#llx)\n", name, args->scalarInputCount ? args->scalarInput[0] : 0ULL);
++		break;
++	default:        /* 3 config ack, 6 stream active, anything else: accepted */
++		break;
++	}
++	if (selector >= 64 || !(sweet_audio_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_audio_logged |= 1ULL << selector;
++		}
++		IOLog("SWEET AUDIO: %s sel %u in %u/%u out %u/%u -> ok\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++#endif /* SWEET */

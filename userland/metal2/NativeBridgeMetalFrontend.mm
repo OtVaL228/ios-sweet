@@ -17,6 +17,7 @@
 #include <atomic>
 #include <mutex>
 #include <pthread.h>
+#include <unistd.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -202,6 +203,11 @@ static void waitForResource(id resource);
 - (uint64_t)protectionOptions {return 0;} \
 - (id<MTLHeap>)heap {return _parentHeap;} \
 - (BOOL)isAliasable {return NO;} \
+/* 0208: MPS releases its temporary images' heap memory early with this (mpsprobe's blur: "-[NBTexture makeAliasable]: \
+   unrecognized selector"). Aliasing only lets later heap resources reuse the memory; the runtime's heap has no reuse, \
+   so the memory stays this resource's until it is freed, which Metal allows. isAliasable stays NO: true would \
+   tell callers the contents may already be overwritten. */ \
+- (void)makeAliasable {} \
 - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
 - (void)waitUntilComplete {waitForResource(self);}
 @interface NBBuffer : NBObject
@@ -315,6 +321,38 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
 - (NSUInteger)rotation {return 0;}
+// 0204: Metal's private "is this a CAMetalLayer drawable's texture" (Core Image / Espresso in PhotosPosterProvider ask it
+// while preparing a photo wallpaper: "-[NBTexture isDrawable]: unrecognized selector"). The drawables' textures are
+// the ones CAMetalLayer labels so (as renderCommandEncoderWithDescriptor: tells them apart).
+- (BOOL)isDrawable {return [self.label isEqualToString:@"CAMetalLayer Display Drawable"];}
+// 0205: the memory a texture takes (MTLResource; PhotosPosterProvider asked next: "MISSING NBTexture -allocatedSize").
+// Over a buffer/surface: its rows as laid out; otherwise texels x bytes a texel (by format) over the mip chain, times
+// depth, slices and samples. An estimate where the runtime pads; what callers use it for is accounting.
+static NSUInteger sweetBytesPerTexel(NSUInteger f) {
+ if(f==250)return 2;                          // Depth16Unorm
+ if(f==252||f==255)return 4;                  // Depth32Float, Depth24Unorm_Stencil8
+ if(f==253)return 1;                          // Stencil8
+ if(f==260)return 8;                          // Depth32Float_Stencil8
+ if(f==552||f==553)return 8;                  // BGRA10_XR(_sRGB)
+ if(f<20)return 1;                            // A8, R8
+ if(f<50)return 2;                            // R16, RG8, 16-bit packed
+ if(f<100)return 4;                           // R32, RG16, RGBA8/BGRA8, RGB10A2, RG11B10, RGB9E5
+ if(f<120)return 8;                           // RG32, RGBA16
+ if(f<130)return 16;                          // RGBA32
+ if(f<250)return 1;                           // compressed (ASTC/ETC/PVRTC/BC): about a byte a texel
+ return 4;
+}
+- (NSUInteger)allocatedSize {
+ const NmbTextureDescriptor d=_descriptor;
+ const NSUInteger slices=MAX((NSUInteger)d.array_length,(NSUInteger)1)*MAX((NSUInteger)d.samples,(NSUInteger)1)*
+                         (d.type==5||d.type==6?6:1);           // cube / cube array: six faces
+ if(_rowBytes && _buffer)return (NSUInteger)_rowBytes*MAX((NSUInteger)d.height,(NSUInteger)1)*MAX((NSUInteger)d.depth,(NSUInteger)1)*slices;
+ const NSUInteger bpp=sweetBytesPerTexel((NSUInteger)d.format);
+ NSUInteger total=0;
+ for(NSUInteger l=0;l<MAX((NSUInteger)d.levels,(NSUInteger)1);l++)
+  total+=MAX((NSUInteger)d.width>>l,(NSUInteger)1)*MAX((NSUInteger)d.height>>l,(NSUInteger)1)*MAX((NSUInteger)d.depth>>l,(NSUInteger)1)*bpp;
+ return total*slices;
+}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
@@ -463,6 +501,13 @@ static uint64_t constantBytes(uint64_t type) {
 static std::string quartzCoreCallers();
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
+// 0204: the same with a pipeline library (Metal SPI; MapKit's snapshot service: "MISSING NBLibrary
+// -newFunctionWithName:constantValues:pipelineLibrary:error:", 43 times). The pipeline library is a cache of compiled
+// pipelines: none is kept here, so the function is made as without one.
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary error:(NSError **)error {
+ (void)pipelineLibrary;
+ return [self newFunctionWithName:name constantValues:values error:error];
+}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
   NBLOG(@"native-metal: %@: unqualified function constant values (%s)",name,values?object_getClassName(values):"nil");
@@ -629,6 +674,7 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic,strong) NSMutableArray<id<MTLDrawable>> *presentDrawables;
 @property(nonatomic,strong) NSArray *priorWorkBuffers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
+@property(nonatomic,strong) NSMutableSet *rotatedShadows;   // 0196: landscape stand-ins rendered into (rotatedSurfaceTexture)
 @property(atomic,strong) NSMutableDictionary *userDictionary;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
@@ -694,6 +740,8 @@ static void waitForResource(id resource) {
   IOSurfaceRef sf=texture?[(NBTexture *)texture surface]:nullptr;
   NSString *v=(sf && IOSurfaceGetWidth(sf)*IOSurfaceGetHeight(sf)>=2000000 /* 0187: landscape too */)?
    [NSString stringWithFormat:@"t%lu=surf %#x %lux%lu fmt %lu",(unsigned long)index,IOSurfaceGetID(sf),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat]:nil;
+  // 0219: 0217's converted YCbCr pictures too (the photo wallpaper's '420f' images in backboardd): their draws are traced
+  if(!v && texture)if(NSString *yc=objc_getAssociatedObject(texture,"ycbcr"))v=[NSString stringWithFormat:@"t%lu=%@",(unsigned long)index,yc];
   objc_setAssociatedObject(self,(const void *)NSSelectorFromString(key),v,OBJC_ASSOCIATION_RETAIN);
   NSMutableDictionary *big=objc_getAssociatedObject(self,"bigtex");
   if(!big){big=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"bigtex",big,OBJC_ASSOCIATION_RETAIN);}
@@ -825,6 +873,12 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
 }
 - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
+// 0204: depth clip mode (Find My: "MISSING NBRenderEncoder -setDepthClipMode:"). Clip is Metal's default and what the
+// runtime does; clamp (depth clamping) is not passed on, logged the first time it is asked for.
+- (void)setDepthClipMode:(MTLDepthClipMode)mode {
+ if(mode==MTLDepthClipModeClamp){static std::atomic<bool> said{false};
+  if(!said.exchange(true))NBLOG(@"native-metal: depth clamp asked for (setDepthClipMode:), drawn with clipping");}
+}
 - (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
@@ -1001,11 +1055,101 @@ static void blitOptionNote(MTLBlitOption options,const char *what) {
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
 @end
 
+// 0196: CoreAnimation's framebuffer while a landscape app is in front. backboardd asks for its portrait framebuffer
+// surfaces (1125x2436, 4608 bytes a row) as 2436x1125 textures: Apple's driver gives a texture whose texels land rotated
+// in the surface. The runtime cannot (texture over buffer refused: RowPitch 4608 < 9744), so CA had nowhere to draw
+// and the screen kept its last portrait picture (Angry Birds Classic, AB2). Instead it gets a landscape texture of our
+// own (the "shadow", which keeps what CA drew, so loads and partial redraws work); every command buffer that rendered
+// into it ends with one full-screen pass that turns it into the surface (a portrait texture over the surface).
+// Direction: counter-clockwise by default (a landscape image's top row goes to the surface's left column; clockwise
+// showed Angry Birds Classic upside down); `touch /var/local/sweet-rotate-cw` turns it the other way,
+// `touch /var/local/sweet-norotate` refuses as before. Both are read when a shadow is made (after a respring).
+static NSString *const kRotationSource=@"#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct RotV { float4 position [[position]]; };\n"
+ "vertex RotV rot_v(uint vid [[vertex_id]]) {\n"
+ " float2 p=float2(float((vid<<1)&2),float(vid&2)); RotV o; o.position=float4(p*2.0-1.0,0.0,1.0); return o;\n"
+ "}\n"
+ // portrait pixel p (width W = the landscape height, height H = the landscape width)
+ "fragment float4 rot_cw(RotV in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {\n"
+ " uint2 p=uint2(in.position.xy); uint W=src.get_height(); return src.read(uint2(p.y, W-1-min(p.x,W-1)));\n"
+ "}\n"
+ "fragment float4 rot_ccw(RotV in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {\n"
+ " uint2 p=uint2(in.position.xy); uint H=src.get_width(); return src.read(uint2(H-1-min(p.y,H-1), p.x));\n"
+ "}\n";
+static std::atomic<uint64_t> gRotations{0};
+static id<MTLRenderPipelineState> rotationPipeline(MTLPixelFormat format,unsigned mode) {
+ static std::mutex lock;static NSMutableDictionary *pipelines;static id<MTLLibrary> library;static bool failed;
+ std::lock_guard<std::mutex> guard(lock);
+ if(!pipelines)pipelines=[NSMutableDictionary dictionary];
+ NSNumber *key=@((uint64_t)format*2+mode);
+ if(id state=pipelines[key])return state;
+ if(failed)return nil;
+ NSError *error=nil;
+ if(!library){
+  library=[(id<MTLDevice>)gDeviceObject newLibraryWithSource:kRotationSource options:nil error:&error];
+  if(!library){failed=true;NBLOG(@"native-metal: rotated framebuffer: the turning shader does not compile: %@",error);return nil;}
+ }
+ MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];
+ d.label=@"sweet rotated framebuffer";
+ d.vertexFunction=[library newFunctionWithName:@"rot_v"];
+ d.fragmentFunction=[library newFunctionWithName:mode?@"rot_ccw":@"rot_cw"];
+ d.colorAttachments[0].pixelFormat=format;
+ id<MTLRenderPipelineState> state=d.vertexFunction && d.fragmentFunction?
+  [(id<MTLDevice>)gDeviceObject newRenderPipelineStateWithDescriptor:d error:&error]:nil;
+ if(!state){NBLOG(@"native-metal: rotated framebuffer: no pipeline for format %lu: %@",(unsigned long)format,error);return nil;}
+ pipelines[key]=state;
+ return state;
+}
+// The shadow a texture is, or is a view of (nil: none).
+static NBTexture *rotationShadowOf(id t) {
+ for(int depth=0;t && depth<4;depth++){
+  if(![t isKindOfClass:[NBTexture class]])return nil;
+  if(objc_getAssociatedObject(t,"rotPortrait"))return (NBTexture *)t;
+  t=[(NBTexture *)t parent];
+ }
+ return nil;
+}
+static id<MTLTexture> rotatedSurfaceTexture(id device,MTLTextureDescriptor *d,IOSurfaceRef surface) {
+ if(access("/var/local/sweet-norotate",F_OK)==0)return nil;
+ // counter-clockwise by default: clockwise showed Angry Birds Classic upside down (user, 2026-11-09)
+ const unsigned mode=access("/var/local/sweet-rotate-cw",F_OK)==0?0:1;
+ long spi=-1;
+ if([d respondsToSelector:NSSelectorFromString(@"rotation")]){@try{spi=[[d valueForKey:@"rotation"] longValue];}@catch(NSException *e){}}
+ static std::mutex lock;static NSMutableDictionary *shadows;static std::atomic<uint32_t> said{0};
+ std::lock_guard<std::mutex> guard(lock);
+ if(!shadows)shadows=[NSMutableDictionary dictionary];
+ NSString *key=[NSString stringWithFormat:@"%u:%lu:%lux%lu",IOSurfaceGetID(surface),(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height];
+ if(NBTexture *shadow=shadows[key]){
+  NBTexture *portrait=objc_getAssociatedObject(shadow,"rotPortrait");
+  if(portrait && IOSurfaceGetBaseAddress(portrait.surface)==IOSurfaceGetBaseAddress(surface) &&
+     [objc_getAssociatedObject(shadow,"rotMode") unsignedIntValue]==mode)return shadow;
+  [shadows removeObjectForKey:key];
+ }
+ if(!rotationPipeline(d.pixelFormat,mode))return nil;
+ MTLTextureDescriptor *pd=[d copy];pd.width=d.height;pd.height=d.width;pd.usage=d.usage|MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+ id<MTLTexture> portrait=[(id<MTLDevice>)device newTextureWithDescriptor:pd iosurface:surface plane:0];
+ if(![(id)portrait isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: rotated framebuffer: surface %#x refused even the right way up",IOSurfaceGetID(surface));return nil;}
+ MTLTextureDescriptor *sd=[d copy];sd.storageMode=MTLStorageModePrivate;sd.usage=d.usage|MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+ id<MTLTexture> made=[(id<MTLDevice>)device newTextureWithDescriptor:sd];
+ if(![(id)made isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: rotated framebuffer: no %lux%lu texture of our own",(unsigned long)d.width,(unsigned long)d.height);return nil;}
+ NBTexture *shadow=(NBTexture *)made;
+ shadow.surface=(IOSurfaceRef)CFRetain(surface);    // what CA asked for: -iosurface answers it
+ objc_setAssociatedObject(shadow,"rotPortrait",portrait,OBJC_ASSOCIATION_RETAIN);
+ objc_setAssociatedObject(shadow,"rotMode",@(mode),OBJC_ASSOCIATION_RETAIN);
+ if(shadows.count>=8)[shadows removeAllObjects];
+ shadows[key]=shadow;
+ if(said.fetch_add(1)<16)
+  NBLOG(@"native-metal: rotated framebuffer: surface %#x %zux%zu asked as %lux%lu fmt %lu usage %lu: a landscape texture of ours, turned %s into the surface (descriptor rotation %ld)",
+   IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.width,(unsigned long)d.height,
+   (unsigned long)d.pixelFormat,(unsigned long)d.usage,mode?"counter-clockwise":"clockwise",spi);
+ return shadow;
+}
 static void completed(void *context);
 static void scheduled(void *context);
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentDrawables=[NSMutableArray array];_surfaces=[NSMutableSet set];_userDictionary=[NSMutableDictionary dictionary];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentDrawables=[NSMutableArray array];_surfaces=[NSMutableSet set];_rotatedShadows=[NSMutableSet set];_userDictionary=[NSMutableDictionary dictionary];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self)createdUs=nowUs();
  return self;
 }
@@ -1075,6 +1219,7 @@ static void scheduled(void *context);
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  if(NBTexture *shadow=rotationShadowOf(texture))[_rotatedShadows addObject:shadow];   // 0196
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
@@ -1245,6 +1390,24 @@ static void scheduled(void *context);
 }
 - (void)commit {
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+ if(_rotatedShadows.count && !self.encodeFailure){   // 0196: what CA drew in landscape, into the portrait surface
+  NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
+  for(NBTexture *shadow in shadows){
+   NBTexture *portrait=objc_getAssociatedObject(shadow,"rotPortrait");
+   id<MTLRenderPipelineState> state=rotationPipeline(shadow.pixelFormat,[objc_getAssociatedObject(shadow,"rotMode") unsignedIntValue]);
+   if(!portrait || !state)continue;
+   MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
+   rp.colorAttachments[0].texture=portrait;rp.colorAttachments[0].loadAction=MTLLoadActionDontCare;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
+   id<MTLRenderCommandEncoder> encoder=[(id<MTLCommandBuffer>)self renderCommandEncoderWithDescriptor:rp];
+   if(!encoder)break;
+   [encoder setRenderPipelineState:state];
+   [encoder setFragmentTexture:shadow atIndex:0];
+   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+   [encoder endEncoding];
+   const uint64_t n=++gRotations;
+   if(n<=3 || n%600==0)NBLOG(@"native-metal: rotated framebuffer: turn %llu into surface %#x",(unsigned long long)n,IOSurfaceGetID(portrait.surface));
+  }
+ }
  self.committed=YES;
  self.committedUs=nowUs();
  dispatch_group_enter(_handlers);
@@ -1460,6 +1623,12 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 @property(nonatomic) MTLResourceOptions options;
 @property(nonatomic) MTLHeapType heapType;
 @end
+// 0211: a full automatic heap's resources come from the device (log the first few, and any refusal).
+static void sweetHeapOverflowNote(bool made,NSString *why) {
+ static std::atomic<unsigned> notes{0};
+ if(!made)NBLOG(@"native-metal: heap full (%@) and the device refused the resource too: %@",why,lastError());
+ else if(notes.fetch_add(1)<3)NBLOG(@"native-metal: heap full (%@): resource made outside the heap",why);
+}
 @implementation NBHeap
 - (void)dealloc {nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
@@ -1479,6 +1648,12 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 }
 - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+ // 0211: an automatic heap that is full takes the resource from the device instead (see textureWithDescriptor:offset:).
+ if(!handle && offset==UINT64_MAX){
+  NSString *why=lastError();
+  handle=nmb_buffer_new(gDevice,length,options,nullptr);
+  sweetHeapOverflowNote(handle!=nullptr,why);
+ }
  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
@@ -1490,6 +1665,17 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
+ // 0211: PhotosPosterProvider's MPS work filled its heaps ("heap texture refused: OutOfMemory(Heap)", 16 in a row, and
+ // the photo wallpaper came out black). MPS sizes a heap counting on makeAliasable to free each temporary image's
+ // memory for the next one, and this runtime's heaps never reuse memory (0208: makeAliasable is a no-op). For an
+ // automatic heap (no offset asked) the texture comes from the device instead: callers see an ordinary heap texture
+ // (its heap is this one), only its memory is outside. Placement heaps (an offset) keep the refusal: their caller
+ // laid out the memory and asked for that spot.
+ if(!handle && offset==UINT64_MAX){
+  NSString *why=lastError();
+  handle=nmb_texture_new(gDevice,&descriptor);
+  sweetHeapOverflowNote(handle!=nullptr,why);
+ }
  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
@@ -1638,6 +1824,68 @@ static char sweetMemoryOwnerKey;
   memcpy((uint8_t *)dst+offset+y*dstRow,(const uint8_t *)src+(y0+y)*_row+x0*_texel,w*_texel);
 }
 @end
+// 0217: see newTextureWithDescriptor:iosurface:plane:. nil when the surface is not as expected (then the runtime's own refusal stands).
+static id<MTLTexture> sweetYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurfaceRef surface,void *base,size_t allocation) {
+ const size_t w=IOSurfaceGetWidthOfPlane(surface,0),h=IOSurfaceGetHeightOfPlane(surface,0);
+ const size_t cw=IOSurfaceGetWidthOfPlane(surface,1),ch=IOSurfaceGetHeightOfPlane(surface,1);
+ if(!w || !h || IOSurfaceGetBytesPerElementOfPlane(surface,0)!=1 || IOSurfaceGetBytesPerElementOfPlane(surface,1)!=2 ||
+    cw<(w+1)/2 || ch<(h+1)/2 || d.width>w || d.height>h || !d.width || !d.height)return nil;
+ size_t yrow=IOSurfaceGetBytesPerRowOfPlane(surface,0),crow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ if(!yrow)yrow=(w+63)&~(size_t)63;
+ if(!crow)crow=(cw*2+63)&~(size_t)63;
+ const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ const uintptr_t lo=(uintptr_t)base,hi=lo+allocation;
+ if(!y || !c || (uintptr_t)y<lo || (uintptr_t)c<lo || (uintptr_t)y+yrow*(h-1)+w>hi || (uintptr_t)c+crow*(ch-1)+cw*2>hi)return nil;
+
+ static std::mutex lock;static NSMutableDictionary<NSNumber *,NSArray *> *cache;
+ const uint32_t seed=IOSurfaceGetSeed(surface);
+ NSNumber *key=@(((uint64_t)IOSurfaceGetID(surface)<<32)|((uint64_t)d.width<<16)|d.height);
+ {std::lock_guard<std::mutex> guard(lock);
+  if(!cache)cache=[NSMutableDictionary dictionary];
+  NSArray *hit=cache[key];
+  if(hit && [hit[0] unsignedIntValue]==seed)return hit[1];}
+
+ const size_t ow=d.width,oh=d.height;
+ // 0224: converted to RGB here. 0217 stored Y/Cb/Cr raw in r/g/b on the assumption that QuartzCore's shaders convert;
+ // they do not - the hardware YCbCr formats sample as RGB - so photos showed in false colours. '420v' is video range,
+ // '420f' (and the rest) full range; BT.601 matrix (JPEG/HEIC photos' usual one).
+ const uint32_t pf=IOSurfaceGetPixelFormat(surface);
+ const bool video=pf=='420v' || pf=='x420';
+ std::vector<uint8_t> rgba(ow*oh*4);
+ for(size_t j=0;j<oh;j++){
+  const uint8_t *yr=y+yrow*j,*cr=c+crow*(j/2);uint8_t *o=rgba.data()+ow*4*j;
+  for(size_t i=0;i<ow;i++){
+   int yy=yr[i],cb=cr[(i/2)*2]-128,cv=cr[(i/2)*2+1]-128;
+   if(video){yy=(yy-16)*298;cb=cb*292/256;cv=cv*292/256;}else yy<<=8;   /* video range: Y 16-235, Cb/Cr 16-240 */
+   const int r=(yy+359*cv+128)>>8,g=(yy-88*cb-183*cv+128)>>8,b=(yy+454*cb+128)>>8;   /* BT.601: 1.402, .344/.714, 1.772 */
+   o[0]=(uint8_t)(r<0?0:r>255?255:r);o[1]=(uint8_t)(g<0?0:g>255?255:g);o[2]=(uint8_t)(b<0?0:b>255?255:b);o[3]=255;o+=4;
+  }
+ }
+ /* 501 is the _sRGB variant: the sampler then linearizes, as the real format would */
+ MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+  d.pixelFormat==501?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm width:ow height:oh mipmapped:NO];
+ td.usage=MTLTextureUsageShaderRead;td.storageMode=MTLStorageModeShared;
+ id<MTLTexture> t=[device newTextureWithDescriptor:td];
+ if(!t)return nil;
+ [t replaceRegion:MTLRegionMake2D(0,0,ow,oh) mipmapLevel:0 withBytes:rgba.data() bytesPerRow:ow*4];
+ // 0218: what the planes hold as seen from this process (all Y 0 and Cb/Cr 0 = memory that never got the picture here,
+ // as the "seen here" probes found for other processes' BGRA surfaces; Y 16 / Cb Cr 128 = a black picture)
+ uint64_t ysum=0,cbsum=0,crsum=0;unsigned ymin=255,ymax=0;size_t n=0;
+ for(size_t j=0;j<oh;j+=16)for(size_t i=0;i<ow;i+=16){const unsigned yv=y[yrow*j+i];const uint8_t *cc=c+crow*(j/2)+(i/2)*2;
+  ysum+=yv;cbsum+=cc[0];crsum+=cc[1];ymin=MIN(ymin,yv);ymax=MAX(ymax,yv);n++;}
+ static std::atomic<uint32_t> told{0};
+ if(told.fetch_add(1)<12)NBLOG(@"native-metal: surface %#x '%c%c%c%c' %zux%zu YCbCr 4:2:0 as RGBA8 %zux%zu (rows %zu/%zu, seed %u): "
+  "Y mean %llu min %u max %u, Cb %llu, Cr %llu (%zu samples)",
+  IOSurfaceGetID(surface),(char)(IOSurfaceGetPixelFormat(surface)>>24),(char)(IOSurfaceGetPixelFormat(surface)>>16),
+  (char)(IOSurfaceGetPixelFormat(surface)>>8),(char)IOSurfaceGetPixelFormat(surface),w,h,ow,oh,yrow,crow,seed,
+  n?ysum/n:0,ymin,ymax,n?cbsum/n:0,n?crsum/n:0,n);
+ objc_setAssociatedObject(t,"ycbcr",[NSString stringWithFormat:@"ycbcr surf %#x %zux%zu as RGBA8",IOSurfaceGetID(surface),ow,oh],
+  OBJC_ASSOCIATION_RETAIN);   // 0219
+ std::lock_guard<std::mutex> guard(lock);
+ if(cache.count>=24)[cache removeAllObjects];
+ cache[key]=@[@(seed),t];
+ return t;
+}
 @implementation NBDeviceMethods
 - (NSString *)name {return gName;}
 - (uint64_t)registryID {return gRegistryID;}
@@ -1646,6 +1894,28 @@ static char sweetMemoryOwnerKey;
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
  (void)options;
  MTLSizeAndAlign result = {length, 256};
+ return result;
+}
+// 0207: a texture's room in a heap (MPS sizes its temporary-image heaps with this: mpsprobe's Gaussian blur stopped at
+// "-[NativeBridgeMetalDevice heapTextureSizeAndAlignWithDescriptor:]: unrecognized selector"). The runtime has no query
+// for a texture's real Vulkan size, so this errs high: each mip level's width and height rounded up to 64 texels (the
+// GPU's tiling), rows to 256 bytes, a quarter more for compression metadata, every level page-aligned; 4 KiB alignment.
+// Too high only wastes heap space; too low would make the heap refuse the texture.
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
+ MTLSizeAndAlign result = {0, 4096};
+ if(!d)return result;
+ const NSUInteger type=(NSUInteger)d.textureType;
+ const NSUInteger slices=MAX(d.arrayLength,(NSUInteger)1)*MAX(d.sampleCount,(NSUInteger)1)*(type==5||type==6?6:1);
+ const NSUInteger bpp=sweetBytesPerTexel((NSUInteger)d.pixelFormat);
+ NSUInteger total=0;
+ for(NSUInteger l=0;l<MAX(d.mipmapLevelCount,(NSUInteger)1);l++){
+  const NSUInteger w=(MAX(d.width>>l,(NSUInteger)1)+63)&~(NSUInteger)63,h=(MAX(d.height>>l,(NSUInteger)1)+63)&~(NSUInteger)63;
+  const NSUInteger row=(w*bpp+255)&~(NSUInteger)255;
+  NSUInteger level=row*h*MAX(d.depth>>l,(NSUInteger)1)*slices;
+  level+=level/4;
+  total+=(level+4095)&~(NSUInteger)4095;
+ }
+ result.size=total;
  return result;
 }
 - (BOOL)hasUnifiedMemory {return YES;}
@@ -1779,7 +2049,21 @@ static char sweetMemoryOwnerKey;
  // guacamole: planar surfaces too (QuartzCore's 'b3a8' tiles, one plane after xnu 0143): the texture is the plane's texels,
  // at its offset in the surface's import, with its row stride
  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
- if(!surface || !d || (planes?plane>=planes:plane!=0)){NBLOG(@"native-metal: surface texture refused: plane %lu of %lu",(unsigned long)plane,(unsigned long)planes);return nil;}
+ // 0209: say which: SBRendererService logged "plane 0 of 0", which plane 0 of an unplanar surface is not (that passes),
+ // so its surface or descriptor was nil (the wallpaper went black after a photo was chosen).
+ if(!surface || !d){NBLOG(@"native-metal: surface texture refused: %s%s",surface?"":"no IOSurface ",d?"":"no descriptor");
+  // 0213: who passes no surface (PosterBoard and SBRendererService, with a photo wallpaper set): the caller's frames,
+  // the first two times in a process.
+  static std::atomic<uint32_t> traced{0};
+  if(traced.fetch_add(1)<2){
+   NSArray<NSString *> *frames=[NSThread callStackSymbols];
+   NSMutableString *text=[NSMutableString string];
+   for(NSUInteger i=1;i<frames.count && i<18;i++)[text appendFormat:@"\n  %@",frames[i]];
+   NBLOG(@"native-metal: no-IOSurface caller (%lux%lu format %lu):%@",(unsigned long)d.width,(unsigned long)d.height,
+    (unsigned long)d.pixelFormat,text);
+  }
+  return nil;}
+ if(planes?plane>=planes:plane!=0){NBLOG(@"native-metal: surface texture refused: plane %lu of %lu",(unsigned long)plane,(unsigned long)planes);return nil;}
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){
   // 0180: this refusal was silent; a backboardd composition of another process's surface (a game's drawable) then
@@ -1797,8 +2081,21 @@ static char sweetMemoryOwnerKey;
  const uintptr_t at=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
  if(!row)row=IOSurfaceGetBytesPerRow(surface);
+ // 0216: QuartzCore's '_RB4' surfaces (RGB8_444_2P, 542) are read here as one BGRA8 plane (sweetNarrow) at the
+ // surface's row. Until kernel 0215 their plane 0 reported row 0, so that row was used; now plane 0 reports its own
+ // 1-byte row (465 wide: 512) and every import was refused ("RowPitch bytes_per_row 512, row_bytes 1860", backboardd).
+ // Keep the surface's row for them, as before 0215.
+ if(d && d.pixelFormat==542 && IOSurfaceGetBytesPerRow(surface)>row)row=IOSurfaceGetBytesPerRow(surface);
  if(!row && sweetNarrow(d.pixelFormat)!=(uint64_t)d.pixelFormat)row=IOSurfaceGetWidth(surface)*4;  // 10-bit asked over BGRA
  if(at<(uintptr_t)base || at-(uintptr_t)base>=allocation){NBLOG(@"native-metal: surface texture refused: plane %lu outside the surface",(unsigned long)plane);return nil;}
+ // 0217: two-plane YCbCr 4:2:0 ('420f'/'420v') sampled as one texture (MTLPixelFormatYCBCR8_420_2P(_sRGB), 500/501).
+ // backboardd composites a photo wallpaper (PhotosPosterProvider's '420f' image) this way and the runtime has no such
+ // format ("Unsupported ... MTLPixelFormatYCBCR8_420_2P ... NotImplemented", thousands a minute): the lock and home
+ // screens stayed black while the picker's BGRA snapshot showed the photo. Here the planes are expanded on the CPU into
+ // an RGBA8 texture holding what the hardware format samples as: RGB (0224: converted here, BT.601, the surface's
+ // range; 0217 stored raw Y/Cb/Cr, which showed photos in false colours). Kept per surface and rebuilt only when its seed changes.
+ if((d.pixelFormat==500 || d.pixelFormat==501) && planes==2 && plane==0)
+  if(id<MTLTexture> t=sweetYCbCrTexture(self,d,surface,base,allocation))return t;
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
  bool hasYCbCrPlanes=planes>=2;
  uint64_t chromaOffset=0,chromaRow=0;
@@ -1825,6 +2122,37 @@ static char sweetMemoryOwnerKey;
    NBLOG(@"native-metal: rotated view asked: surface %#x %zux%zu as %lux%lu usage %lu storage %lu type %lu;%@",IOSurfaceGetID(surface),
     IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.usage,
     (unsigned long)d.storageMode,(unsigned long)d.textureType,spi.length?spi:@" (no rotation property on the descriptor)");
+  }
+ }
+ if(!texture && !planes && d.width==IOSurfaceGetHeight(surface) && d.height==IOSurfaceGetWidth(surface) && d.width!=d.height){
+  if(id<MTLTexture> rotated=rotatedSurfaceTexture(self,d,surface))return rotated;   // 0196
+ }
+ // 0212: a YCbCr photo's chroma plane did not fit its own surface (PhotosPosterProvider, photo wallpaper: '420f'
+ // 606x1145, plane 1 as RG8 303x573 with the plane's row 968: "PastBuffer counted 1291646 length 1114112"). The
+ // allocation fits rows of the plane's own width (303 x 2 bytes, 64-aligned: 640), so the surface's reported row is
+ // suspect. Log every plane's geometry (once per surface), and if a 64-aligned row of the plane's width fits, use it.
+ if(!texture && planes>=2 && plane<planes){
+  static std::mutex lock;static NSMutableSet<NSNumber *> *said;
+  {std::lock_guard<std::mutex> guard(lock);if(!said)said=[NSMutableSet set];
+   NSNumber *sid=@(IOSurfaceGetID(surface));
+   if(![said containsObject:sid] && said.count<20){[said addObject:sid];
+    NSMutableString *geo=[NSMutableString string];
+    for(size_t i=0;i<planes;i++)
+     [geo appendFormat:@" [%zu: offset %ld %zux%zu row %zu elem %zu bytes]",i,
+      (long)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,i)-(uintptr_t)base),IOSurfaceGetWidthOfPlane(surface,i),
+      IOSurfaceGetHeightOfPlane(surface,i),IOSurfaceGetBytesPerRowOfPlane(surface,i),IOSurfaceGetBytesPerElementOfPlane(surface,i)];
+    NBLOG(@"native-metal: surface %#x planes: alloc %zu, row %zu;%@",IOSurfaceGetID(surface),allocation,
+     IOSurfaceGetBytesPerRow(surface),geo);
+   }}
+  const size_t pw=IOSurfaceGetWidthOfPlane(surface,plane),ph=IOSurfaceGetHeightOfPlane(surface,plane),
+               pe=IOSurfaceGetBytesPerElementOfPlane(surface,plane),tight=(pw*pe+63)&~(size_t)63;
+  if(pw && ph && pe && tight<row && (at-(uintptr_t)base)+tight*(ph-1)+pw*pe<=allocation){
+   texture=textureOnBuffer(buffer,d,at-(uintptr_t)base,tight,true,hasYCbCrPlanes,plane,IOSurfaceGetPixelFormat(surface),
+                           IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,plane==1?tight:chromaRow);
+   static std::atomic<uint32_t> told{0};
+   if(told.fetch_add(1)<6)NBLOG(@"native-metal: surface %#x plane %lu: row %zu does not fit, row %zu %s",IOSurfaceGetID(surface),
+    (unsigned long)plane,row,tight,texture?"used":"refused too");
+   if(texture)row=tight;
   }
  }
  if(!texture){const uint32_t f=IOSurfaceGetPixelFormat(surface);
@@ -2064,6 +2392,17 @@ static void installAnswers(Class cls) {
  }
 }
 
+// 0203: Core Image's graph kernels. With CI_ENABLE_METAL_DAG / CI_ENABLE_FUNCTION_STITCHING on (iOS's default; read
+// with getenv at first use, CoreImage CI::MetalDAGHelper::analyze_kernels), Core Image builds kernels with
+// -[MTLDevice newLibraryWithStitchedDescriptor:...]: Apple's MTLLibraryBuilder then asks each function for
+// -libraryData, which ours cannot give (PhotosPosterProvider, choosing a photo for a wallpaper: "-[NBFunction
+// libraryData]: unrecognized selector"); stitched visible functions are not what metal2vulkan runs either. With both 0
+// Core Image writes each filter chain as Metal source and compiles it (newLibraryWithSource, which works here).
+// Set when this bundle loads (before Core Image reads them); a value already in the environment is kept.
+__attribute__((constructor)) static void sweetCoreImageWithoutStitching(void) {
+ setenv("CI_ENABLE_METAL_DAG","0",0);
+ setenv("CI_ENABLE_FUNCTION_STITCHING","0",0);
+}
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
@@ -2106,16 +2445,60 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    // Public protocols only, named by the message: a private one could make callers take SPI paths this file lacks.
    {[NBFunction class],{"MTLFunction",nullptr,nullptr}},
    {[NBLibrary class],{"MTLLibrary",nullptr,nullptr}},
+   // 0206: Metal Performance Shaders checks the command buffer: -[MPSCommandBufferImageCache initWithCommandBuffer:]
+   // returns nil unless [commandBuffer conformsToProtocol:@protocol(MTLCommandBuffer)], and MPSAutoCache then reads
+   // nil+0x18 (PhotosPosterProvider choosing a photo wallpaper; PridePosterExtension). The rest for the same reason.
+   {[NBCommandBuffer class],{"MTLCommandBuffer",nullptr,nullptr}},
+   {[NBQueue class],{"MTLCommandQueue",nullptr,nullptr}},
+   {[NBBuffer class],{"MTLBuffer","MTLResource",nullptr}},
+   {[NBTexture class],{"MTLTexture","MTLResource",nullptr}},
+   {[NBRenderEncoder class],{"MTLRenderCommandEncoder","MTLCommandEncoder",nullptr}},
+   {[NBComputeEncoder class],{"MTLComputeCommandEncoder","MTLCommandEncoder",nullptr}},
+   {[NBBlitEncoder class],{"MTLBlitCommandEncoder","MTLCommandEncoder",nullptr}},
   };
   for(auto &a:adopt)for(const char *name:a.names){
    if(!name)continue;
    Protocol *p=objc_getProtocol(name);
+   // 0210: objc_getProtocol finds a protocol only once some loaded image has registered it, and Metal's own binaries
+   // register some only where they use them: SBRendererService logged "NBRenderEncoder MTLRenderCommandEncoder
+   // missing" and "NBBlitEncoder MTLBlitCommandEncoder missing" (PosterBoard, with more of Metal loaded, adopted both),
+   // so its encoders failed conformance checks there. These are public protocols from the SDK headers: referencing
+   // them with @protocol puts them in this bundle's own protocol list, so they always exist here.
+   if(!p){
+    static const struct {const char *name;Protocol *__unsafe_unretained proto;} publicProtocols[]={
+     {"MTLFunction",@protocol(MTLFunction)},{"MTLLibrary",@protocol(MTLLibrary)},
+     {"MTLCommandBuffer",@protocol(MTLCommandBuffer)},{"MTLCommandQueue",@protocol(MTLCommandQueue)},
+     {"MTLBuffer",@protocol(MTLBuffer)},{"MTLResource",@protocol(MTLResource)},{"MTLTexture",@protocol(MTLTexture)},
+     {"MTLRenderCommandEncoder",@protocol(MTLRenderCommandEncoder)},{"MTLComputeCommandEncoder",@protocol(MTLComputeCommandEncoder)},
+     {"MTLBlitCommandEncoder",@protocol(MTLBlitCommandEncoder)},{"MTLCommandEncoder",@protocol(MTLCommandEncoder)},
+    };
+    for(const auto &pp:publicProtocols)if(!strcmp(pp.name,name))p=pp.proto;
+   }
    if(p && !class_conformsToProtocol(a.cls,p))class_addProtocol(a.cls,p);
    NBLOG(@"native-metal: %s %s %s",class_getName(a.cls),name,p?([a.cls conformsToProtocol:p]?"adopted":"not adopted"):"missing");
   }
  }
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
+ // 0200: the base class's limits stay 0 (initLimits is empty here, above), and some clients read them directly through the
+ // private -[MTLDevice limits] (a pointer to _MTLDevice's own table). Photos (PhotosUICore -[PXGMetalTextureConverter
+ // createTextureFromCGImage:transform:options:]) takes limits+0x84/+0x88 (uint32 maximum 2D texture width/height) as the most it
+ // may draw an image at: 0 x 0 made every redraw 0 x 0 and it aborted on 'Invalid parameter not satisfying:
+ // !PXPixelSizeAreaIsZero(roundedSize)' at its first view. Those two get 16384, the A11's and Turnip's (Adreno 640) 2D limit, when 0.
+ {SEL limitsSel=sel_registerName("limits");
+  if([gDeviceObject respondsToSelector:limitsSel]){
+   uint8_t *limits=((uint8_t *(*)(id,SEL))objc_msgSend)(gDeviceObject,limitsSel);
+   if(limits){
+    uint32_t w=0,h=0;memcpy(&w,limits+0x84,4);memcpy(&h,limits+0x88,4);
+    // only in the device object itself (_MTLDevice's own ivar table), never through a pointer elsewhere (read-only memory)
+    const uintptr_t obj=(uintptr_t)(__bridge void *)gDeviceObject,end=obj+class_getInstanceSize(cls);
+    const bool inside=(uintptr_t)limits>=obj && (uintptr_t)limits+0x8c<=end;
+    if(!w && !h && inside){const uint32_t max2d=16384;memcpy(limits+0x84,&max2d,4);memcpy(limits+0x88,&max2d,4);}
+    if(!inside)NBLOG(@"native-metal: limits %p is not inside the device (%p, %zu bytes): left alone",limits,(void *)obj,(size_t)(end-obj));
+    memcpy(&w,limits+0x84,4);memcpy(&h,limits+0x88,4);
+    NBLOG(@"native-metal: limits at %p: 2D texture %ux%u (+0x84/+0x88)",limits,w,h);
+   }
+  }}
  return gDeviceObject;
 }
 

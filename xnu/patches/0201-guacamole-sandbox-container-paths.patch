@@ -1,0 +1,213 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -26,4 +26,5 @@
+ #include <kern/debug.h>
++#include <kern/locks.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+@@ -324,7 +325,179 @@
+ 	uint64_t handle = 1;
+ 	return copyout(&handle, (user_addr_t)args[2], sizeof(handle));
+ }
+ 
++/*
++ * 0201: container paths. An app extension asks for its own data container (libsystem_sandbox
++ * sandbox_container_path_for_pid / _for_audit_token: op 4, { pid, pidversion, buffer, size, by token }) and
++ * ExtensionFoundation aborts when there is none: Photos' picker (PhotosPicker.appex, needed to choose a photo
++ * for a wallpaper) died on "plugin has invalid sandbox or container: error 2 path ?" because this stand-in
++ * answered ENOENT. Its container exists (containermanagerd made it); only the kernel did not know it.
++ * On iOS the launcher hands the path to the Sandbox policy at exec: sandbox_spawnattrs_setcontainer() puts it
++ * in the "Sandbox" mac policy info of posix_spawn (length at +0xc, the path at +0x50), and the policy keeps it
++ * with the process. Here it is kept in a small table (pid + unique id, so a reused pid is not mistaken), also
++ * from op 0x42 (sandbox_set_container_path_for_audit_token: { pid, pidversion, path }), and answered by op 4
++ * and op 0x43 (sandbox_get_container_expected: { u64 *expected, u64 * }). A process without one gets ENOENT,
++ * as before. The first 40 paths are logged ("SWEET Sandbox: <name>[pid] container (spawn|set) <path>").
++ */
++#define SWEET_CONTAINERS        128
++static struct {
++	pid_t    pid;
++	uint64_t uniqueid;
++	char     path[MAXPATHLEN];
++} sweet_containers[SWEET_CONTAINERS];
++static unsigned sweet_containers_next, sweet_containers_said;
++static LCK_GRP_DECLARE(sweet_containers_grp, "sweet_containers");
++static LCK_MTX_DECLARE(sweet_containers_lock, &sweet_containers_grp);
++
++/* path of len bytes for p (len 0: p has none any more) */
++static void
++sweet_container_note(proc_t p, const char *path, size_t len, const char *how)
++{
++	if (p == NULL) {
++		return;
++	}
++	pid_t pid = proc_pid(p);
++	uint64_t uniqueid = proc_uniqueid(p);
++	int say = 0;
++	lck_mtx_lock(&sweet_containers_lock);
++	unsigned slot = SWEET_CONTAINERS;
++	for (unsigned i = 0; i < SWEET_CONTAINERS; i++) {
++		if (sweet_containers[i].pid == pid && sweet_containers[i].path[0] != '\0') {
++			slot = i;
++			break;
++		}
++	}
++	if (len == 0) {
++		if (slot < SWEET_CONTAINERS) {
++			sweet_containers[slot].path[0] = '\0';
++		}
++	} else {
++		if (slot == SWEET_CONTAINERS) {
++			slot = sweet_containers_next++ % SWEET_CONTAINERS;
++		}
++		if (len >= MAXPATHLEN) {
++			len = MAXPATHLEN - 1;
++		}
++		sweet_containers[slot].pid = pid;
++		sweet_containers[slot].uniqueid = uniqueid;
++		memcpy(sweet_containers[slot].path, path, len);
++		sweet_containers[slot].path[len] = '\0';
++		if (sweet_containers_said < 40) {
++			sweet_containers_said++;
++			say = 1;
++		}
++	}
++	lck_mtx_unlock(&sweet_containers_lock);
++	if (say) {
++		char name[32];
++		proc_name(pid, name, sizeof(name));
++		printf("SWEET Sandbox: %s[%d] container (%s) %.*s\n", name, pid, how, (int)len, path);
++	}
++}
++
++/* the path kept for pid, if it is still the same process; 0 when there is one */
++static int
++sweet_container_lookup(pid_t pid, char *out, size_t size)
++{
++	proc_t p = proc_find(pid);
++	if (p == NULL) {
++		return ESRCH;
++	}
++	uint64_t uniqueid = proc_uniqueid(p);
++	proc_rele(p);
++	int error = ENOENT;
++	lck_mtx_lock(&sweet_containers_lock);
++	for (unsigned i = 0; i < SWEET_CONTAINERS; i++) {
++		if (sweet_containers[i].pid == pid && sweet_containers[i].uniqueid == uniqueid &&
++		    sweet_containers[i].path[0] != '\0') {
++			strlcpy(out, sweet_containers[i].path, size);
++			error = 0;
++			break;
++		}
++	}
++	lck_mtx_unlock(&sweet_containers_lock);
++	return error;
++}
++
++/* exec: the launcher's container for the new image (no transition is asked for: always 0) */
++static int
++sweet_sandbox_check_execve(kauth_cred_t old __unused, struct vnode *vp __unused, off_t offset __unused,
++    struct vnode *scriptvp __unused, struct label *vnodelabel __unused, struct label *scriptvnodelabel __unused,
++    struct label *execlabel __unused, struct proc *p, void *macpolicyattr, size_t macpolicyattrlen)
++{
++	const uint8_t *attr = (const uint8_t *)macpolicyattr;
++	uint32_t len = 0;
++	if (attr != NULL && macpolicyattrlen > 0x51) {
++		memcpy(&len, attr + 0xc, sizeof(len));
++		if (len >= MAXPATHLEN || 0x50 + (size_t)len > macpolicyattrlen || attr[0x50] != '/') {
++			len = 0;
++		}
++	}
++	sweet_container_note(p, len ? (const char *)attr + 0x50 : NULL, len, "spawn");
++	return 0;
++}
++
++static int
++sweet_sandbox_container_set(user_addr_t arg)
++{
++	uint64_t args[3];               /* pid, pidversion, path */
++	char path[MAXPATHLEN];
++	size_t done = 0;
++	int error = copyin(arg, args, sizeof(args));
++	if (error == 0) {
++		error = copyinstr((user_addr_t)args[2], path, sizeof(path), &done);
++	}
++	if (error) {
++		return error;
++	}
++	proc_t p = proc_find((pid_t)args[0]);
++	if (p == NULL) {
++		return ESRCH;
++	}
++	sweet_container_note(p, path, strlen(path), "set");
++	proc_rele(p);
++	return 0;
++}
++
++static int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	uint64_t args[5];               /* pid, pidversion, buffer, size, by audit token */
++	char path[MAXPATHLEN];
++	int error = copyin(arg, args, sizeof(args));
++	if (error == 0) {
++		error = sweet_container_lookup((pid_t)args[0], path, sizeof(path));
++	}
++	if (error) {
++		return error;
++	}
++	size_t need = strlen(path) + 1;
++	if (args[3] < need) {
++		return ERANGE;
++	}
++	return copyout(path, (user_addr_t)args[2], need);
++}
++
++static int
++sweet_sandbox_container_expected(struct proc *p, user_addr_t arg)
++{
++	uint64_t args[2];               /* u64 *expected, u64 * */
++	char path[MAXPATHLEN];
++	int error = copyin(arg, args, sizeof(args));
++	if (error == 0) {
++		error = sweet_container_lookup(proc_pid(p), path, sizeof(path));
++	}
++	if (error) {
++		return ENOENT;          /* as before 0201 */
++	}
++	const uint64_t yes = 1, no = 0;
++	error = copyout(&yes, (user_addr_t)args[0], sizeof(yes));
++	if (error == 0 && args[1] != 0) {
++		error = copyout(&no, (user_addr_t)args[1], sizeof(no));
++	}
++	return error;
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -336,12 +509,15 @@
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 0x43:      /* container expected */
+-		return ENOENT;
++		return sweet_sandbox_container_expected(p, arg);
++	case 0x42:      /* set container path for audit token */
++		return sweet_sandbox_container_set(arg);
+ 	case 5:
+ 		return sweet_sandbox_extension_issue(arg);
+ 	case 6:
+ 		return sweet_sandbox_extension_consume(arg);
+ 	default:
+ 		return 0;
+ 	}
+@@ -500,6 +676,7 @@
+ static const struct mac_policy_ops sweet_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = sweet_sandbox_syscall,
+ 	.mpo_priv_grant = sweet_sandbox_priv_grant,
++	.mpo_cred_check_label_update_execve = sweet_sandbox_check_execve,
+ };
+ 
+ static struct mac_policy_conf sweet_sandbox_mac_conf = {

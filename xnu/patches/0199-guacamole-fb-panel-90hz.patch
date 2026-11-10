@@ -1,0 +1,96 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -230,6 +230,85 @@
+ 	return true;
+ }
+ 
++/*
++ * 0199: the panel's 90 Hz mode. The OnePlus 7 Pro's Samsung panel takes DCS 0x53 (write CTRL display) 0x30 for
++ * 90 Hz and 0x20 for 60 Hz, as the Pixel 4 XL's S6E3HC2 (Google kernel/msm dsi-panel-s6e3hc2-dsc-wqhd-cmd.dtsi; same
++ * link clock in both modes). Tested by hand 2026-11-09 (userland/jb/panelbright raw 53 30): frames 11.368 ms apart
++ * (87.97 Hz), each sent in 10.41 ms. Sent here before the refresh is measured, so 0198 finds and publishes 88 Hz.
++ * The command goes over DSI0 as the bootloader's own (its last packet: c0390003 89b80051, DCS long write 0x51):
++ * embedded DMA from a buffer just past the splash frame, software trigger, CMD_DMA_DONE awaited (<= 100 ms),
++ * the DSI registers put back. Boot-arg sweetfb90=0: the bootloader's 60 Hz.
++ */
++#define SWEET_FB_DSI0_PAGE      0x0ae94000ull
++#define SWEET_FB_DSI_CTRL       0x004u
++#define SWEET_FB_DSI_DMA_CTRL   0x03cu
++#define SWEET_FB_DSI_DMA_BASE   0x048u
++#define SWEET_FB_DSI_DMA_LEN    0x04cu
++#define SWEET_FB_DSI_TRIG_CTRL  0x084u
++#define SWEET_FB_DSI_TRIG_DMA   0x090u
++#define SWEET_FB_DSI_INTR_CTRL  0x110u
++#define SWEET_FB_DSI_BUF        0x9d124000ull   /* 0x9c000000 + 3120 * 5760, page up: never used by XNU */
++
++static void
++sweet_fb_panel_90hz(void)
++{
++	uint32_t want = 1;
++	(void)PE_parse_boot_argn("sweetfb90", &want, sizeof(want));
++	if (!want) {
++		IOLog("SWEET FB: panel left at the bootloader's refresh (sweetfb90=0)\n");
++		return;
++	}
++	IOMemoryDescriptor *dmd = IOMemoryDescriptor::withPhysicalAddress(SWEET_FB_DSI0_PAGE, 0x1000, kIODirectionInOut);
++	IOMemoryMap *dmap = dmd != NULL ? dmd->map(kIOMapInhibitCache) : NULL;
++	IOMemoryDescriptor *bmd = IOMemoryDescriptor::withPhysicalAddress(SWEET_FB_DSI_BUF, 0x1000, kIODirectionInOut);
++	IOMemoryMap *bmap = bmd != NULL ? bmd->map(kIOMapInhibitCache) : NULL;
++	if (dmap == NULL || bmap == NULL) {
++		IOLog("SWEET FB: 90 Hz: DSI0 or the command buffer not mapped\n");
++	} else {
++		volatile uint32_t *dsi = (volatile uint32_t *)dmap->getVirtualAddress();
++		volatile uint32_t *buf = (volatile uint32_t *)bmap->getVirtualAddress();
++		uint32_t ver = dsi[0], ctrl = dsi[SWEET_FB_DSI_CTRL / 4];
++		if ((ver >> 24) != 0x20 || !(ctrl & 1) || !(ctrl & 4)) {
++			IOLog("SWEET FB: 90 Hz: DSI0 not as probed (version %08x, CTRL %08x): left at 60 Hz\n", ver, ctrl);
++		} else {
++			/* header: WC 2, DCS long write 0x39, last + long; payload 0x53 0x30, 0xff 0xff */
++			buf[0] = 0xc0390002u;
++			buf[1] = 0xffff3053u;
++			__builtin_arm_dsb(0xf);
++			uint32_t dmaCtrl = dsi[SWEET_FB_DSI_DMA_CTRL / 4], trig = dsi[SWEET_FB_DSI_TRIG_CTRL / 4];
++			dsi[SWEET_FB_DSI_INTR_CTRL / 4] = dsi[SWEET_FB_DSI_INTR_CTRL / 4] | 1;
++			dsi[SWEET_FB_DSI_DMA_CTRL / 4] = (dmaCtrl & ~((1u << 31) | (1u << 30) | (1u << 26))) | (1u << 28);
++			if ((trig & 7) != 4) {
++				dsi[SWEET_FB_DSI_TRIG_CTRL / 4] = (trig & ~7u) | 4;
++			}
++			dsi[SWEET_FB_DSI_DMA_BASE / 4] = (uint32_t)SWEET_FB_DSI_BUF;
++			dsi[SWEET_FB_DSI_DMA_LEN / 4] = 8;
++			__builtin_arm_dsb(0xf);
++			dsi[SWEET_FB_DSI_TRIG_DMA / 4] = 1;
++			bool done = false;
++			for (int i = 0; i < 500 && !(done = (dsi[SWEET_FB_DSI_INTR_CTRL / 4] & 1) != 0); i++) {
++				IODelay(200);
++			}
++			dsi[SWEET_FB_DSI_INTR_CTRL / 4] = dsi[SWEET_FB_DSI_INTR_CTRL / 4] | 1;
++			if ((trig & 7) != 4) {
++				dsi[SWEET_FB_DSI_TRIG_CTRL / 4] = trig;
++			}
++			dsi[SWEET_FB_DSI_DMA_CTRL / 4] = dmaCtrl;
++			if (done) {
++				IOSleep(60);            /* a few frames at the new rate before 0198 times them */
++				IOLog("SWEET FB: panel switched to 90 Hz (DCS 53 30)\n");
++			} else {
++				IOLog("SWEET FB: 90 Hz: no CMD_DMA_DONE after 100 ms (INTR_CTRL %08x): left as it was\n",
++				    dsi[SWEET_FB_DSI_INTR_CTRL / 4]);
++			}
++		}
++	}
++	OSSafeReleaseNULL(dmap);
++	OSSafeReleaseNULL(dmd);
++	OSSafeReleaseNULL(bmap);
++	OSSafeReleaseNULL(bmd);
++}
++
+ /* 0198: the vsync timer's next timeout, so that it fires at the start of the panel's next frame */
+ static uint32_t
+ sweet_fb_next_tick_us(void)
+@@ -432,6 +511,7 @@
+ 		vsyncHz = 60;
+ 	}
+ 	sweet_fb_vsync_us = 1000000 / vsyncHz;
++	sweet_fb_panel_90hz();                          /* 0199: before the panel's refresh is measured */
+ 	if (sweet_fb_measure_refresh() && !vsyncArg) {   /* 0198 */
+ 		sweet_fb_vsync_us = (uint32_t)(sweet_fb_period_ns / 1000);
+ 		IOLog("SWEET FB: vsync from the panel: %u us, at each frame's start\n", sweet_fb_vsync_us);

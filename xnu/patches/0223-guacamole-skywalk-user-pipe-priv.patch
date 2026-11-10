@@ -1,0 +1,23 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -689,9 +689,20 @@
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	/*
++	 * 0223: Skywalk user pipes. bluetoothd (uid 501) builds its A2DP audio path as a user-pipe
++	 * nexus ("Device supports Skywalk Path", provider slot 2048, 1/1 rings, 8/8 slots) and
++	 * exits on "Failed to alloc a nexus provider" (2026-11-09, Beats Solo 4 at AVDTP OPEN).
++	 * On iOS AMFI grants PRIV_SKYWALK_REGISTER_USER_PIPE from its entitlement; this kernel has no
++	 * entitlements (0025), so it is granted here (userland/bt/nxprobe: root register + alloc
++	 * work, mobile gets EPERM). Kernel pipes, interfaces and flow switches stay privileged.
++	 */
++	if (priv == PRIV_SKYWALK_REGISTER_USER_PIPE) {
++		return 0;
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {

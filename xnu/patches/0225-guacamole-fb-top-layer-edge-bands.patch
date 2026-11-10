@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1270,13 +1270,35 @@
+ 	for (int32_t j = 0; j < 8; j++) {
+ 		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
+ 		for (int32_t i = 0; i < 8; i++) {
+ 			if ((row[(sw * (2 * i + 1)) / 16] >> 24) != 0) {
+ 				return false;
+ 			}
+ 		}
+ 	}
++	/*
++	 * 0225: the grid's first and last sample rows are 1/16 of the height in (~150 px), so the top and bottom
++	 * edges were never looked at: SpringBoard's Dynamic Island pill and the home indicator live there. In a
++	 * full-screen game (Subway Surfers) CoreAnimation's layer is transparent except for them, it counted as
++	 * "all transparent", and the game layer was shown alone: the island vanished, even with a timer running
++	 * (2026-11-10). Both edge bands are now scanned too, every 4th row and every 8th pixel (the home
++	 * indicator is ~5 rows tall). A visible pixel there sends the frame to the blended path.
++	 */
++	const int32_t band = sh / 16;
++	for (int32_t pass = 0; pass < 2; pass++) {
++		const int32_t y0 = pass == 0 ? 0 : sh - band;
++		for (int32_t y = y0; y < y0 + band; y += 4) {
++			uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;
++			s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
++			const uint32_t *row = (const uint32_t *)(src + off);
++			for (int32_t x = 0; x < sw; x += 8) {
++				if ((row[x] >> 24) != 0) {
++					return false;
++				}
++			}
++		}
++	}
+ 	return true;
+ }
+ 

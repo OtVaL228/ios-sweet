@@ -16,3 +16,9 @@ userland/metal2/out/
 userland/metal2/test/mtltest
 userland/metal2/test/surftest
 userland/metal2/test/cgtest
+userland/bt/bluetoothd-ents.plist
+# local-only: boot images, scratch, Apple launchd.plist copies
+outputs/
+work/
+launchd.plist.*
+*.tmp

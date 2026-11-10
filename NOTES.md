@@ -1,3 +1,1495 @@
+## 2026-11-10 04:00: mute property fix
+
+CoreAudio's HALS_IOA2Device resolves device-level custom properties against instantiated controls; it does not
+consume a separate top-level `mute` key. See research/audio/ioa2-mute-property-0400.md. 0233 changed the mute control
+base class from `'ctrl'` to `'togl'` at the same time it changed output channels, so the prior boot did not isolate
+which change prevented `mute/outp/3,4`. Added 0235 to restore `'ctrl'` while retaining four output channels. Build
+and boot 0235, then verify VirtualAudio creates the speaker / receiver ports (and query `mute/outp/4` directly).
+The 0234 headset-personality boot-argument experiment remains available if needed. Patches 0226-0235 apply in order.
+
+Build completed locally: `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`
+(SHA-256 `06e68e296b45b226c2631ecea8afa1fdde6dbff7b52c0ab45f3ce454cf2989f1`) includes 0234 and 0235. Boot image:
+`outputs/guacamole-0235-ioaudio2-mute-ctrl.img` (SHA-256
+`e41c8596fd72391c18a0d37e120edee54db230521df33fef5beb36cb4a0b9a6f`, 21,536,768 bytes). It uses the prior 0233
+working-image arguments, retaining `rd=ufsroot0 ufsroot=ios`, 60 Hz GPU-present settings, and no forced
+`sweetfb_refresh`/`sweetfb_vsync`; only `sweettime` was refreshed. The image has not been booted on the phone yet.
+
+Rebuilt on request at 04:12 with the same kernel and regenerated ADT/payload. Refreshed boot arguments are recorded in
+`outputs/guacamole-0235-rebuilt-boot-args.txt` and verified in the image header. Fresh image:
+`outputs/guacamole-0235-ioaudio2-mute-ctrl-rebuilt-20261110.img` (21,536,768 bytes, SHA-256
+`33efcc66d221dcb95bb22ad7c75b52e2d07b019f00b9f38d6f3f73b9d4633b14`). Kernel SHA-256 remains
+`06e68e296b45b226c2631ecea8afa1fdde6dbff7b52c0ab45f3ce454cf2989f1`.
+
+## 2026-11-10 03:50: 0233: still no speaker port; Codex request "03:50"; 0234 terminal boot-args
+
+0233 changed nothing visible: no "creating a speaker port", AQMEIO "Error -1 getting output port ID" on every queue.
+Likely Device_Null_Aspen ('null') never reaches the codec block. Codex request in research/audio/README.md "03:50".
+NEW xnu/patches/0234-guacamole-ioaudio2-terminal-bootargs.patch (after 0233): sweetaudioterm / sweetaudiointerm
+(FourCC numbers) set the output / input stream terminal types (defaults 'spkr' / 'micr'); boot log line "SWEET
+AUDIO: transport ..., out terminal ..., in terminal ...". Candidate to try without a kernel build:
+sweetaudiotp=0x6d627573 sweetaudioterm=0x68647068 sweetaudiointerm=0x686d6963 ('mbus' / 'hdph' / 'hmic').
+
+## 2026-11-10 03:40: 0232: no more timeouts / 'what'; apps fail "Error -1 getting output port ID" -> 0233
+
+With 0232 the route on SweetBuiltInAudio comes up cleanly (StartIOProcID, no nsrt/pft timeouts), but audio queues
+fail AQMEIO_HAL "Error -1 (-1) getting output port ID": only a 'pnul' port; no "creating a speaker/receiver port"
+(mute el 3/4 controls not surfaced). NEW xnu/patches/0233-guacamole-ioaudio2-four-out-channels.patch (after 0232):
+output stream 4 channels (ring sized 2 * 4 bytes/frame), mute controls base class 'togl' instead of 'ctrl'.
+Dry run OK. If still no speaker port: ask Codex how HALS_IOA2 maps an IOAudio2 control dict to a HAL mute property
+(scope / element validation) and whether Device_Null_Aspen (transport 'null') runs the codec setup at all; or try
+another transport via boot-arg sweetaudiotp.
+
+Built with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; 0233 is recorded in
+`work/xnu-local-latest/applied-patches.txt`. Kernel SHA-256:
+`d241643d916c2b7050ca2d0d2288833211925b781ac7333ade0eb6c2625715d0`. Boot image:
+`outputs/guacamole-0233-ioaudio2-four-out-channels.img` (21,536,768 bytes), SHA-256
+`b024c100ab74902458f48b57701463dd656c294831f8281522252e16a094de47`; packaged with current
+`mkadt.py --highmem --guacamole`, the existing fullmetal template and shim, and the 0232 boot args with `sweettime`
+refreshed. Image has not been booted.
+
+## 2026-11-10 03:30: 0231 works (format list OK, StartIOProcID on SweetBuiltInAudio); next: device rate 0 -> 0232
+
+ms-0231: "Server_Internal_StartIOProcID: 93 SweetBuiltInAudio (VAD [vdef] AggDev 2)"; new failure: "timed out ...
+[nsrt/glob/0] ... on id 33", "Error 'what' setting sample rate to 48000 Hz on HAL device 33", nominal rate reads 0 ->
+falls back to 44100 (unsupported) -> virtual format 0 Hz. No sel 10 start seen yet. NEW
+xnu/patches/0232-guacamole-ioaudio2-device-rate.patch (after 0231): device-level "sample rate" / "nominal sample rate"
+/ "current sample rate" = 48000 << 32 (key unconfirmed: all three), sel 4 logged + answered with 'conf'. Dry run OK.
+Codex could confirm the HAL's device nominal-rate key (HALS_IOA2Device) to drop the extra two.
+
+Built with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; 0232 is recorded in
+`work/xnu-local-latest/applied-patches.txt`. Kernel SHA-256:
+`40427cc5a12a121446e9b38757d2653c4b71a8e1b685719c80f011b0a883117e`. Boot image:
+`outputs/guacamole-0232-ioaudio2-device-rate.img` (21,536,768 bytes), SHA-256
+`a930de7944b569b8a46cf8585892ac3c4ea36578ae15b7847699b8eb8584b203`; packaged with current
+`mkadt.py --highmem --guacamole`, the existing fullmetal template and shim, and the 0231 boot args with `sweettime`
+refreshed. Image has not been booted.
+
+## 2026-11-10 03:20: 0230 conf/ack works; real cause of the 2 s loop: 0 Hz in the format list -> 0231
+
+ms-0230.oslog: VirtualStream "Physical stream format list does not contain current physical stream format:
+[16/48000/2]" -> "closest matching ... [16/0/2]" -> "Synchronously setting physical format to [16/0/2]" ->
+HALPropertySynchronizer "timed out waiting 2000 milliseconds ... [pft /glob/0]" -> "Error 'what' ensuring valid
+physical stream format" -> route fails. min/max sample rate were plain 48000 (read as 32.32 = 0 Hz).
+xnu/patches/0231-guacamole-ioaudio2-rate-range-fixed.patch (after 0230): min/max sample rate 32.32 in the format
+dictionaries and the stream dictionaries. Applies after 0226-0230 (dry run OK).
+
+Built with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; 0231 is recorded in
+`work/xnu-local-latest/applied-patches.txt`. Kernel SHA-256:
+`7e1cf8422cc0b1c28bf483313b3332771d8309b177f24b33a53998b374a4a70c`. Boot image:
+`outputs/guacamole-0231-ioaudio2-rate-range-fixed.img` (21,536,768 bytes), SHA-256
+`581731928df4f5917562bc0dd6ba0905e28942f392384cec0ee66f3ee251403f`; packaged with current
+`mkadt.py --highmem --guacamole`, the existing fullmetal template and shim, and the 0230 boot args with `sweettime`
+refreshed. Image has not been booted.
+
+## 2026-11-10 03:00: 0230 IOAudio2 notifications (conf / goin / halt) + more logging (built; not booted)
+
+Codex: notification msg = 24-byte Mach header, refCon u32 @0x18, count u32 @0x1c, 32-byte events @0x20 {ID u32,
+FourCC u32, 24-byte payload}; a 'conf' event goes back unchanged with sel 3; sel 5 itself does not wait; goin/halt are
+async after sel 10/11; ASBD rate becomes 32.32 in the wrapper. The 2 s retry cause is still unidentified.
+xnu/patches/0230-guacamole-ioaudio2-notifications.patch (after 0229): the UC keeps the notification port + refCon
+(released on close / replacement) and sends 'conf' (arg0 = stream ID) after every sel 5, 'goin' after sel 10, 'halt'
+after sel 11 (mach_msg_send_from_kernel_with_options, COPY_SEND, as IOUserClient.cpp); logs "sent 'conf' -> kr"
+(first 40), every sel 3 ("config change ack") and sel 6 ("stream N active M"). Applies after 0226-0229 (dry run OK).
+
+Built with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; 0230 is recorded in
+`work/xnu-local-latest/applied-patches.txt`. Kernel SHA-256:
+`5df01b03e45c982a144f3f6c0c6a6cc6d4ca45bfb247c896aa41d15b11e87396`. Boot image:
+`outputs/guacamole-0230-ioaudio2-notifications.img` (21,536,768 bytes), SHA-256
+`66dc3aed409c9deae46a34f8241bef3aebfab45623d1577fa421d293aa8d2e1c`; packaged with current
+`mkadt.py --highmem --guacamole`, the existing fullmetal template and shim, and the 0229 boot args with `sweettime`
+refreshed. Image has not been booted.
+
+## 2026-11-10 02:50: 0229: 'vdef' on SweetBuiltInAudio; route loops (set format -> 2 s -> StopIOProc, 'what')
+
+VirtualAudio: aggregate master PhysicalDevice 33 SweetBuiltInAudio (port still 'pnul': transport 'null' ->
+Device_Null, no codec speaker port yet); CoreAudio writes "exclusive access owner" (hog) = pid / -1. Every ~2 s:
+sel 5 set format stream 2 (our format; ASBD rate integer 48000), no sel 10 start, StopIOProcID, "CAException ...
+ProcessRoute: 'what'". Hypothesis: HAL waits for a config-change notification we never send. Codex request in
+research/audio/README.md "02:50" (message layout, events waited for). Also: dmesg loses lines (FB stats spam).
+
+## 2026-11-10 02:35: 0228 adopted! then "Could not add PhysicalDevice" (registry write unsupported) -> 0229 (built, not booted)
+
+With 0228 (transport 'null', mute el 3/4, terminal types): "Newly connected device located. UID: SweetBuiltInAudio",
+"Creating Device ID: 33", then "Could not add PhysicalDevice ID: 33 ... CAException (-536870201)" = 0xE00002C7
+kIOReturnUnsupported from "HALB_UCObject::SetProperty: got an error from the IORegistry". Kernel: mediaserverd mapped
+type 0, 0x10000002, 0x10000001 OK, notification port type 0 accepted. NEW
+xnu/patches/0229-guacamole-ioaudio2-set-properties.patch (after 0228): setProperties on IOAudio2Device and its user
+client accept every key (kept as properties), first 24 writes logged "SWEET AUDIO: <proc> sets <device|user client>
+property "<key>" = ...". Built successfully with the local XNU toolchain; 0229 reverse-apply check passes. Kernel SHA-256: `743bc5e66c5c185b4f39a27395cfe445e37e236be72eb6eda013d5b820bd3159`. Boot image: `outputs/guacamole-0229-audio-set-properties.img` (21,536,768 bytes), SHA-256 `d341ad27a1482254e5446b2e0d8a1eff134a81d877e1363a51b0112c7c38b3ac`; same 0228 boot arguments with `sweettime` refreshed and current `mkadt.py --highmem --guacamole`. Image not booted.
+
+## 2026-11-10 02:25: 0228 codec ports: built kernel and boot image (not booted)
+
+Codex (research/audio/devicefactory-codec-addendum.md, codec-controls-addendum.md): DeviceFactory_Aspen handles
+null pci thun strk dprt hdmi mbus usb vlri pair blue - NOT 'bltn' (so 0226/0227's device was listed, never adopted);
+the codec setup runs from the common per-device path and creates Built-In Speaker / Receiver only if the HAL device
+has ('mute','outp', element 4 / 3). IOAudio2 control dict keys: control ID, class, base class, scope, element, value.
+xnu/patches/0228-guacamole-ioaudio2-codec-ports.patch (after 0227): transport default 'null' (0x6e756c6c), boot-arg
+sweetaudiotp=<FourCC as number> to try others without a kernel rebuild (e.g. 0x6d627573 'mbus'); controls: two mute
+controls (IDs 1003/1004, class 'mute', base 'ctrl', scope 'outp', elements 3/4); stream "terminal type" 'spkr' out,
+'micr' in. Mic data sources ('dsrc' "selectors" item format unverified) left out. Check after boot: mediaserverd log
+for "Newly connected device located. UID: \"SweetBuiltInAudio\"", "creating a speaker port", "creating a receiver
+port", then a route + the Beats.
+Built successfully at 02:23 with the local XNU toolchain; 0228 reverse-apply check passes. Kernel SHA-256: `313299089300ee23eeb686b1c2279ccbf03f20f460feb7bee7649eefddfa82de`. Boot image: `outputs/guacamole-0228-audio-codec-ports.img` (21,536,768 bytes), SHA-256 `64771d8078fc55fd1b18558c9c519d31922b0c027bffa18274a29e55c95ca71e`; generated from current `mkadt.py --highmem --guacamole`, the 0227 boot args with `sweettime` refreshed, and the existing fullmetal template/shim. `sweetaudiotp` is omitted so the patch default `null` is used. Image has not been booted.
+
+## 2026-11-10 01:50: 0227 booted: IOA2 stream errors gone; VirtualAudio still lists but does not adopt our device
+
+Beats selectable with VirtualAudio back, but every route fails (no built-in speaker/receiver/mic ports: only
+Null_Device's 'pnul'), bluetoothd only gets A2DP suspend/reset, never start; ringtone silent, YouTube in Safari crashes
+(separate). With 0227 CoreAudio accepts the streams (no "no current format"), but DeviceListener_Aspen lists
+SweetBuiltInAudio (id 33) and adopts only Null_Device; nothing logged why; our UC never opened. dmesg rolls over in
+minutes (SWEET FB 5s stats), so boot-time SWEET AUDIO lines are lost. Codex request (README "01:50"): the adoption
+predicate; also pending "01:45": terminal-type FourCCs + data-source registry keys. bluetooth boot job installed
+(launchd.plist on the phone, backup /var/local/launchd.plist.bak): btbridge starts at boot.
+
+## 2026-11-10: 0226 works: CoreAudio activates SweetBuiltInAudio; VirtualAudio back, 'vdef' built; 0227
+
+With 0226 and VirtualAudio.plugin moved back to /Library/Audio/Plug-Ins/HAL/ (done on the phone 00:56), mediaserverd
+is stable: "HALS_Device::Activate: activating device 33: SweetBuiltInAudio"; VirtualAudio starts, sees our UID but
+adopts only Null_Device, and builds 'vdef' (VirtualAudioDevice_Default, id 70) on an aggregate with master
+Null_Device. Our device was skipped because its streams were incomplete: "there is no current format", "there is no
+starting channel number". Codex (research/audio/device-tree-virtualaudio-identities.md): no UID whitelist (UIDs with
+"VirtualAudioDevice_" are filtered); "current format" = nested dict with 32.32 fixed-point UInt64 "sample rate" + UInt32
+fields (no format ID read); "starting channel" UInt32. D22 /product/audio = {wireless-splitter 1,
+supports-always-listening 1}; /product builtin-mics 4 (not added to our ADT yet; only a log line).
+NEW xnu/patches/0227-guacamole-ioaudio2-current-format.patch (after 0226): "current format" + "starting channel" 1,
+format dict "sample rate" as 32.32. Not built. Also: test the Beats now - 'vdef' exists even on Null_Device.
+
+## 2026-11-10: 0223 + 0225 + 0226 kernel / audio stand-in boot image (built, not booted)
+
+Applied the current 0225 and 0226 patches on top of the previously built 0223 tree and built successfully with
+`XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`. The 0225 patch had a malformed hunk count;
+corrected its header from `-1270,15 +1270,38` to `-1270,13 +1270,35` (patch body unchanged). Reverse-apply checks
+confirm 0223, 0225, and 0226 are all present. Kernel SHA-256:
+`8c8c8fe347a3a95c3694377b83b2f52ffcc53b4c2fde834afdee6292d52822a0`.
+
+Built `outputs/guacamole-0223-0225-0226-audio-standin.img` with current `mkadt.py --highmem --guacamole`,
+the existing fullmetal template and shim, and the previous 0223 60 Hz GPU-present arguments refreshed with
+`sweettime`. 0226 audio stand-in remains enabled (no `sweetaudio=0`); VirtualAudio remains a separate userland
+plugin setting and was not changed. Image SHA-256: `5508773e53e42dcca644b6499297a3ab6284f1bf08270fc78f0a5c973bd07982`.
+Not yet booted: `fastboot devices` is empty, and SSH to the last known phone IP `192.168.0.51` times out. Need the
+phone in fastboot to boot this image, then re-establish SSH to inspect `SWEET AUDIO` / CoreAudio logs with
+VirtualAudio still disabled.
+
+## 2026-11-10: 0226 silent IOAudio2Device stand-in (kernel; built, not hardware-tested)
+
+xnu/patches/0226-guacamole-ioaudio2-standin.patch: iokit/Kernel/arm/SweetAudio.cpp (+ files.arm64, KernelConfigTables
+entry on IOResources, before IOWatchdog). Class IOAudio2Device (CoreAudio matches by class name), user client
+IOAudio2DeviceUserClient (type 0). Registry: device UID "SweetBuiltInAudio", name "Built-In Audio", clock domain 1,
+io buffer frame size 512, transport 'bltn', latencies 0, safety offsets 64; output stream ID 2 (2 ch) and input
+stream ID 1 (1 ch), s16 48 kHz, ring 4096 frames, format dict as "format" + "supported formats"/"available formats".
+Selectors: 2 echoes the value, 5 logs the ASBD, 10/11 start/stop the clock, rest accepted. Memory: type 0 = status
+page (guess: 0x00 sample time, 0x08 host time of the last ring wrap, 0x10 == 0x18 seqlock counter), 0x10000001 /
+0x10000002 = rings. A HIGH thread call advances the page once per ring pass (85.3 ms). Logs "SWEET AUDIO: ...";
+boot-arg sweetaudio=0 disables. GUESSES to correct from logs: UID/name, format dictionary layout, status page.
+Test plan: (1) boot with VirtualAudio still disabled: dmesg | grep 'SWEET AUDIO' (registered; does mediaserverd
+open/map/start?). (2) then mv /Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin /Library/Audio/Plug-Ins/HAL/,
+killall mediaserverd, watch its log / crash reports (undo: move it back).
+
+## 2026-11-10: 0225 Dynamic Island vanishes in full-screen games: fb transparency test missed the edges
+
+User: in Subway Surfers the island disappears (back on leaving the game; not shown even with a timer running).
+0185's sweet_fb_layer_transparent samples an 8x8 grid whose outer rows are 1/16 of the height in (~150 px), so
+CA's layer with only the island pill (top) and home indicator (bottom) visible counted as all-transparent and the
+game layer was scanned out alone. NEW xnu/patches/0225-guacamole-fb-top-layer-edge-bands.patch: also scan the top
+and bottom 1/16 bands (every 4th row, every 8th pixel). Cost to watch: such frames now go to the blended (CPU
+compose) path every frame while the island shows - check fps and `dmesg | grep 'SWEET FB: 5s' | tail`; if it is
+too slow, the next step is blending only the edge bands (or the whole top layer) on the GPU. Not built yet.
+
+## 2026-11-10: 0224 photo colours (userland/metal2): YCbCr 4:2:0 converted to RGB on the CPU
+
+User: photos show in the wrong colours. 0217's sweetYCbCrTexture stored raw Y/Cb/Cr in r/g/b assuming QuartzCore's
+shaders convert; they do not (the hardware YCBCR8_420_2P formats sample as RGB). Now BT.601, '420v'/'x420' video
+range else full range, format 501 -> RGBA8Unorm_sRGB; the 0218 stats log reads the source planes. Needs rebuild of
+the metal2 bundle (as for 0217-0219).
+
+## 2026-11-10: audio stand-in: plan = kernel "IOAudio2Device" specified from CoreAudio's client side
+
+Codex IPSW findings in research/audio/README.md (D22: IOAudio2Family, AppleARMIISAudio, AppleEmbeddedAudio,
+AppleCS42L75Audio codec, AppleCS35L26Amp speaker amp, AppleAOPAudio; iOS CoreAudio HALS_IOA2Manager matches
+IOAudio2Device and calls UC selectors 2, 3, 5, 6, 10 (start), 11 (stop)). No stock D22 ioreg available, so next
+Codex request = the client-side contract (matching, registry schema + required keys, selector shapes, notification
+format, mapped memory + status page fields, VirtualAudio's searched UIDs + D22 VAD tuning file names). Then: kernel
+patch with a silent IOAudio2Device stand-in, VirtualAudio restored, iterate from mediaserverd's log.
+
+## 2026-11-10: MILESTONE: D22 iOS IOAudio2 stack researched
+
+Inspected the local iOS 16.7.16 / 20H392 D22 kernelcache, DeviceTree and the matching
+CoreAudio shared cache. Findings are in `research/audio/README.md`: D22 uses IOAudio2
+through `HALS_IOA2Manager`/`HALS_IOA2UCDevice`; the tree identifies CS42L75 codec,
+CS35L26 top-speaker amp, six MCA clusters and a distinct AOP audio endpoint; kernel
+personalities and IOAudio2 registry key names are summarized there. The iOS HAL call
+sites use selectors 2, 3, 5, 6, 10 and 11 (including flagged start/stop), so do not
+substitute the older macOS 0/1 start/stop table.
+
+Still unknown: exact primary D22 device UID/name, complete IOAudio2 stream/control
+dictionaries and the kernel driver's selector dispatch table. The available IPSW dump
+does not expose those runtime values; obtain a stock D22 IORegistry dump or extract and
+disassemble the individual kext Mach-Os before implementing the stand-in personality.
+All Apple binaries and raw disassembly were kept in `/private/tmp`, outside the repo.
+
+## 2026-11-09: MILESTONE: AppleAOPAudioPlugin and VirtualAudio static findings
+
+Documented the AppleAOPAudioController match, AOP audio/voice-trigger user clients,
+observed IOConnectCallMethod selectors and the two mapped ring/status regions, plus
+VirtualAudio's built-in speaker/receiver/microphone topology requirements in
+`research/audio/README.md`. Exact D22 physical UIDs and numeric port IDs still need a
+stock-device IORegistry capture or VirtualAudio topology disassembly; do not treat the
+stand-in topology as fully specified yet.
+
+## 2026-11-09: started: audio stand-in device (option 1) - research/audio/README.md (Codex task)
+
+## 2026-11-09: MILESTONE: A2DP connects with 0223; route listed but not selectable: needs VirtualAudio
+
+With kernel 0223 (Skywalk user-pipe priv) bluetoothd survives AVDTP OPEN and the Beats appear in the audio route
+list. Picking them fails in mediaserverd: "FigRoutingManagerPickRouteDescriptorsForContext: Unable to find endpoint
+for descriptor" ("Beats Solo 4"), routeConfigUpdateReasonEndedFailed; around it CoreAudio "no object with given ID 0",
+"Couldn't get the VAD to set the audio object property listener", AQMEIO "error -66680 finding/initializing
+Default-InputOutput". VAD = VirtualAudio.plugin, which image v12 moved to /Library/Audio/Plug-Ins/HAL.disabled/
+(it crashed mediaserverd: ApplyBeamFormerPreference, no default virtual device 'vdef' because there is no audio
+hardware). On iOS every route, Bluetooth included, is an endpoint of the VAD, so Bluetooth audio now waits on the
+audio stack: VirtualAudio back + something that makes 'vdef' exist (a dummy built-in device or the real codec).
+Bluetooth itself is done: 3 Mbaud, pairing, encryption, SDP, AVRCP, HFP AT, AAP, AVDTP to OPEN, route published.
+
+## 2026-11-09: btbridge at boot: launchd job com.sweet.btbridge (not installed yet)
+
+tools/sweet-root-tweaks.py NET_JOBS: com.sweet.btbridge = /var/local/bin/btbridge -q, RunAtLoad, KeepAlive,
+ThrottleInterval 10 (fails and retries until wland has the rails up), log /var/local/btbridge.out. btbridge takes
+/var/run/btbridge.lock (flock) so a hand-started second copy exits instead of resetting the controller; to debug by
+hand: `launchctl bootout system/com.sweet.btbridge`. Install on the live phone: pull /System/Library/xpc/launchd.plist,
+`python3 tools/sweet-root-tweaks.py --launchd-plist IN OUT --net`, push back (keep owner/mode), reboot.
+
+## 2026-11-09: kernel 0223 Skywalk user-pipe privilege + boot image
+
+Applied 0223 after 0222 and built locally with Xcode 27.2 / macOS 13.5 KDK
+22G74 using `XNU_LOCAL=$(pwd)/work/xnu-local-latest sh tools/xnu-local-build.sh`.
+The patch file's original unified-diff hunk counts were malformed; corrected
+the header counts to match its existing context/additions, then `git apply
+--check` and the build succeeded. Reverse-apply check confirms 0223 is present
+in the built source. No other kernel patch was changed. Kernel:
+`work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`,
+16,959,848 bytes, SHA-256
+`994dafffe75cf811739d208e06a6bdfcc48eee18b43b5407e46d43f477f2a872`.
+
+Built `outputs/guacamole-0223-skywalk-user-pipe-priv.img` from that kernel,
+current `mkadt.py --highmem --guacamole`, the same shim and stock boot-image
+template/DTB as 0222, and the 0222 boot args with `sweettime` refreshed.
+Verified `rd=ufsroot0 ufsroot=ios`, `sweetfbgpu=1`, and no forced
+`sweetfb_refresh=60 sweetfb_vsync=60`; embedded ADT matches the current
+generator output. Image is 21,495,808 bytes, SHA-256
+`59e96e9bdffabc899d6444c090a076f2e5b1fd65ecc5c02ba4610ca06968f1be`.
+Built only; not booted on the phone.
+
+## 2026-11-09: cause of the A2DP exit: no Skywalk user-pipe privilege for mobile; patch 0223
+
+nxprobe: root USER_PIPE register + alloc OK; root KERNEL_PIPE register EINVAL (expected); mobile register EPERM;
+nxprobe-bt (signed with bluetoothd's entitlements) as mobile: EPERM too - this kernel has no entitlements at all
+(0025), and its MAC priv_grant (0064 sweet_sandbox_priv_grant) grants only PRIV_WORK_INTERVAL. bluetoothd runs as
+mobile (501). 0223 grants only PRIV_SKYWALK_REGISTER_USER_PIPE. Built into
+`outputs/guacamole-0223-skywalk-user-pipe-priv.img` (details above), not yet booted. After boot:
+`su mobile -c /var/local/bin/nxprobe` -> expected register 0, alloc 0.
+
+## 2026-11-09: nxprobe-bt rebuilt and installed; Skywalk permission delta
+
+Extracted the iOS 16.7.x `bluetoothd` entitlements from
+`/private/tmp/guac-rootfs-audit/usr/sbin/bluetoothd` to the ignored
+`userland/bt/bluetoothd-ents.plist` with `codesign -d --entitlements :-`;
+`plutil -lint` passed. `sh userland/build.sh` completed and built
+`userland/out/nxprobe-bt`, ad-hoc signed with those entitlements. Installed it
+to `/var/local/bin/nxprobe-bt` on `192.168.0.51` via `.new`, `chmod 755`, and
+`mv -f`; pulled it back and verified byte-for-byte. SHA-256:
+`53462a68e2bc5fd5f0d52fc16c7922521982eeefe010544af5b4c6b0fb2a7d6c`.
+
+XNU source finding (`work/xnu-local-42140063871/dxb/xnu`): user-pipe provider
+registration calls `skywalk_priv_check_cred(..., PRIV_SKYWALK_REGISTER_USER_PIPE)`,
+whose entitlement name is `com.apple.private.skywalk.register-user-pipe`.
+`os_channel_create` passes `cha_low_latency` into `CHMODE_LOW_LATENCY`; when set,
+`ch_open()` separately requires `PRIV_SKYWALK_LOW_LATENCY_CHANNEL`, mapped to
+`com.apple.private.skywalk.low-latency-channel`. Monitor channels separately
+require `com.apple.private.skywalk.observe-all` and uid 0. The extracted
+bluetoothd entitlements include register-user-pipe but do not include
+low-latency-channel (they do include `com.apple.bluetooth.latencyCritical`, a
+different entitlement). Thus a channel request marked low-latency can pass
+registration and still fail channel open. `nxprobe-bt` currently repeats
+`nxprobe.c`'s register/allocate-instance calls; it does not yet open a channel,
+so it does not itself test that second permission check.
+
+## 2026-11-09: nxprobe (errno of the A2DP user-pipe nexus alloc)
+
+Built with `sh userland/build.sh` and installed to `/var/local/bin/nxprobe` on
+`192.168.0.51` using `nxprobe.new` + `chmod 755` + `mv -f`. Pulled the installed
+file back and confirmed byte-for-byte equality. SHA-256:
+`7025b74958445cb0c7d6a173786bb17417632be332ec240bc3b48f7900382913` (51,184 bytes).
+The build emitted existing warnings in `bt/btuart.c`, `wland/radio.c`, and other targets.
+
+Codex: bluetoothd fails in os_nexus_controller_alloc_provider_instance for its NEXUS_TYPE_USER_PIPE provider
+(BTAudioSkywalk, slot 2048, 1/1 rings, 8/8 slots); "Device supports Skywalk Path" = a virtual predicate (vtable +0x60),
+source unknown; xnu nx_create candidates ENOENT (provider missing/closed) or a constructor error. No CRASH line in
+dmesg for bluetoothd (exited, not faulted?). New userland/bt/nxprobe.c (build.sh): same register + alloc, prints
+each errno; `nxprobe` (user pipe) and `nxprobe k` (kernel pipe), as root and as mobile.
+
+## 2026-11-09: A2DP Skywalk disassembly findings
+
+`research/bluetooth/a2dp-skywalk.md` records the confirmed provider setup and XNU
+failure path. bluetoothd registers `BTAudioSkywalk` as `NEXUS_TYPE_USER_PIPE` with
+2048-byte slots, one RX/TX ring, 8 RX/TX slots and MHINTS=2. The next call,
+`os_nexus_controller_alloc_provider_instance`, is the one that fails. `nexus.c`'s
+likely runtime return is `ENOENT` (provider UUID/controller lookup), but the log has
+no errno; the UI capability log is a virtual predicate at vtable offset 0x60, and
+its implementation/source condition remains unidentified. The failure helper logs
+and returns through cleanup; it does not itself abort. No phone or kernel changes.
+
+## 2026-11-09: bluetoothd dies at "Failed to alloc a nexus provider" (A2DP Skywalk path)
+
+At AVDTP OPEN bluetoothd says "Device supports Skywalk Path", creates its own Skywalk nexus (slot 2048, 1/1 rings,
+8/8 slots), "Created skywalk nexus provider", then "Failed to alloc a nexus provider" and the process is gone 0.1 s
+later (no .ips, no "restarting"). Task for Codex: research/bluetooth/a2dp-skywalk.md (which nexus type/call fails,
+why bluetoothd dies, what selects the Skywalk path, xnu error returns).
+
+## 2026-11-09: after the cmd_sync fix: A2DP reaches AVDTP OPEN, then bluetoothd restarts
+
+btbridge trace (run 2): the Beats connect to us, AVDTP: they Discover (6 local SEPs), Get_All_Caps SEID 1..6,
+Set_Configuration SEID 5 = Apple vendor codec (ff 4c 00 00 / 00 01 ...), Delay_Report, Open: all accepted; the media
+L2CAP channel (2nd PSM 0x19) opens and configures; AAP (PSM 0x1001) exchanges its certificate (639-byte ACL); HFP
+AT commands flow. Within ~1 s of the media channel being configured, a new HCI_Reset: bluetoothd restarted (no
+.ips). Repeats on every reconnect (5x). Reason not yet seen: need bt-a2dp2.oslog (the attachment was the old file).
+
+## 2026-11-09: A2DP blocker found: btbridge's own command exchanges swallowed controller packets (fixed, untested)
+
+bt-a2dp.oslog (bluetoothd is verbose: AVDTP, SDP, L2CAP state): Beats connect, SDP OK (AudioSink AVDTP 1.3, AVRCP,
+HFP, AAP), AVDTP Discover -> SEID 1 SBC, SEID 2 AAC; Get_All_Capabilities SEID 3 sent, then "Didn't get command
+response to transaction 4 within timeout period" -> "Disconnecting A2DP when no AVDTP stream has been established";
+also "L2CAP Config Timeout" on the headset's SDP channel and an AAP (PSM 0x1001) timeout. In the btbridge -a trace
+that request is followed at once by "LE scan parameters, done here": scan_parameters / sync_cmd /
+ensure_random_address / the FC01->FC14 BD_ADDR path did uart_write + uart_read(300 ms) into a private buffer and
+dropped whatever else arrived. Same cause for both earlier bluetoothd restarts (reason 621 ExpectedEventTimeout on
+OI_DHCI_AUTHENT_REQ and OI_DHCI_ACCEPT_CNCT_REQ: Authentication Complete / Connection Complete eaten).
+Fix in btbridge.c: ctl/nc are global; `cmd_sync()` reads into ctl, removes only its own Command Complete/Status and
+leaves every other packet for the main loop. Also seen: Create Connection Command Status 0x3a (Controller Busy) a few
+times while the headset paged us (retries succeed).
+
+## 2026-11-09: ACL trace (btbridge -a): A2DP stops after AVDTP Get_All_Capabilities
+
+Device is "Beats Solo 4" 4c:97:cc:06:4f:3e. L2CAP channels open fine: SDP (PSM 1), RFCOMM (3), Apple 0x1001, ATT (0x1f),
+AVDTP (0x19), AVCTP (0x17). AVDTP: our Discover -> 3 SEPs (SEID 1/2/3, sink); our Get_All_Capabilities SEID 1 ->
+accept (media transport, SBC ff ff bitpool 8-75, SCMS-T, delay reporting). Then bluetoothd sends NO Set_Configuration,
+and does not answer the headset's own AVDTP Discover (label 3); later the headset closes a channel. Meanwhile
+bluetoothd loops Broadcom vendor 0xFCE9 (sub 05/07/1e/35/32/01, ~750 times) and 0xFCE2 (sub 1e/36), all answered
+blindly by btbridge (status 0 + zeros): suspect one of these answers is what bluetoothd waits on. Need bluetoothd oslog.
+
+## 2026-11-09: 3 Mbaud works; AirPods connect but no audio; btbridge -a (ACL trace) added
+
+Log: `uart: 3 Mbaud link up` (0xFC48 answer 04 ff 02 92 01 + 04 0e 04 01 00 00 00 dropped, BD_ADDR read OK at 3M).
+AirPods 4c:97:cc:06:4f:3e: first Create Connection page timeout (04), then Connection Complete 0 handle 2, link key
+reply, auth OK, encryption on, Exit Sniff, then only ~50 ACL each way (60 s summary: ACL 47 in / 54 out, 0 resyncs) and
+no audio. Open: did AVDTP reach Start (needs ACL contents: new `btbridge -a`), and does iOS audio work at all on this
+port (speaker / audiomxd)? Vendor commands answered blindly around then: fce9 (x70), fce2, fd4a, fd4b, fd4d.
+
+## 2026-11-09: latest btbridge rebuilt and installed
+
+Ran `sh userland/build.sh`; installed the resulting `out/btbridge` to `/var/local/bin/btbridge` on `192.168.0.51` via `/var/local/bin/btbridge.new` and `mv -f`. Pulled the installed binary back and verified it byte-for-byte with `cmp`. SHA-256: `4e5b2d8946680a742c9f973752fb6fd0b14e5af564c610db51d3e2e30c43e43f`. Build completed with existing unused-variable warnings (`scan`, `regs`) in `bt/btuart.c` and unrelated warnings from other targets. The running `btbridge` process was not restarted.
+
+## 2026-11-09: btbridge rebuilt and installed (latest request)
+
+Ran `sh userland/build.sh`; installed the resulting `userland/out/btbridge` to `/var/local/bin/btbridge` on `192.168.0.51` using the `.new` staging path, `chmod 755`, and `mv -f`. Pulled the installed binary back and verified byte-for-byte with `cmp`. SHA-256: `ca906da968329f0a497cba89d60722a9d61b57c41c95e07710e6dc83a4516a9f` (86,032 bytes). Build completed with existing warnings, including unused `scan`/`regs` in `bt/btuart.c` and warnings in other targets. The running process was not restarted.
+
+## 2026-11-09: btbridge rebuilt and installed
+
+Ran `sh userland/build.sh` successfully. Current `userland/out/btbridge` (85,936 bytes; SHA-256 `74012c1ec84f0a92f401f83fd8afd5f99b65d03e3156336b1ebda60e3828c2db`) is installed at `/var/local/bin/btbridge` on `192.168.0.51`. The earlier SSH attempt completed the staged rename before Wi-Fi dropped; after Wi-Fi returned, pulled the installed binary and verified it byte-for-byte with `cmp`. Build warnings: `scan`/`regs` unused in `bt/btuart.c`, plus existing warnings in other targets.
+
+## 2026-11-09: AirPods connect -> btbridge stopped; fix: 3 Mbaud link + stream resync (NOT yet built/tested)
+
+AirPods connected (encryption on, ACL flowing), then Bluetooth died: phone did NOT reboot; btbridge gone,
+bluetoothd + BlueTool -R left, kernel `SWEET BT: ... 11532017 bytes to the bridge, 1613779 back, 1192 lost`.
+Cause: controller link at 115200 (~11 KB/s) < A2DP; the host kernel control's 64 KB queue overflowed, the kernel
+dropped bytes (sweet_bt_to_bridge), btbridge's H4 parser fell out of step on a bogus long ACL length, its 64 KB host
+buffer filled, `read(m, .., 0)` returned 0 = "kernel control closed" -> exit. Changes:
+- btuart.c: `rcg_set(m, n, hz)` (clk-rcg2 2d clamp), `src_hz` replaces SRC_HZ in set_baud; `uart_fast()`: RFR held
+  not-ready, vendor 0xFC48 [0x0e = 3000000] (Linux hci_qca qca_set_speed), RCG 600 MHz x 4/25 = 96 MHz, divider 1,
+  RFR back to hardware, answer dropped, HCI_Read_BD_ADDR must complete.
+- btbridge.c: boot at 3 Mbaud by default (falls back to a full 115200 re-boot), `-s` stays at 115200; ACL length
+  > 4096 or an event from the host = out of step -> skip byte, logged once, counted ("resyncs" in the summary); full
+  host buffer -> dropped, never read(.., 0).
+Kernel side still drops on a full queue (should stop consuming tx slots instead): next if loss remains.
+
+## 2026-11-09: MILESTONE: Bluetooth works in iOS (Settings finds devices)
+
+With 0x204a answered by btbridge: LE_Set_Scan_Parameters -> 0, no bluetoothd restart in 30 s, Settings' Bluetooth
+switch on and a nearby device listed; Wi-Fi stays connected. Chain: ADT /arm-io/bluetooth (mkadt.py), WifiVendor=USI
+(mgtool setstr), kernel 0220+0221+0222 (kernel controls com.apple.uart.bluetooth / .sk.bluetooth / com.sweet.bt.host,
+Skywalk kernel pipe), userland/bt/btbridge (WCN3998 boot + H4 bridge + Broadcom/Apple compatibility answers).
+Not done: btbridge as a launchd job at boot (after wland); pairing / ACL data / audio untested; host polls the UART
+(CPU); Wi-Fi/BT coexistence not configured; real BD_ADDR source; the stand-in .hcd.
+
+## 2026-11-09: latest btbridge installed with extended-scan workaround
+
+Ran `sh userland/build.sh`; the current `out/btbridge` includes the `0x204a` reply that keeps the controller in legacy scan mode. Installed to `/var/local/bin/btbridge` on `192.168.0.51` using `.new` + `mv -f`, then pulled back and verified byte-for-byte. SHA-256: `ee4a92377f556e596ca818bf5c63e6234f856e1c182acd9d057c00d59e6386e5`. Existing warnings in `bt/btuart.c` (`scan`, `regs`) and unrelated build targets remain. Running bridge process was not restarted.
+
+## 2026-11-09: LE legacy commands refused = extended mode (0x204a)
+
+Even LE_Set_Scan_Enable(0) gets 0x0c: the chip has switched to extended-advertising mode, where legacy LE scan /
+advertising commands are disallowed. Cause: bluetoothd's init sends LE_Read_Periodic_Advertiser_List_Size (0x204a,
+"01 4a 20 00"), a periodic (extended) advertising command. btbridge now answers 0x204a itself (size 3) so the chip
+stays legacy. The 0x200b handling (scan off, retry public) stays as a fallback.
+
+## 2026-11-09: latest btbridge rebuilt and installed
+
+Ran `sh userland/build.sh`; `out/btbridge` built successfully with the current scan-parameter fallback changes. Installed to `/var/local/bin/btbridge` on `192.168.0.51` via `.new` + `mv -f`, then pulled it back and confirmed a byte-for-byte match. SHA-256: `d08d582e882bc2e86cfa124eb0e93cc0f0a0755f484d7786793ebd90adc8f1e5`. Build emitted the existing unused-function warnings for `scan` and `regs` in `bt/btuart.c`, plus warnings in unrelated targets. Did not restart a running bridge process.
+
+## 2026-11-09: LE scan still disallowed with a random address
+
+LE_Set_Random_Address accepted (c7:34:a7:fb:2e:73), LE_Set_Scan_Parameters (now passive, 01e0/0030, own random) still
+0x0c -> bluetoothd "restarting { reason=712 }". btbridge now does 0x200b itself: LE_Set_Scan_Enable(0) first, the
+command as sent, and if still 0x0c with own address type public; logs every status; bluetoothd gets the last.
+Also reported: Wi-Fi "unable to connect / channels in use" while BT stack runs (coexistence? not yet checked).
+
+## 2026-11-09: btbridge rebuilt and installed
+
+Ran `sh userland/build.sh`; `out/btbridge` built successfully. Existing warnings: unused `scan` and `regs` functions in `bt/btuart.c`, plus an unrelated wland parentheses warning and other pre-existing warnings. Installed to `/var/local/bin/btbridge` on `192.168.0.51` through `btbridge.new` + `mv -f`, then pulled it back and compared byte-for-byte. SHA-256: `cb54aa41c0944755756df7de858649677ffecfbc7d29d0fd7a2a830a3bb9ce1a`. Did not stop or restart any running bridge process.
+
+## 2026-11-09: LE scan "Command Disallowed"
+
+bluetoothd up to announcing the local device, then "Could not start LE scan (leScanParamsLPCoreCb): STATUS 712" ->
+"Scan stopped improperly -- restart". lescan.md (ChatGPT): standard LE_Set_Scan_Parameters (0x200b). The chip answers
+it 0x0c Command Disallowed every time (01 0b 20 07 01 40 00 30 00 01 00: own address type 1 = random). No scan enable
+and no extended (0x2036-46) commands before it. Likely: no random address on the chip (Apple sets it through vendor
+0xfce9 commands, answered by the bridge). btbridge now sets a static random address with LE_Set_Random_Address
+(0x2005) before 0x200b / 0x2006 / 0x200d that use own address type random, once per HCI_Reset.
+
+## 2026-11-09: bluetoothd LE scan path disassembly
+
+`research/bluetooth/lescan.md` documents the iOS 16.7.16 `leScanParamsLPCoreCb` path. It uses standard HCI LE Set Scan Parameters (`0x200b`) or LE Set Extended Scan Parameters (`0x2041`), not vendor opcodes `0xfdd1`/`0xfd4e`; their Command Complete returns the normal one-byte HCI status. A separate asynchronous vendor scan-core event handler exists, but no mandatory event wait is in the parameter callback. Status 712 (`0x2c8`) is passed into the callback as an OI_STATUS and isn't synthesized there; exact lower-layer mapping remains undetermined. The LPCore decision reads runtime scan-core state and tracks a `scanLPCoreEnable` boolean; the branch contains no direct BCM chipset threshold. Whether that boolean comes from defaults or a negotiated feature bit remains undetermined. No device/config changes were made.
+
+## 2026-11-09: bluetoothd stack up to STACK_READY; vendor replies with parameters
+
+With the supported-commands fix: "Stack initialization complete", STACK_READY, "Done starting up stack", SDP/A2DP/HFP
+registered, "Notifying stack listeners that the stack did start". Then ~1 s later: BD_VSC_LE_META_ENA_FEATURES
+(0xfd48) -> "AssertFail bcm_vsc.c:642 : ByteStream_NumReadBytesAvail(*pBs) >= 1" (our vendor Command Complete had
+only the status) -> exit, launchd restart every ~10 s (no crash report). btbridge: vendor commands answered here now
+return status 0 + the command's first parameter byte (sub-opcode echo) + 15 zeros.
+
+## 2026-11-09: supported-commands mask
+
+0x0c5b never reaches the bridge: bluetoothd fails it locally (status 628) because the WCN3998's
+Read_Local_Supported_Commands octet 18 = 0x83 (bit 3 Write_Default_Erroneous_Data_Reporting clear). btbridge now
+sets octet 18 bits 2-3 in that reply; the chip's "unknown command" (status 1) is then turned into success.
+Also seen (non-fatal so far): "Unable to turn on BT)_WAKE signal (status=65535)".
+
+## 2026-11-09: MILESTONE: bluetoothd's stack talks to the WCN3998 through the 0222 Skywalk channel
+
+dmesg: "channel open for pid 456", "channel connected"; btbridge: bluetoothd's own HCI init on the real chip
+(Read_Local_Supported_Commands, BD_ADDR 02:53:57:45:45:02, features, LE masks, buffer sizes, LE white list / data
+length / resolving list, host flow control...), all status 0. Then bluetoothd: "OI_HCICMD_WriteDefaultErroneous
+DataReporting (status=628)", "HCI initialization failed", restart (reason 108) ~0.7 s after connect; Write_Default_
+Erroneous_Data_Reporting (0x0c5b) does not show in the bridge log. btbridge now turns Command Complete status 0x01
+(Unknown HCI Command) into success (logged). To check: does 0x0c5b reach the bridge (grep '5b 0c').
+
+## 2026-11-09: 0222 Skywalk kernel-pipe channel for bluetoothd
+
+With 0221 bluetoothd connects to com.apple.uart.sk.bluetooth, then "os_channel_create (on com.apple.uart.sk.bluetooth)
+failed (No such file or directory)" -> fatal 1201. transport.md (ChatGPT): getsockopt 0x40487413 (72 bytes termios),
+setsockopt 0x800c5414 (12 bytes), getsockopt 0x40105412 (16 bytes: nexus UUID), os_channel_create, setsockopt
+0x80487414; slots carry the byte stream in chunks. (Its claim that H4BC skips this contradicts the phone's log.)
+0222 (on 0221): kernel-pipe nexus as bsd/net/if_utun.c's utun_enable_channel: provider "com.sweet.nexus.bt.kpipe"
+(2048-byte slots, 64 per ring), instance + pbufpool per open, bound to the asking pid (NEXUS_PORT_KERNEL_PIPE_CLIENT);
+0x800c5414 opens it, 0x40105412 returns the instance UUID; sync_tx sends slot bytes to the bridge, bridge bytes are
+queued (64 KB) and sync_rx fills rx slots after kern_channel_notify; closing the sk socket frees the instance.
+Logs "SWEET BT: channel open for pid N" / "channel connected" / "channel closed". Untested; compile first.
+(research/bluetooth/sweet_btuart.c.0222: full file after 0222, staging copy.)
+
+## 2026-11-09: bluetoothd's stack opens com.apple.uart.sk.bluetooth (0221)
+
+BlueTool's script now completes ("BlueTool finished running boot script", "Powering on chipset", "Starting up
+StackManager"), then bluetoothd: "HCI Transport is set to H4BC" -> "ioctl(CTLIOCGINFO, com.apple.uart.sk.bluetooth)
+failed" -> "Failed to initialize transport H4BC" -> "Bluetooth fatal error - crashing { reason=1201 }"; launchd
+restarts it, Settings cycles unavailable / loading. xnu/patches/0221-guacamole-bluetooth-uart-sk-control.patch (on
+top of 0220): also registers com.apple.uart.sk.bluetooth with the same handling; the latest iOS connection on
+either control gets the bridge's bytes; dmesg says which control. (research/bluetooth/sweet_btuart.c.0221: the
+full file after 0221, staging copy.)
+
+## 2026-11-09: MILESTONE: BlueTool's whole D22 boot script runs against the WCN3998
+
+With Read_Local_Version faked as BCM4357B1: "chip = BCM4357B1", fwPos 31; "wake failed: error 2" (no wake GPIO,
+ignored); HCI_Reset (chip); FC18 baud; FC2E + ~25 FC4C Write_RAM records + FC4E Launch_RAM (BlueTool found an
+.hcd with real Broadcom code: all answered by btbridge, nothing sent); FC18; FC01 Write_BD_ADDR 02:53:57:45:45:02;
+HCI Write_Local_Name "iPhone" (chip, ok); FD98 (Broadcom TX power table) and FC27 (sleep mode, bcm -s) answered.
+btbridge now forwards FC01 as QCA 0xfc14 (Linux qca_set_bdaddr) so the chip takes the real address.
+Next: what bluetoothd does after the boot script (oslog bluetoothd), Settings' Bluetooth switch.
+
+## 2026-11-09: btbridge Read_Local_Version opcode fix
+
+The installed btbridge (ChatGPT's rework of the version fake + ensure_hcd with an H4-prefixed record 01 4e fc 04
+ff ff ff ff) matched opcode 0x1002 and answered with 02 10: Read_Local_Version_Information is 0x1001 (wire 01 10).
+BlueTool's 01 01 10 00 still went to the WCN3998 (0x001d / 0x02be) -> chip ALL. Fixed to 0x1001 in both places.
+
+## 2026-11-09: BlueTool's script runs over 0220 + btbridge
+
+Fixed 0220: BlueTool connects; btbridge log: HCI_Reset (chip, ok), FC18 baud (answered), Read_Local_Version (chip:
+Qualcomm 0x001d / 0x02be), FC2E minidriver (answered). Then BlueTool's chip became "ALL": getChipset reads
+Read_Local_Version and needs manufacturer 0x000f + LMP subversion 0x420e for BCM4357B1, caching the answer in the
+process (killall BlueTool resets it). bcm -W reads /usr/share/firmware/bluetooth/BCM4357B1_19.1.282.5154_
+Hercules_OS_USI_20210524.hcd and stops if missing (absent here). btbridge now answers Read_Local_Version as
+BCM4357B1 (HCI/LMP 9, mfr 0x000f, subver 0x420e) and writes a one-record stand-in .hcd (4e fc 04 ff ff ff ff) if
+missing. Open: whether the .hcd parser expects a 0x01 type byte per record (ChatGPT: "requires packet type 0x01").
+
+## 2026-11-09: 0220 fix: stream kernel controls
+
+First 0220 boot: both controls registered (CTLIOCGINFO found them), but btbridge's connect failed "Protocol wrong
+type for socket" (EPROTOTYPE): a kernel control takes SOCK_STREAM clients only with CTL_FLAG_REG_SOCK_STREAM.
+BlueTool (also SOCK_STREAM) then leaked a socket per retry: "socket failed (Too many open files)". 0220 now sets
+CTL_FLAG_REG_SOCK_STREAM on both. After the new kernel BlueTool starts clean (fresh boot).
+
+## 2026-11-09: 0220 Bluetooth kernel controls + btbridge over them
+
+research/bluetooth/transport.md (ChatGPT): BlueTool's `device` sends transport-encoding 6 -> AppleBT, 7 -> PCIe,
+anything else (3 here) -> PF_SYSTEM kernel control "com.apple.uart.bluetooth": socket(32,1,2), CTLIOCGINFO,
+connect unit 0, termios through getsockopt(2, 0x40487413) / setsockopt(2, 0x80487414) (0x48 bytes), H4 byte
+stream. bluetoothd only access()-checks /dev/cu.bluetooth or /dev/uart.bluetooth at start.
+xnu/patches/0220-guacamole-bluetooth-kernel-control.patch: bsd/dev/sweet_btuart.c registers
+com.apple.uart.bluetooth (unprivileged; termios options kept and answered) and com.sweet.bt.host (privileged, one
+client) and passes bytes between them (latest iOS connection); logs "SWEET BT: ..."; boot-arg sweetbt=0 = off.
+btbridge now connects to com.sweet.bt.host (no pty) and links /dev/cu.bluetooth + /dev/uart.bluetooth to /dev/null
+for bluetoothd's existence check. (research/bluetooth/sweet_btuart.c.new: a staging copy, delete; not for git.)
+
+## 2026-11-09: BlueTool transport paths disassembled
+
+`research/bluetooth/transport.md` records the iOS 16.7.16 BlueTool and bluetoothd transport analysis. BlueTool reads DeviceTree `transport-encoding`: 6 selects AppleBT, 7 selects PCIe, and all other values (including Guacamole's 3) fall through to `PF_SYSTEM`/`SYSPROTO_CONTROL` named `com.apple.uart.bluetooth`. The generic path uses CTLIOCGINFO, connects a `sockaddr_ctl`, configures a termios-shaped control option, and carries H4-style bytes. bluetoothd reads the same DeviceTree property but has a separate, broader transport/config selector. Its `/dev/cu.bluetooth` and `/dev/uart.bluetooth` references are startup `_access(..., F_OK)` probes; this disassembly does not prove when either path is actually opened.
+
+## 2026-11-09: BlueTool selects the D22 row; transport is a kernel control socket
+
+With WifiVendor = USI: "vendor = USI", fwPos 31, boot function runs; first command `device -D`: "HCI transport is
+other types from bluetool_command_device", then "ioctl(CTLIOCGINFO, com.apple.uart.bluetooth) failed (No such file
+or directory)" -> result 3. With the ADT's transport-encoding 3 BlueTool talks to a KERNEL CONTROL socket
+(PF_SYSTEM/SYSPROTO_CONTROL) named com.apple.uart.bluetooth, not to /dev/cu.bluetooth. Options: another
+transport-encoding that takes the tty path (need bluetool_command_device's branches), or a kernel control
+com.apple.uart.bluetooth (kernel patch) that hands bytes to btbridge. btbridge: leftover boot bytes now dropped,
+EIO (no slave open) silent.
+
+## 2026-11-09: btbridge (bluetoothd / BlueTool <-> WCN3998)
+
+research/bluetooth/bluetool.md (ChatGPT): BlueTool picks its D22 row by ProductHash fd079b29... + chipset
+BCM4357B1 + manufacturer from MGCopyAnswer("WifiVendor"): "Murata"/"V=m" -> MUR, "USI"/"V=u" -> USI (also Mitsumi,
+Semco, TDK, Taiyo, TASS). D22 rows: MUR (Hercules 5153 .hcd) and USI (5154). Boot script (both): device -D; wake on;
+power off; msleep 100; power on; msleep 100; hci reset; bcm -b 1500000; bcm -W; device -s 115200; bcm -B; bcm -A;
+bcm -N; bcm -Q; bcm -x; bcm -s 0x01,...; quit.
+Plan: `mgtool setstr WifiVendor USI`; userland/bt/btbridge.c: boots the controller (btuart code, included with
+-DBTUART_NO_MAIN), pty with /dev/cu.bluetooth + /dev/uart.bluetooth -> slave (0666), H4 both ways; vendor commands
+(OGF 0x3f, Broadcom's) answered locally with Command Complete status 0, the rest go to the WCN3998; QCA log ACL
+(handle 0x2edc) dropped. Open questions: what `wake on` / `power off/on` and `bcm -W` (where is the .hcd?) need.
+Built all of `userland/build.sh` and installed the rebuilt `out/btbridge` to `/var/local/bin/btbridge` and `out/mgtool`
+to `/usr/local/bin/mgtool` on `192.168.0.51` via `.new` staging + rename. Pulled both back over SSH and byte-compared
+them with the build. SHA-256: btbridge `f4f8b69643b31f925f407619df6e81d87b1caa1f992233cb7c712e9d6e3dab88`;
+mgtool `69f43995fc7e9ba602106282cfa84e54e3c57a30616a6cc34fdfb1bc71b89525`. Neither tool was run on the phone.
+The user tried `/var/local/bin/mgtool`; it was initially only installed in `/usr/local/bin`. Also installed the same
+verified binary at `/var/local/bin/mgtool` (root:wheel, 0755) to match the path they used.
+
+## 2026-11-09: bluetoothd matches /arm-io/bluetooth; BlueTool is next
+
+With the ADT node at /arm-io/bluetooth: Settings' Bluetooth is no longer "unavailable"; bluetoothd says "Booting
+chipset" and asks BlueTool (XPC com.apple.BlueTool, xpcRunBuiltinScript) to run the boot script, which times out.
+BlueTool: "DeviceTree transport = 3", then getChipset -> getManufacturer -> MGCopyAnswer(kMGQWifiVendor), which waits
+5 s for an AppleOLYHAL service ("failed to fetch wifi vendor (no AppleOLYHAL node)"): "Manufacturer is -1",
+chip (null), "getFirmwarePosForPlatform fwPos = -1" (NO_FW_FOUND), "No WiFi - Iteration N", "BlueTool timed out!".
+mgtool now has `setstr NAME STRING` (a cached WifiVendor answer would stop the wait). Needed from BlueTool's code:
+the strings _getManufacturerFromString accepts, the firmwareList entry for D22, and its builtin boot script.
+
+## 2026-11-09: BlueTool D22 firmware lookup extracted
+
+`research/bluetooth/bluetool.md` records the analysis of the iOS 16.7.16 (20H392) `/usr/sbin/BlueTool` copied
+from the phone. The phone's cache identifies ProductType `iPhone10,3` / `D22AP` and ProductHash
+`fd079b298144a7deb4d7c87fef3eb474d8f0e7eb`; BlueTool's firmware table has BCM4357B1 Hercules rows for MUR
+(`...5153...`) and USI (`...5154...`), with built-in boot callbacks. The failure observed in bluetoothd/BlueTool
+is consistent with `WifiVendor` being unavailable: manufacturer resolves to -1 and neither vendor-specific row
+matches. The report includes the WifiVendor input aliases/tags, chipset selector, table matching logic and
+disassembled script commands. No device state was changed; the MobileGestalt cache was copied read-only for
+ProductHash confirmation.
+
+## 2026-11-09: Bluetooth ADT node v2
+
+With /arm-io/uart1/bluetooth, bluetoothd still logs "marconi-bt / bluetooth: Unable to match bluetooth service in
+device tree" (the first 20-s oslog just stopped early). SweetPlatformExpert::processTopLevel makes nubs for /arm-io's
+direct children only, so uart1/bluetooth had no IOService. mkadt.py now puts the node at /arm-io/bluetooth (gets a
+nub). /dev symlinks work (ln -s /dev/null /dev/cu.bluetooth): the serial bridge can be a pty in userland.
+If this still does not match: get the matching dictionary from bluetoothd's code (function logging "Unable to
+match bluetooth service in device tree").
+
+## 2026-11-09: Bluetooth part 2, step 1: ADT node
+
+research/bluetooth/ios-side.md (ChatGPT): bluetoothd matches the DT bluetooth service, then opens
+/dev/cu.bluetooth or /dev/uart.bluetooth ("No valid serial port found (tried cu.bluetooth and uart.bluetooth)");
+no /etc/bluetool scripts or .hcd on the rootfs; BlueTool runs as `BlueTool -R`.
+tools/mkadt.py (--guacamole): /arm-io/uart1 (compatible guacamole,qup-uart, so pe_serial leaves it alone) with
+child bluetooth as D22AP (bluetooth,n88, transport-speed 3000000, encoding 3, vendor 0x05ac, product 0x12a0,
+coex 2, local-mac-address 02:53:57:45:45:02 = /chosen mac-address-bluetooth0).
+Trial image built with the current generator: `outputs/guacamole-0215-bluetooth-adt.img`, SHA-256
+`a2991cab20555e1e582e3dc42221cd925e2e2970e63921942998f1ebe8439f16`. It uses the 0215 kernel
+(SHA-256 `70974e3bcb90e94d4ea304dcd16ca5d23ea64023965e06eec1a3d1b00db22ce6`), `mkadt.py --guacamole --highmem`,
+and the working 0215 boot arguments with `sweettime` refreshed; root arguments are present and forced 60 Hz
+refresh/vsync overrides are absent. Image is built, not yet booted.
+Second image from the same generator/kernel and exact same arguments (including `sweettime=1794266329`):
+`outputs/guacamole-0215-bluetooth-adt-rerun.img`, SHA-256
+`21f7b01ebdc72fe76f3e7526a24f49aa02d1f8ed9bc576a47933cf20cb42998c`. Not yet booted.
+Serial port plan: a userland bridge with a pty, /dev/cu.bluetooth -> its slave (if devfs takes the symlink),
+translating Broadcom-specific setup; to be decided from what bluetoothd does next.
+
+## 2026-11-09: MILESTONE: Bluetooth scan works from userland (btuart scan)
+
+hello + load + scan 15: logging off, masks, extended inquiry + LE active scan all accepted; 25 devices (23 LE,
+2 classic incl. "iPhone2" at -47 dBm). Part 1 (hardware) done.
+Part 2 (iOS): the iPhone X ADT (research/ipsw-x/d22ap.adt) has /arm-io/uart1/bluetooth: compatible
+"bluetooth,n88", device_type bluetooth, transport-speed 3000000, transport-encoding 3, vendor-id 0x05ac,
+product-id 0x12a0, local-mac-address "macaddr/btaddr,syscfg/BMac/6,zeroes/6", function-power_enable /
+function-bt_wake, coex 2. bluetoothd: "Unable to match bluetooth service in device tree" -> our ADT lacks it.
+To find out: how bluetoothd/BlueTool open the transport (serial BSD node? IOKit user client?) and which
+Broadcom-specific commands it sends (firmware .hcd download, baud change, ...) that the bridge must answer.
+
+## 2026-11-09: MILESTONE: Bluetooth controller runs its firmware
+
+btuart hello + load: rampatch + NVM (tag 17 patched: IBS off, 115200) accepted; HCI_Reset ok; Local Version
+HCI 9 (Bluetooth 5.0), manufacturer 0x001d Qualcomm, LMP subversion 0x02be; BD_ADDR 39:90:21:74:07:00 (NVM
+default, needs a real one later). Firmware logs stream as ACL on handle 0x2edc. (The installed btuart was the one
+before the deep-sleep change: tag 27 stayed 01, and it worked.) Next: `btuart scan [SECS]` (logging off, event
+masks, extended inquiry + LE active scan, one line per device).
+
+## 2026-11-09: Bluetooth firmware download, first try
+
+Rampatch crbtfw21.tlv (ROM build 0x201, download mode 3) accepted: one final event 04 ff 03 00 04 00 (result 0),
+926 segments / 23.5 s at 115200. crnv21.bin is TLV type 4: a container with an inner type-2 NVM entry (45 tags)
+and a type-3 entry. Its tag 17 = 82 01 11 (in-band sleep on, baud code 0x11 = 3.2 Mbaud) and tag 27 = 01 (deep
+sleep): unpatched, the link went silent after HCI_Reset (reply "ff", then nothing). btuart now patches inside the
+container: tag 17 byte 0 bit 7 off, byte 2 = 0 (115200); tag 27 bit 0 off. NVM default BD_ADDR 39:90:21:74:07:00.
+Board ID request: 04 ff 05 00 00 10 0a 03 + status 01 (not used; crnv21.bin used).
+
+## 2026-11-09: Bluetooth controller ANSWERS (btuart hello)
+
+UART at 115200 on QUP wrapper 2 SE3 works; power pulses as hci_qca.c. QCA version event:
+04 ff 0e 00 02 | product 0x0a, patch 0x6699, ROM 0x1001, SoC 0x40010224 = WCN3998 (Android CHEROKEE_VER_2_1 ->
+crbtfw21.tlv + crnv21.*). HCI_Reset -> 04 0e 04 01 03 0c 00. Next: `btuart board` (board ID -> NVM variant: the
+crnv21.bXX files are all identical, crnv21.bin differs) and `btuart load [NVM]` (rampatch + NVM at 115200 with CTS
+flow control, NVM tag 17 baud byte -> 0, no IBS / deep-sleep changes; then reset, local version, BD_ADDR).
+
+## 2026-11-09: Bluetooth step 2 (btuart)
+
+btprobe clock: SE3 (0xc8c000) runs with vote bit 7; UART firmware loaded (FW rev 0x20b, protocol 2); QUP wrapper 2
+HW 1.3 (-> 32x oversampling); TX FIFO 16 words, RX 32. GPIO43-46 in TLMM EAST, function 1 = qup13 (Linux
+pinctrl-sm8150.c, checked by ChatGPT); RX (GPIO45) idles high = controller likely powered (wland's rails).
+userland/bt/btuart.c: SE3 RCG -> 7.3728 MHz (GPLL0 600 x 384/31250, M/N), pins to qup13, GENI UART FIFO 8N1,
+power-off 0xC0 @2400 / power-on 0xFC @115200 (hci_qca.c), QCA version (01 00 fc 01 19), HCI_Reset.
+`btuart hello` does all of it. Assumptions to check if nothing answers: GPLL0 main = RCG source 1, M/N encoding,
+flow control (off), the UART really being BT's.
+
+## 2026-11-09: Bluetooth, step 1 (btprobe, read-only)
+
+bluetoothd today: "marconi-bt / bluetooth: Unable to match bluetooth service in device tree", MAC all 00s (no
+BT_DEVICE_ADDRESS, no boot-arg): it looks for an ADT bluetooth node / IOKit service first.
+Hardware (research/bluetooth/): WCN3990 BT, no enable GPIO; rails L7A 1.8 / L2C 1.3 / L11C 3.0-3.3 V = the rails
+wland already votes for Wi-Fi (ldoa7, ldoc2, ldoc11, rfclka2). UART candidate: qupv3_se13_4uart 0xc8c000 = QUP
+wrapper 2 SE3 (GPIO43-46). Firmware: bluetooth_a partition (crbtfw21.tlv / crnv21.bin family), local ignored folder.
+userland/bt/btprobe.c (build.sh): GCC wrapper-2 vote / SE3 branch / RCG + DFS levels, TLMM GPIO43-46 + 172-174 in
+all four tiles, and the SE3 registers only if its clocks are on. Plan after that: clocks + pins + GENI UART FIFO
+mode, WCN3990 power-on pulse (0xFC at 2400 baud), QCA version / rampatch / NVM download, HCI reset, scan
+(milestone: a CLI that lists nearby devices); then the bluetoothd side (ADT node + transport).
+
+## 2026-11-09: wallpaper work PAUSED (user: Bluetooth next)
+
+State: photo shows in the picker; lock + home screen black. backboardd converts the photo's '420f' planes (0217) and
+sees real data (0218: Y 0-226, Cb/Cr ~128). 0219 (draw trace for converted YCbCr textures) is written but not yet
+built/tested: next step is `grep backboardd mtl2.log | grep 'ycbcr surf'` on the lock screen. Also open: '_RB4'
+465x465 (format 542) refused, the surface row is 512 too (0216 did not help).
+
+## 2026-11-09: 0217 (Metal frontend): YCbCr 4:2:0 wallpapers in backboardd
+
+Lock and home screen both black with a photo wallpaper. backboardd composites PhotosPosterProvider's '420f' photo as
+MTLPixelFormatYCBCR8_420_2P (500) over the surface and the runtime refuses it ("Unsupported ... NotImplemented",
+3000+ times). 0217: newTextureWithDescriptor:iosurface:plane: with format 500/501 on a 2-plane surface (plane 0)
+expands the planes on the CPU into an RGBA8 texture with Y/Cb/Cr in r/g/b (assumed: what the Apple format samples
+as; QuartzCore's shader applies the matrix), cached per surface ID + size, rebuilt when the IOSurface seed changes.
+If the photo shows with wrong colours (green/pink cast), the assumption is wrong: the hardware may return RGB.
+
+- 2026-11-09 Codex rebuilt with `METAL_WORK=work/metal-work sh userland/metal2/build.sh`; local ad-hoc signature
+  verification passed (4 existing incompatible-pointer warnings). Installed on `192.168.0.51` at
+  `/System/Library/Extensions/SweetMetal2.bundle`; prior install preserved as
+  `SweetMetal2.bundle.pre-0216-0217-20261109`. Read back over SSH and byte-compared `SweetMetal2`, Turnip, and
+  `_CodeSignature/CodeResources`. SHA-256: `e5dd5218a481bd5299d8d0cee77ea335de4d7f948cbceb64a12bc6509f3e6f9f`,
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and
+  `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive
+  `outputs/guacamole-SweetMetal2-0216-0217.tar.gz`, SHA-256
+  `feb483dc103362078bdbbbbe20f82840d485fea2086ef181cc77f27d45812945`. No reboot performed.
+
+- 2026-11-09 Codex rebuilt the current Metal bundle with the 0218 Y/Cb/Cr sample diagnostics in
+  `NativeBridgeMetalFrontend.mm`, verified its ad-hoc signature, and installed it on `192.168.0.51` at
+  `/System/Library/Extensions/SweetMetal2.bundle`. Prior install preserved as
+  `SweetMetal2.bundle.pre-0218-20261109`. Read back over SSH and byte-compared `SweetMetal2`, Turnip, and
+  `_CodeSignature/CodeResources`. SHA-256: `be288d592761ef786c9ab45a20996eb9a2ca93b135000e80760907bc36dcd62e`,
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and
+  `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive
+  `outputs/guacamole-SweetMetal2-0218.tar.gz`, SHA-256
+  `f859c922218434983639f75b90227a5e067a9471332698e12183133ded320340`. No reboot performed.
+
+- 2026-11-09 Codex rebuilt the Metal bundle from current sources with
+  `METAL_WORK=/Users/coreycusick/Documents/Codex/2026-11-06/ok/work/metal-work sh userland/metal2/build.sh`;
+  local ad-hoc signature verification passed (4 existing incompatible-pointer warnings). Installed on `192.168.0.51`
+  at `/System/Library/Extensions/SweetMetal2.bundle`, preserving the previous bundle as
+  `SweetMetal2.bundle.pre-20261109-171609`. Read back over SSH and byte-compared `SweetMetal2`, Turnip, and
+  `_CodeSignature/CodeResources`. SHA-256: `ac7bdeb46caab1cb3d4bb1405f1ae9ec89ac05a2ba44c73871e502a6901c452b`,
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and
+  `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive
+  `outputs/guacamole-SweetMetal2-20261109.tar.gz`, SHA-256
+  `d4449b86a0263eccb21c484fce2248c0359bc163250a7ae5e7b1b36526461e58`. No reboot performed.
+
+## 2026-11-09: 0216 (Metal frontend): '_RB4' after 0215
+
+0215 works: PhotosPosterProvider's planes import cleanly; the photo shows in the wallpaper picker. The home screen is
+still black. Side effect of 0215: backboardd's '_RB4' 465x465 surfaces (RGB8_444_2P, 542, narrowed to one BGRA8
+plane) now report plane 0's own row (512) and were refused (RowPitch 512 < 1860). 0216 keeps the surface's row for
+format 542, as before 0215. Real two-plane 444 support is still not done.
+
+## 2026-11-09: 0215 plane bytes-per-row at the right offset (kernel)
+
+0214 works (surfprobe: maxima 16384/16384/262144, bs_IOSurface gives surfaces). Next in PhotosPosterProvider: its
+'420f' surfaces report IOSurfaceGetBytesPerRowOfPlane = 0 for both planes (0212's plane log: offsets 64 / 737344,
+row 0). IOSurface.framework (research/iosurface/IOSurface, llvm-objdump) reads plane i at result+0x68+0x80*i:
++0 width, +4 height, +0xc offset, +0x10 bytesPerRow, +0x14 size, +0x18 bpe (u16), +0x1a/+0x1b element w/h, byte
++0x54 == 1 makes base address and row read 0. SweetSurface wrote the row at +0x08. 0215 also writes it at +0x10.
+Note (applies with offsets): the patch context is from work/xnu-local-latest (after 0214).
+
+## 2026-11-09: 0214 IOSurface maxima (kernel): black wallpapers
+
+surfprobe: IOSurfaceGetPropertyMaximum(Width/Height/BytesPerRow) = 0, and BaseBoard's
++[IOSurface bs_IOSurfaceWithWidth:height:options:] returns nil for any size (it refuses sizes above the maxima), so
+PosterBoard's wallpaper snapshots had no surface (0213 trace: -[PBFHomeScreenPreviewImageBuilder _imageForView:]).
+research/iosurface/: selector 13's 24-byte block is _ioSurfaceLimits: +0 offset align mask, +4 row align mask,
++8 max BytesPerRow, +0xc max Width, +0x10 max Height (as-is), u16 +0x16 = 1 (checked). 0046 filled only +0/+4/+0x16.
+xnu/patches/0214-guacamole-iosurface-limits-maxima.patch: +8 = 16384*16, +0xc = +0x10 = 16384 (create()'s own limits).
+Test: surfprobe -> maxima 16384 and the bs_IOSurface lines give surfaces; then the photo / default / Pride wallpapers.
+
+- 2026-11-09 Codex applied 0214 after the existing 0197–0202 kernel series and built with
+  `XNU_LOCAL=work/xnu-local-latest sh tools/xnu-local-build.sh` (no patch errors). Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, SHA-256
+  `b8f05c6a9e9285363fe0a24a495f5700819bffec41559a9853df59a5ef0eb854`.
+- Boot image: `outputs/guacamole-0197-0198-0199-0201-0202-0214-iosurface-limits.img`, SHA-256
+  `f7db46577cd569aa78c9a0c1f903bc0ce0c2681510a6c7192eb4d6605fa765d1`. Reused the 0202 image's ADT and boot
+  arguments, refreshed `sweettime`; verified `rd=ufsroot0 ufsroot=ios` are present and
+  `sweetfb_refresh=60 sweetfb_vsync=60` are absent. Image built but not booted.
+
+## 2026-11-09: 0215 IOSurface plane row width
+
+- Applied 0215 after 0214 with `tools/xnu-local-build.sh`; kernel build succeeded and reverse-apply check passed.
+  Kernel SHA-256: `70974e3bcb90e94d4ea304dcd16ca5d23ea64023965e06eec1a3d1b00db22ce6`.
+- Boot image: `outputs/guacamole-0197-0198-0199-0201-0202-0214-0215-iosurface-plane-row-offset.img`, SHA-256
+  `f0a59ac1ddb6cff748a37656750f64f74f750368191a256f7f3a9b5d057b990d`. Reused the 0214 image's ADT and boot
+  arguments, refreshed `sweettime`; required root args are present and forced refresh/vsync args are absent.
+  Image built but not booted.
+
+## 2026-11-09: surfprobe (PosterBoard's nil snapshot surface)
+
+PosterBoard's surface comes from +[IOSurface bs_IOSurfaceWithWidth:height:options:] (BaseBoard), sized from the
+layer's bounds x contentsScale, plane 0. It returns nil here. `userland/jb/surfprobe.m` prints IOSurface property maxima/alignments and IOSurfaceRoot registry properties, creates a plain BGRA reference surface, and calls the helper with an `&1` options word at the requested size, 1125x2436, and 64x64. Rebuilt `userland/build.sh`; fixed a CFDictionary-to-NSDictionary bridge access in `surfprobe.m` that blocked this build. Installed `out/surfprobe` as `/var/local/bin/surfprobe` on 192.168.0.51 (root:wheel, 0755), verified SHA-256 `ec0ec31b61bb5aaa0d5feb03c3f9883dcc1e4b6e9db7d5536682b3d65bf36860`. The named BaseBoard helper disassembly and PosterBoard's option interpretation are in `research/posterboard/BaseBoard-IOSurface-helper.txt` and `README.md`. PosterBoard passes a pointer to a 64-bit value 1; it takes the non-planar 4-byte-per-element path. No kernel or Metal bundle change.
+
+## 2026-11-09: no-IOSurface caller = PosterBoard itself (0213 result)
+
+PosterBoard asks for a 375x811 BGRA8 (format 80) texture over a nil IOSurface: a 1/3-scale snapshot of the 1125x2436
+screen. Caller frames, from the dispatch queue: PosterBoard (UUID FBD32EAC-FBBF-3F56-A0BA-5BD44D2E2725) image offsets
++465104 (0x718d0) -> +465424 (0x71a10). Disassembled and named both containing functions in `research/posterboard/PosterBoard-0x718d0.txt` and
+`PosterBoard-0x71a10.txt`; `README.md` records the analysis. Verified the extracted image UUID. The IOSurface argument
+is newly requested from `+[IOSurface bs_IOSurfaceWithWidth:height:options:]` using the view layer's bounds multiplied
+by its contentsScale; the returned object is passed as `iosurface:` with plane 0. Extracted PosterBoard Mach-O is also
+in that folder.
+No crash reports from the wallpaper processes this run (only MobileSlideShow at 15:50, earlier).
+
+## 2026-11-09: 0213 (Metal frontend): who passes a nil IOSurface
+
+With 0211/0212: PhotosPosterProvider's heaps overflow to the device as intended (3x "resource made outside the heap"),
+then 3 compute commits and no more; no 420f refusal this run. PosterBoard and SBRendererService both log "surface
+texture refused: no IOSurface". 0213 logs the caller's stack (16 frames, first two times per process) with the
+descriptor's size and format.
+
+- Rebuilt with `sh userland/metal2/build.sh`; ad-hoc signature verification passed. Installed on `192.168.0.51` at `/System/Library/Extensions/SweetMetal2.bundle`; previous bundle preserved as `SweetMetal2.bundle.pre-0213-20261109`. Installed `SweetMetal2`, Turnip, and `_CodeSignature/CodeResources` hashes match the local build: `8332f7b0ff441d15208c34efb7cd2d87d97e27d6aafe76d6b82916569f777571`, `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive `outputs/guacamole-SweetMetal2-0213.tar.gz`, SHA-256 `a282a42979d7db282ec1d75ebc1369bf17e7df8491151db45a67333df352a969`. No reboot or kernel change.
+
+## 2026-11-09: 0211 / 0212 (Metal frontend): PhotosPosterProvider's black photo
+
+mtl2.log after setting a photo wallpaper (0210 installed):
+- PhotosPosterProvider: 16x "heap texture refused: OutOfMemory(Heap)". MPS sizes heaps counting on makeAliasable
+  reuse, which this runtime's heaps lack. 0211: an automatic heap that is full makes the texture/buffer from the device
+  instead (still reports this heap); placement heaps (an offset) still refuse. Logs "heap full (...): resource made
+  outside the heap" (first 3).
+- PhotosPosterProvider: '420f' 606x1145 plane 1 as RG8 303x573, row 968: "PastBuffer counted 1291646 length 1114112"
+  (the chroma plane's reported row runs past the surface). 0212: logs every plane's offset/size/row once per surface,
+  and retries with a 64-aligned row of the plane's own width when that fits ("row X does not fit, row Y used").
+  If colours come out wrong, that guess is wrong: the plane log says what the surface really is (kernel IOSurface?).
+- SBRendererService: "surface texture refused: no IOSurface" (0209's split): it is handed nil; probably the poster's
+  rendered surface that PhotosPosterProvider never produced.
+
+- Rebuilt with `sh userland/metal2/build.sh`; ad-hoc signature verification passed. Installed on `192.168.0.51` at `/System/Library/Extensions/SweetMetal2.bundle`; previous bundle preserved as `SweetMetal2.bundle.pre-0211-0212-20261109`. Installed `SweetMetal2`, Turnip, and `_CodeSignature/CodeResources` hashes match the local build: `bb8c8e51b7067c2e84911ee3d400beca97d81f2f429560161969256652df9e28`, `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive `outputs/guacamole-SweetMetal2-0211-0212.tar.gz`, SHA-256 `cb16b6a1288291c55b346d0c172f3707126d4acc6c1f8aeb9c98093daa3137e8`. No reboot or kernel change.
+
+## 2026-11-09: 0209 / 0210 (Metal frontend): black photo wallpaper
+
+0209: "surface texture refused" now says whether the IOSurface or the descriptor was nil (SBRendererService's
+"plane 0 of 0" meant one of them was nil; plane 0 of an unplanar surface passes).
+0210: SBRendererService logged "NBRenderEncoder MTLRenderCommandEncoder missing" and "NBBlitEncoder
+MTLBlitCommandEncoder missing": objc_getProtocol only finds protocols a loaded image registered. The adopt list now
+falls back to @protocol(...) for the public Metal protocols, so render/blit encoders conform in every process.
+- Rebuilt with `sh userland/metal2/build.sh`; ad-hoc signature verification passed. Installed on `192.168.0.51` at `/System/Library/Extensions/SweetMetal2.bundle`; previous bundle preserved as `SweetMetal2.bundle.pre-0210-20261109`. Installed `SweetMetal2`, Turnip, and `_CodeSignature/CodeResources` hashes match the local output: `003c814c4d2448ffe90724056b977d2b5fadd4926c3e9030ef0a55a926714b8b`, `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive `outputs/guacamole-SweetMetal2-0209-0210.tar.gz`, SHA-256 `ebddbf893f76cc8ac06cbe3002240e14c39438ddbc5a9eb512e6e243b05ea5a4`. No reboot or kernel change.
+
+## 2026-11-09: 0209 surface plane validation (Metal frontend)
+
+- Rebuilt with `sh userland/metal2/build.sh`; ad-hoc signature verifies. `SweetMetal2` SHA-256: `62e1ebbf21a3b2c733bcd8cdfc611422656ab41430465963ab7c61aef0983a8a`; Turnip unchanged: `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`.
+- Installed on `192.168.0.51` to `/System/Library/Extensions/SweetMetal2.bundle`. The previous bundle is preserved as `SweetMetal2.bundle.pre-0209-20261109`. Verified installed `SweetMetal2` SHA-256 `62e1ebbf21a3b2c733bcd8cdfc611422656ab41430465963ab7c61aef0983a8a`, Turnip SHA-256 `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and `_CodeSignature/CodeResources` SHA-256 `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`; all match the local build. Archive: `outputs/guacamole-SweetMetal2-0209-surface-plane-validation.tar.gz` (SHA-256 `34b0d637c60eb227a2c876c1eea25e7dc36326c922dc3631dc16146636eb85c3`). No kernel changed and no reboot was performed.
+
+## 2026-11-09: 0208 makeAliasable (Metal frontend)
+
+With 0207 installed (bundle sha256 must match out/), mpsprobe's blur got past heap sizing and stopped at
+"-[NBTexture makeAliasable]: unrecognized selector". 0208 adds a no-op -makeAliasable to NB_RESOURCE_SPI (buffers and
+textures): the runtime's heaps never reuse memory, so the resource simply keeps it until freed; isAliasable stays NO.
+Install check: shasum -a 256 /System/Library/Extensions/SweetMetal2.bundle/SweetMetal2 against out/.
+- 2026-11-09 Codex rebuilt with `sh userland/metal2/build.sh` and installed to `192.168.0.70`. `/System/Library/Extensions` was writable; no remount needed. The bundle is ad-hoc signed, `makeAliasable` is present, and the pulled-back bundle including signature resources matches the build. `SweetMetal2` SHA-256: `a20e8aa1a371bd600cbe584fe7dca1aba7b3b30fd9c5a312e3ca2428d2ee6691`; Turnip unchanged: `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`. Previous install preserved as `SweetMetal2.bundle.pre-0208-20261109-0620`. No kernel change or reboot. Archive: `outputs/guacamole-SweetMetal2-0208-makeAliasable.tar.gz`, SHA-256 `bd27ee0ada5205625cefb3413eb51cc78583672cf06656b9801b78a14cc825c5`.
+
+## 2026-11-09: 0207 heapTextureSizeAndAlignWithDescriptor: (Metal frontend)
+
+mpsprobe: the device answers Apple1-3 + Common1-2 only, MPSSupportsMTLDevice = YES and MPSCommandBufferImageCache
+initWithCommandBuffer: returns an object, so MPS accepts the device (at least in a plain process). MPSImageGaussianBlur
+then stopped at "-[NativeBridgeMetalDevice heapTextureSizeAndAlignWithDescriptor:]: unrecognized selector".
+0207 adds it to NBDeviceMethods (generous estimate: 64-texel tiles, 256-byte rows, +25%, page-aligned levels, align 4096).
+Next: rebuild the Metal bundle, run mpsprobe again (the blur should finish), then the photo and Pride wallpapers.
+- 2026-11-09 Codex rebuilt with `sh userland/metal2/build.sh`; ad-hoc signature verification passed and the new `heapTextureSizeAndAlignWithDescriptor:` selector is present. `SweetMetal2` SHA-256: `8d978c67400ca79cb9ba3e8f489d02eb177a1b9c1908edc21a3321459d18d9e5`; Turnip unchanged at `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`.
+- Installed the 06:09 bundle on `192.168.0.70`; `/System/Library/Extensions` was already writable, so no remount was needed. Preserved prior bundle as `SweetMetal2.bundle.pre-0207-20261109-0609`. Pulled the install back and verified all bundle files, including `_CodeSignature/CodeResources`, match the built bundle. Archive: `outputs/guacamole-SweetMetal2-0207-mps-heap-align.tar.gz`, SHA-256 `f9b78a93ec6bb582077519b2af2f3548eac3f7813601f4e8db56b0061e30cb50`. No reboot or kernel change. Four existing pointer-type warnings remain.
+
+## 2026-11-09: mpsprobe (photo / Pride wallpapers, MPSAutoCache nil+0x18)
+
+MPSCommandBufferImageCache initWithCommandBuffer: returns nil when MPSDevice::GetMPSDevice([cb device]) is NULL
+(research/metal/MPSDevice-GetMPSDevice.txt). GetMPSDevice asks supportsFamily: 1008 (Apple8) down to 1002 (Apple2):
+Apple8/7 true -> accepted; Apple6 true -> only "Apple A13 GPU" by -name, else NULL; Apple5/4/3/2 -> accepted
+(Apple3 with a non-Apple name = the A9-class path); none -> NULL. Then maxComputeThreadgroupMemory and maxTextureLayers
+only size things (not a refusal). The bridge claims Apple1-3 (TARGET_FAMILIES) plus whatever the runtime's
+supports_family says, so the suspect is Apple6 answered true (or the cache refusing for another reason).
+userland/jb/mpsprobe.m (build.sh) prints the device's family answers, MPSSupportsMTLDevice, the cache init result and
+runs one MPSImageGaussianBlur. Install to /var/local/bin/mpsprobe and run as mobile or root.
+- 2026-11-09 Codex rebuilt userland with `sh userland/build.sh`; installed `out/mpsprobe` to `/var/local/bin/mpsprobe` on `192.168.0.70` via `.new` + rename. Pulled it back and byte-compared successfully. SHA-256: `0f790bf5559aaff069964535e6d177538e09963ed60409716bc630584ba24d4c`. No kernel or Metal bundle changed.
+
+# Active handoff — 0206 Metal object protocols (MPS) (2026-11-09, Claude)
+
+- Photo wallpaper / Pride: SIGSEGV 0x18 in MPSAutoCache::MPSAutoCache (from +[_PIDynamicGuidedProcessorKernel
+  processWithInputs:...] via CIImageProcessorKernel). Codex's named disassembly (research/metal/MPSAutoCache-ctor.txt,
+  MPS-cache-init.txt): the ctor takes [cb userDictionary][@"MPSCommandBufferImageCache"], else
+  [[MPSCommandBufferImageCache alloc] initWithCommandBuffer:cb], then reads +0x18 of it. initWithCommandBuffer:
+  returns nil if cb does not conformsToProtocol:MTLCommandBuffer, or MPSDevice::GetMPSDevice([cb device]) is NULL;
+  else uses retainedReferences, userDictionary, addHandlerToCommandBuffer: (ours has them).
+- 0206 (NativeBridgeMetalFrontend.mm, the 0178 adopt list): NBCommandBuffer MTLCommandBuffer, NBQueue
+  MTLCommandQueue, NBBuffer/NBTexture MTLBuffer|MTLTexture + MTLResource, encoders their MTL*CommandEncoder +
+  MTLCommandEncoder (public protocols; logged "adopted"). If it still crashes the same way, it is GetMPSDevice
+  rejecting our device (MPS's supported-GPU check) -> next: MPSDevice::GetMPSDevice disassembly.
+
+# Active handoff — 0205 NBTexture -allocatedSize (2026-11-09, Claude)
+
+- After 0203/0204 the photo wallpaper gets one step further: new "MISSING NBTexture -allocatedSize" (PhotosPosterProvider).
+- 0205 (NativeBridgeMetalFrontend.mm, NBTexture): allocatedSize = rowBytes x height x depth x slices over a
+  buffer/surface, else sum over mips of texels x bytes-per-texel (by MTLPixelFormat range) x depth/slices/samples
+  (cube x6). Bundle rebuild + reboot. Clear /var/local/mtl2.log before the next test (counts are cumulative).
+- 2026-11-09 Codex rebuilt 0203+0204+0205 with `userland/metal2/build.sh`; ad-hoc signatures verified. `SweetMetal2`
+  SHA-256 `17675d3c64456614fef31e3e1653f548d7725eab8ea69caab8d75d4d4a49d60e`, Turnip SHA-256
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`. Installed at
+  `/System/Library/Extensions/SweetMetal2.bundle` on `192.168.0.70`; phone hashes match and `allocatedSize` is present.
+  Previous bundle preserved as `SweetMetal2.bundle.pre-0205-20261109-0521`. No reboot performed in this request.
+  Archive: `outputs/guacamole-SweetMetal2-0205-allocatedSize.tar.gz`, SHA-256
+  `188913a827539962f2c1cf4aca2b5504d964c7515e4084284a453645a1a31102`.
+
+# Active handoff — 0204 missing Metal selectors batch (2026-11-09, Claude)
+
+- 0203 worked (no more stitching). Next PhotosPosterProvider abort: '-[NBTexture isDrawable]: unrecognized selector'.
+  mtl2.log MISSING (all processes): MapKit.SnapshotService NBLibrary -newFunctionWithName:constantValues:pipelineLibrary:error:
+  (43), NBFunction -libraryData (PhotosPosterProvider 5, MobileSafari 3: Core Image stitching, covered by 0203 in all
+  processes), NBTexture -isDrawable (2), FindMy NBRenderEncoder -setDepthClipMode: (1).
+- 0204 (NativeBridgeMetalFrontend.mm): NBTexture -isDrawable (label == "CAMetalLayer Display Drawable");
+  NBLibrary -newFunctionWithName:constantValues:pipelineLibrary:error: -> the constantValues:error: form;
+  NBRenderEncoder -setDepthClipMode: (clip = default no-op; clamp logged once, not applied). Bundle rebuild + reboot.
+- 2026-11-09 Codex rebuilt the bundle with 0203+0204 using `userland/metal2/build.sh`; ad-hoc signatures verified.
+  `SweetMetal2` SHA-256 `0b73b3192fee3c3585b5477780e7ceed91e3b250607488e9208f2302986c1f94`, Turnip SHA-256
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`. Installed at
+  `/System/Library/Extensions/SweetMetal2.bundle`; phone hashes match. Prior install preserved at
+  `SweetMetal2.bundle.pre-0203-0204-20261109-0511`. Archive:
+  `outputs/guacamole-SweetMetal2-0203-0204-metal-selectors.tar.gz`, SHA-256
+  `88829e20814a3cc8883d99562a863e55424093fe8c07412a21ca18aeeed4dfa0`. `launchctl reboot system` returned
+  successfully; SSH at `192.168.0.70` has not returned after 60 seconds. Post-reboot check is pending Wi-Fi.
+
+# Active handoff — 0202 picker opens; 0203 Core Image without stitching (2026-11-09, Claude)
+
+- With 0202 + sweet-containers the photo picker opens. Picking a photo: PhotosPosterProvider aborts:
+  '-[NBFunction libraryData]: unrecognized selector' in Core Image's function stitching (CI::MetalDAG::compile ->
+  CI::VisibleFunctionStitchingDescriptor::compile -> -[_MTLDevice newLibraryWithStitchedDescriptor:...] (Apple's base,
+  not ours) -> MTLLibraryBuilder::newLibraryWithDAG -> [function libraryData]). Also: Espresso "Failed creating a
+  default shader library! GPU mode won't work" (subject segmentation; probably falls back to CPU; not the crash).
+- research/metal/CoreImage: CI_ENABLE_METAL_DAG and CI_ENABLE_FUNCTION_STITCHING are getenv'd once (atoi, default
+  on); analyze_kernels picks the stitched DAG only with them.
+- 0203 (NativeBridgeMetalFrontend.mm): a constructor in the SweetMetal2 bundle does setenv(..., "0", 0) for both,
+  so Core Image builds filter chains from Metal source (newLibraryWithSource works). Bundle rebuild + reboot.
+  If CI then hits another gap, it will show as a new crash / mtl2 MISSING line in PhotosPosterProvider.
+
+# Active handoff — CoreImage and Metal extracted (2026-11-09)
+
+- Extracted `CoreImage` and `Metal` from the iOS 16.7.16 (20H392) arm64 dyld shared cache at
+  `/private/tmp/guac-rootfs-audit/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64` using `ipsw dyld extract`.
+- Mach-O arm64 libraries and `strings -a` dumps are in `research/metal/`: `CoreImage`, `CoreImage.strings`,
+  `Metal`, and `Metal.strings`. `MPSCore` and `MPSCore.strings` were added 2026-11-09; the extraction is also an
+  arm64 Mach-O shared library.
+
+# Active handoff — 0202 containers by signing identity + sweet-containers (2026-11-09, Claude)
+
+- 2026-11-09 Codex applied 0202 after 0201 and built successfully with `tools/xnu-local-build.sh`. The patch needed
+  its `PROC_NULL` context updated to the existing 0201 compile fix (`NULL`); after that `git apply --check` passed.
+  Patch SHA-256: `48b9cd3f88c5c7c7b70cb39a8eb4fcc4657a1aee99b32af67158cb948f807429`; the hash is recorded in
+  `work/xnu-local-latest/applied-patches.txt`. Kernel:
+  `work/xnu-local-latest/kernel.0197-plus-0198-plus-0199-plus-0201-plus-0202.development.sweet`, SHA-256
+  `4dc1ad11bdf833604f0abb9d9263432db7c65cde201689c21bd8a40890957f94`.
+- Boot image: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0197-0198-0199-0201-0202-sandbox-containers.img`,
+  SHA-256 `5084c63911f0e3f82e9a63e4e2fe07f7c308d581eec72603961e8b35969603a7`. Reused the 0199 image's ADT and
+  boot arguments, refreshed `sweettime`, retained `rd=ufsroot0 ufsroot=ios` and the 60 Hz GPU-present options,
+  and confirmed `sweetfb_refresh=60` and `sweetfb_vsync=60` are absent. Not booted.
+- Ran `sh userland/build.sh`; `userland/out/sweet-containers` SHA-256
+  `13ba93147de4847fcf75f8ce5f1c1dbd346db5cc588ffaf8e31ba9f150906533`. Installed it as
+  `/var/local/bin/sweet-containers` on 192.168.0.70 (root:wheel, 0755); pulled it back and byte-compared it.
+  `sweet-containers -1` ran successfully and registered 700 container identities in the running kernel.
+- Generated the `--net` launchd configuration from the phone's current plist and installed it atomically at
+  `/System/Library/xpc/launchd.plist` (root:admin, 0644); saved the prior file at
+  `/var/local/launchd.plist.pre-containers`. Verified the installed plist byte-matches the generated file and
+  contains `com.sweet.containers` with `RunAtLoad` and `KeepAlive`, alongside `com.sweet.displayd`. No reboot was
+  performed; launchd will load the new persistent job on the next boot.
+
+- sbpath: 0 of 301 processes have a container -> 0201's exec hook records nothing (this launcher passes no
+  container at exec, or the hook is not called). 0201 stays (harmless; op 4/0x43/0x42 plumbing).
+- libsystem_sandbox: sandbox_set_container_path_for_signing_id[_with_persona] / _for_application_group = op 0xd
+  { identity, path, kind 0 signing id / 1 app group, persona }.
+- NEW xnu/patches/0202-guacamole-sandbox-containers-by-identity.patch (after 0201; git apply --check OK against
+  0201's text): table of 640 {identity[128], path[192]} filled by op 0xd (kind 0); op 4 / 0x43 fall back to the
+  process's cs_identity_get() identity when it has no per-process container. Logs first 12 new identities.
+- NEW userland/jb/sweet-containers.c (build.sh, -framework CoreFoundation): reads every
+  /private/var/mobile/Containers/Data/{Application,PluginKitPlugin,InternalDaemon,System,VPNPlugin,XPCService}/*
+  metadata plist (MCMMetadataIdentifier) and calls sandbox_set_container_path_for_signing_id(id, dir); rescans
+  every 20 s; `-1` once + prints. Boot job com.sweet.containers in tools/sweet-root-tweaks.py (--net), KeepAlive.
+- Test: kernel 0202 + install /var/local/bin/sweet-containers; `sweet-containers -1` (count); `sbpath` (apps and
+  extensions now list paths); then choose a photo as wallpaper.
+
+# Active handoff — 0201 in, picker still "error 2"; sbpath diagnostic (2026-11-09, Claude)
+
+- 0201 applied cleanly (Codex). Picker still: 'plugin has invalid sandbox or container: error 2 path ?'.
+  research/sandbox/PlugInKit: the check is buf="?"; sandbox_container_path_for_pid(getpid(), buf, 0x400) != 0 ->
+  exception with errno. So op 4 for its own pid finds nothing in 0201's table. dmesg has no 'SWEET Sandbox' lines
+  at all (ring too busy / not right after boot), so we can't see whether the exec hook records anything.
+- NEW userland/jb/sbpath.c (build.sh -> out/sbpath, /usr/local/bin): asks op 4 for every running pid (or given
+  pids), prints the processes that have a container + counts. Decides: hook records (apps have paths, only the
+  picker missing) vs records nothing (-> fallback needed: e.g. op 4 falls back to a path a userland helper sets
+  via op 0x42 from containermanagerd metadata, or the kernel derives it).
+
+- Built with `userland/build.sh`; installed `/usr/local/bin/sbpath` on the phone over SSH. Pulled the installed
+  binary back and byte-compared it to `userland/out/sbpath`. SHA-256:
+  `455ef123c5b3ee1310d56d1c77d6598fea3aa6ed9ee6ad3646376edf6cb17cc8`. `sbpath 1` returns `error 2` for launchd,
+  as expected for a process without an app container.
+
+# Active handoff — 0201 application confirmed; PlugInKit extracted (2026-11-09)
+
+- 0201 was applied during the last kernel build: `tools/xnu-local-build.sh` reported `applying
+  xnu/patches/0201-guacamole-sandbox-container-paths.patch` and proceeded to compilation. No `git apply` errors;
+  the final patch hash is recorded in `work/xnu-local-latest/applied-patches.txt`. A reverse `git apply --check`
+  against the built source also exits 0. The built kernel contains the 0201 sandbox log string.
+- Extracted arm64 `PlugInKit` from the mounted iOS 16.7.16 shared cache into `research/sandbox/`; its `strings -a`
+  dump is `research/sandbox/PlugInKit.strings`. Research artifacts are git-ignored.
+
+# Active handoff — 0201 sandbox container paths built (2026-11-09)
+
+- 0200 (Metal limits 16384) fixed Photos. Choosing a photo as wallpaper: PhotosPicker.appex aborts because the
+  kernel Sandbox stand-in returned ENOENT for container lookups (op 4 and 0x43). `research/sandbox/` has the iOS
+  16.7.16 `libsystem_sandbox.dylib` and `ExtensionFoundation` extracts and strings dumps.
+- Applied `xnu/patches/0201-guacamole-sandbox-container-paths.patch` after 0199. Its launch hook signature matches
+  `security/mac_policy.h`. First compile caught `PROC_NULL` undefined in this file; changed the three null checks
+  to `NULL`. Build then succeeded. Local DXB dSYM command needed its `/dev/fd` warning filter disabled because
+  this environment rejects Bash process substitution; this affects only symbol-warning filtering.
+- Kernel: `work/xnu-local-latest/kernel.0197-plus-0198-plus-0199-plus-0201.development.sweet`, SHA-256
+  `43363eb4f36cbb23c90293e9f8bb23cd95c2a3e0a5c543c3a8116dc2b88df766`. Linked image contains both the 0199 panel
+  mode marker and 0201 `SWEET Sandbox` log string.
+- Boot image: `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0197-0198-0199-0201-sandbox-container.img`,
+  SHA-256 `312d686b4a336d74cc914d768b4a79df9ad517a363ca8311953d8704bf418c19`. Reused 0199's ADT and boot args,
+  refreshed `sweettime`; verified `rd=ufsroot0 ufsroot=ios` and related root arguments remain and that neither
+  `sweetfb_refresh=60` nor `sweetfb_vsync=60` is present. Shim Image and DTB match the prior 0199 image. Not booted.
+- Next: temporary-boot this image and test Photos' wallpaper picker; collect the new `SWEET Sandbox` kernel logs
+  if the picker still fails.
+
+# Active handoff — iOS 16 sandbox libraries extracted (2026-11-09)
+
+- Extracted `libsystem_sandbox.dylib` and `ExtensionFoundation` from the mounted iOS 16.7.16 20H392
+  `dyld_shared_cache_arm64` into `research/sandbox/`. Generated `strings -a` dumps beside each binary; both
+  extracts are arm64 Mach-O shared libraries. Research artifacts are git-ignored.
+
+# Active handoff — 0200 Photos crash = Metal device limits 0 (2026-11-09, Claude)
+
+- Photos (MobileSlideShow) aborts: NSInternalInconsistencyException 'Invalid parameter not satisfying:
+  !PXPixelSizeAreaIsZero(roundedSize)' (oslog). lastExceptionBacktrace: PXCuratedLibraryUIViewController viewDidLoad
+  -> PXGView init -> PXGMetalRenderer _setupMetalIfNeeded -> PXGMetalTextureConverter init -> _createTransparentTexture
+  (1x1 CGImage) -> createTextureFromCGImage:transform:options: -> PXGMetalCompatibleImageByRedrawingCGImage -> PXGCreateContext.
+- research/photosuicore/PhotosUICore (extracted): createTextureFromCGImage reads [[metalRenderContext device] limits]
+  (private MTLDevice SPI, pointer) +0x84/+0x88 as uint32 max 2D texture width/height and caps the redraw size to it;
+  our device subclasses _MTLDevice with an empty initLimits -> 0 x 0 -> abort.
+- 0200 (NativeBridgeMetalFrontend.mm, native_bridge_metal_open after [cls new]): if -limits returns a pointer inside
+  the device object and +0x84/+0x88 are both 0, set them to 16384. Logs "native-metal: limits at .. 2D texture
+  16384x16384". Bundle rebuild + reboot (or relaunch apps; backboardd loads it at start). Not compiled by me.
+
+# Active handoff — PhotosUICore extracted from iOS 16.7.16 shared cache (2026-11-09)
+
+- Extracted `/System/Library/PrivateFrameworks/PhotosUICore.framework/PhotosUICore` from the mounted 20H392
+  `dyld_shared_cache_arm64` at `/private/tmp/guac-rootfs-audit/System/Library/Caches/com.apple.dyld/` with
+  `ipsw dyld extract`. `PhotosUICore` and its `strings -a` dump are in `research/photosuicore/` (research artifacts
+  are git-ignored, consistent with the other extracted Apple binaries).
+
+# Active handoff — 0199 90 Hz WORKS (2026-11-09, Claude)
+
+- User: 90 Hz (0197+0198+0199) "feels ok". Photos crashes (long-standing, not new): next to look at.
+
+# Active handoff — 90 Hz WORKS by hand; 0199 makes it the boot default (2026-11-09, Claude)
+
+- Test: `panelbright raw 53 30` -> frames 11.368 ms apart (87.97 Hz); sending a frame takes 10.41 ms (max 10.42)
+  in both modes (fits 11.37 ms with ~1 ms margin). 60 Hz baseline 16.711 ms. Back: raw 53 20 or reboot.
+- NEW xnu/patches/0199-guacamole-fb-panel-90hz.patch (SweetFramebuffer.cpp, after 0198; dry-run OK on the
+  Codex-applied 0198 source research/SweetFramebuffer-0198-applied.cpp; applied and compiled locally): sweet_fb_panel_90hz()
+  in start() right before 0198's measurement: maps DSI0 + the buffer page 0x9d124000 (inhibit-cache; just past
+  the panel memory the GPU present maps, 0x9c000000 + 0x1124000), checks DSI0 version 20xxxxxx and CTRL enable +
+  command mode, sends DCS long write 53 30 (c0390002 ffff3053) like panelbright, waits CMD_DMA_DONE (<=100 ms),
+  restores DMA_CTRL/TRIG_CTRL, sleeps 60 ms; then 0198 measures ~87.97 Hz and publishes it to CoreAnimation.
+  Logs "SWEET FB: panel switched to 90 Hz (DCS 53 30)". Boot-arg sweetfb90=0: bootloader's 60 Hz.
+- Boot image: the working 0197 args WITHOUT sweetfb_refresh=60 sweetfb_vsync=60 (else no 0198/0199 rate).
+- 0199 was applied after 0198 to the source tree that already includes 0197. Incremental XNU build succeeded.
+  Kernel `work/xnu-local-latest/kernel.0197-plus-0198-plus-0199.development.sweet`, SHA-256
+  `83deee3b528e99cb1f97aa4ccd0c8321c619a4e54386949b261bbe148fee524e`.
+- Packaged `outputs/guacamole-0197-0198-0199-panel-90hz.img` with the working 0197 root/GPU-present arguments,
+  omitting `sweetfb_refresh=60` and `sweetfb_vsync=60`; payload args were checked. SHA-256
+  `0d45ec504007538d3cc69ef9c07299138629522eff1a0cf085d684f61b42e655`. Image not booted.
+- Watch: backboardd/GPU at ~88 fps (compositing cost +47%); CoreAnimation may still cap apps at 60 (iPhone X).
+
+# Active handoff — 0198 WORKS (with correct boot args); 90 Hz test (2026-11-09, Claude)
+
+- Rebuilt `userland/jb/vsyncprobe.c` with the iOS 16 arm64 SDK and ad-hoc signed it. Replaced
+  `/usr/local/bin/vsyncprobe` on the phone at `192.168.0.70` via SSH/SCP staging and rename. Pulled it back and
+  byte-compared it to the build. SHA-256: `7a44562a02023fdfae6d64916eb37372d5f406dc0f7082b250b0ebfdc3b38bbf`.
+- 0198 boots with the 0197 image's args minus sweetfb_refresh=60 sweetfb_vsync=60 (those override 0198). The
+  earlier 0198 "hang" (and A/B) = images built WITHOUT rd=ufsroot0 ufsroot=ios ... (Codex audit). Always build
+  from the working image's args. (sweetfb_hwvsync=1 in the args is read by nothing.)
+- 90 Hz: Pixel 4 XL's S6E3HC2 panel dtsi (Google kernel/msm, dsi-panel-s6e3hc2-dsc-wqhd-cmd.dtsi): the only
+  60/90 difference is DCS 0x53 (WRCTRLD) 0x20 = 60 Hz / 0x30 = 90 Hz; same link clock (962150400), MDP transfer
+  time 14000 us (60) / 9000 us (90). Assumed same DDIC family in the OnePlus 7 Pro (1440 wide 90 Hz Samsung).
+  Test: `panelbright raw 53 30` then `vsyncprobe` (frame interval should be ~11.1 ms; it now also prints how long
+  sending a frame takes: must be < 11 ms). Back: `panelbright raw 53 20` or reboot.
+  If it works: iOS still gets 59.85 Hz until 0198 measures 90 at boot -> needs the switch before the framebuffer
+  starts (kernel) or a re-measure; next step after the test.
+
+# Active handoff — 0198 boot audit (2026-11-09, Codex)
+
+- Source delta from the applied 0197 tree to the 0198 tree is only
+  `iokit/Kernel/arm/SweetFramebuffer.cpp` (120 insertions, 15 deletions). Reconstructed `git diff` is in
+  `research/SweetFramebuffer-0198-vs-0197.diff`; patched source copy is `research/SweetFramebuffer-0198-applied.cpp`.
+  `0198-build.log` records `applying xnu/patches/0198-guacamole-fb-panel-refresh-lock.patch`; the build script uses
+  `git apply` (no fuzz/offset mode), and reverse-checking the applied patch succeeds.
+- Image comparison: 0197 fallback and 0198 A/B are all 21,491,712 bytes; Android shim kernel is 188,416 bytes
+  and DTB is 4,255,607 bytes with the same hash. Embedded XNU payload is 17,040,784 bytes for 0197 and
+  17,040,992 bytes for 0198 (kernel segment file bytes 16,940,616 vs 16,940,824). ADTs are all 99,140 bytes;
+  0198 A/B use the same ADT, while 0197's ADT differs only in `/chosen/random-seed`.
+- The first 0198 A/B images omitted required root arguments; that was an image-build confound. Rebuilt both A/B
+  images from the same 0198 kernel, with `rd=ufsroot0 ufsroot=ios unentitled_ios_sim_launch=1 ignition_level=1
+  wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 sweetfbgpu=1` restored, plus the common
+  60 Hz GPU-present arguments. They share `sweettime=1794211894`; A adds `sweetfblock=0`, B adds
+  `sweetfb_vsync=60 sweetfb_refresh=60`. Corrected A SHA-256:
+  `dd83b7f93e22b142c8c05ede87cda32301faf0127bb4b8e4bf34417ee47e4977`; corrected B SHA-256:
+  `9de37ebaa92235d172a3a4adb5481432b41d4d62cdea9c5460048cc0a96cf3f8`. The 0197 fallback remains unchanged.
+- Rebuilt once more with 0197 reversed and 0198 retained. Kernel:
+  `work/xnu-local-latest/kernel.0198-without-0197.development.sweet`, SHA-256
+  `6c1658f52ad8f356811d268cd7f766e79bc7bfdfcf6608fef30c04872ed0c8ca` (0198 refresh marker present). The build
+  tree's 0197 patch was restored after the build. Corrected no-0197 image A:
+  `outputs/guacamole-0198-no0197-A-fblock-disabled.img`, SHA-256
+  `90b43224093452e509a49d74eec838b5cdf535ac7646b1f5c7dc90bebdc821e4`; B:
+  `outputs/guacamole-0198-no0197-B-vsync-refresh-60.img`, SHA-256
+  `0429843d6d52f5fdb235ea636ea431398c69073095080d892bab51c525f05225`. Both carry the required root args and
+  `sweetfbgpu=1`; shared `sweettime=1794212073`. The 0197 fallback hash remains
+  `7bf17bb629ab98ae2c2d7166d82bc6a7fbe6946315ea4ed75fb01f4d98b1432d`. These new images were not booted.
+- Built combined 0197+0198 image with the required root arguments, `sweetfbgpu=1`, and default panel lock enabled
+  (no `sweetfblock=0`, `sweetfb_vsync`, or `sweetfb_refresh`):
+  `outputs/guacamole-0197-0198-panel-lock.img`, SHA-256
+  `fcc35f53583e204b4f3f3b6057a694c279282f1487b17e03975d7b55a95c022c`. Payload boot args were read back and
+  checked. The 0197-only fallback remains unchanged; this image was not booted.
+
+- vsyncprobe run 3: INTF1 +0x2b0 = TE line counter (0 .. 0c30, changes on every read), +0x298 another counter
+  (0c30 .. 1879), +0x2b4 = 80000001 = autorefresh on, every TE (this is what feeds the command-mode panel; nobody
+  kicks CTL_START). Frames 16.712 ms (59.84 Hz) apart.
+- NEW xnu/patches/0198-guacamole-fb-panel-refresh-lock.patch (SweetFramebuffer.cpp, after 0185): at start maps
+  INTF1 (0x0ae6b000, inhibit-cache), checks
+  autorefresh bit + height, times 7 frame starts of the line counter (<= 300 ms busy wait once) -> period.
+  IOMFBDisplayRefresh / TimingElements SyncRate publish the measured rate (CoreAnimation runs its own frame clock
+  from it; it was 60.000 -> one frame of drift every ~7 s). The vsync timer uses the period and re-arms each tick
+  to land just after the frame start (line counter). Logs: "SWEET FB: panel refresh measured: N ns a frame =
+  59.8xx Hz", "vsync from the panel", "IOMFBDisplayRefresh 59.8xx Hz". Boot-args: sweetfblock=0 off (as before);
+  sweetfb_vsync / sweetfb_refresh still override.
+- Build order: 0197 then 0198 (the patches are independent). Built locally from the Wi-Fi-capable `ios-sweet`
+  source using the established XNU build tree. Kernel SHA-256:
+  `a475575026e54509bb35d80a44731a1c5c53f6fb03d199994bca68669a4be9be`.
+- Initial A/B images used the same combined 0197+0198 kernel, template, shim, base args, and sweettime
+  (`1794210868`); only the requested
+  option(s) differ. A: `outputs/guacamole-0198-A-fblock-disabled.img`, adds `sweetfblock=0`, SHA-256
+  `fbfe97c440bb1783d8eba372f4aef0bf38ed0a6ea7e11fa8feeee124be72c99c` (superseded by the corrected image above). B:
+  `outputs/guacamole-0198-B-vsync-refresh-60.img`, adds `sweetfb_vsync=60 sweetfb_refresh=60`, SHA-256
+  `db63c693dfbfde7e8b27c88323ffff8ed8df3b9a35066e471f8e55db6e8b6c66` (superseded by the corrected image above).
+- The previous working 0197-only fallback remains untouched at
+  `outputs/guacamole-0197-60hz-gpu-two-layers.img`, SHA-256
+  `7bf17bb629ab98ae2c2d7166d82bc6a7fbe6946315ea4ed75fb01f4d98b1432d`. No image was booted or flashed for this
+  A/B build request.
+
+# Active handoff — vsyncprobe run 2: panel 59.86 Hz; timing in INTF1 tear check (2026-11-09, Claude)
+
+- DSI0 MDP stream busy rises every 16.70-16.71 ms: 18 frames / 300 ms, 59.86 Hz, steady (while scrolling).
+  DSI0 STREAM0_CTRL 05a10039 TOTAL 0c3001e0 (3120 lines x 480 words). PINGPONG0/1 all zero.
+- INTF1 (0xae6b800) tear check block populated: +284 1, +288 00180066, +28c ffff, +294 0c30, +298 177f,
+  +29c 00050004, +2a0 0c30, +2a4 0c31 (height+1), +2b0 0c30 (layout looks like Linux INTF_TEAR_* shifted +4).
+- Consequence: the kernel's vsync timer (60.00 Hz) vs panel 59.86 Hz -> one frame of drift every ~7 s (a hitch).
+  Plan (small step): phase-lock the kernel vsync timer to a hardware line counter (period 16.706 ms, tick at a fixed
+  line), no interrupt wiring needed. vsyncprobe now also finds which INTF1 word +0x200..+0x2fc changes (and range).
+- Codex rebuilt/signed this extended `vsyncprobe` and atomically replaced `/usr/local/bin/vsyncprobe`; pulled-back
+  binary byte-matches. SHA-256 `56b81b195af7f0f413e8cfbed7d7e8693ac5bd4e2714dc41d48948cbff2dd0a4`. New build not run yet.
+
+# Active handoff — vsyncprobe run 1: PINGPONG timing all zero (2026-11-09, Claude)
+
+- PINGPONG0/1 (0xae71000/0xae71800) +0x000-0x030 all 0 (no tear check, no autorefresh, LINE_COUNT stuck 0) while
+  the screen updates; MDP INTR_EN 0, STATUS 00000100 (bit 8 = PINGPONG0 done, stale). Kernel never kicks CTL_START.
+- vsyncprobe extended (read-only): INTF1 (0xae6b800) incl. +0x280.. (INTF tear check on newer DPUs), +0x0ac/+0x2a4
+  counters; DSI0 STATUS0 bit 2 (MDP stream busy) sampled 300 ms -> frames actually sent to the panel and their rate;
+  DSI0 MDP stream regs +0x58/+0x5c. Rebuild + run while scrolling.
+- Codex rebuilt/signed and atomically replaced `/usr/local/bin/vsyncprobe`; installed file pulled back and byte-matched.
+  SHA-256 `ff5aaec89b6788dd8ebdc36f00cb05aa91eb7a6b908080fc99387378e56322cd`. The extended probe has not been run yet.
+
+# Active handoff — 0197 WORKS (brightness + Night Shift); Night Shift stuck on fixed (2026-11-09, Claude)
+
+- User: with 0197 brightness and Night Shift work, but Night Shift is always on. sweet-displayd took status byte 0
+  OR byte 1 as on. User's -1: on = 01 01, off = 01 00 (02:22, schedule 22:00-07:00 at bytes 8/16): byte 0 =
+  inside the schedule, byte 1 = on now. sweet-displayd now uses byte 1 (enabled) only.
+- Codex rebuilt/signed and atomically replaced `/var/local/bin/sweet-displayd` (SHA-256
+  `5071efc3685cc4de9eb453ed2924548805a3d7f44fbb8cb482cee2dc5e2c2d34`), then ran `killall sweet-displayd`.
+  Launchd restarted it: `com.sweet.displayd` is running (pid 685, run count 3); pulled-back binary matches the build.
+  Next compare `sweet-displayd -1` with Night Shift on and off (status bytes).
+
+# Active handoff — display driver, small steps: vsync probe (2026-11-09, Claude)
+
+- User asked about a better display driver with 90 Hz; chose to start with the small pieces. Order agreed in
+  spirit: real vsync (hardware frame timing) -> direct scanout (SSPP pointed at CA's surface, hardware scaling,
+  no copy) -> 90 Hz panel mode -> brightness/Night Shift in the kernel. 0197 is now booted and registered.
+- NEW userland/jb/vsyncprobe.c (READ-ONLY; build.sh -> out/vsyncprobe, /usr/local/bin): dumps PINGPONG0/1 tear
+  check / sync config / autorefresh registers (Linux dpu_hw_pingpong offsets 0x000-0x030) and MDP INTR/INTR2
+  EN/STATUS, then samples PP0 LINE_COUNT for 300 ms and reports frame intervals = the panel's real refresh rate.
+- Codex built/signed and installed the first `vsyncprobe` at `/usr/local/bin/vsyncprobe` (SHA-256
+  `b46ef0518656181f742e884396541b793bb48b8db695013d499cf61a1e036c67`; later replaced with the INTF1/DSI probe above).
+  Read-only run returned zero for all
+  PINGPONG0/1 timing registers and no LINE_COUNT cycles in 300 ms (94,657 samples); rerun while content is moving
+  to distinguish an idle panel from an incorrect register assumption.
+
+# Active handoff — 0197 AppleARMBacklight so CoreBrightness starts (Night Shift) (2026-11-09, Claude)
+
+- research/corebrightness/CoreBrightness (extracted, read with llvm-objdump): -[BLControl findBacklight] does
+  IOServiceGetMatchingServices({IOPropertyMatch: {backlight-control: true}}) -> IOIteratorNext -> 
+  -[CBDisplayContaineriOS initWithBacklightService:] (needs IOObjectConformsTo "AppleARMBacklight", registryID)
+  -> setupInternalModules (CBDisplayModuleiOS initWithBacklight:queue:display: -> DisplayCreate/DisplayOpen; auto-
+  brightness, Night Shift ...). With none: "Built in display/backlight driver has not been found." -> no Night
+  Shift, CBBlueLightClient answers nobody, no CoreBrightness prefs. The guacamole ADT has no backlight node.
+- NEW xnu/patches/0197-guacamole-applearmbacklight.patch (applied after 0185 and built locally):
+  iokit/Kernel/arm/SweetBacklight.cpp: class AppleARMBacklight (IOResources match in KernelConfigTables, after
+  AMFI; files.arm64 after SweetAMFI). Properties: the iPhone X /device-tree/backlight node (d22ap.adt, 40 props:
+  DBVMin 139/DBVMax 2047, marketing table, restriction curves, ... ; generated table also in
+  research/corebrightness/backlight-table.inc.txt), backlight-control = true, IODisplayParameters
+  {brightness {min 0, max 65536, value}}. setProperties accepts/keeps everything (IODisplayParameters value merged),
+  logs first 80 keys `SWEET BL: <proc> sets <key> (<class>) <n>`; user client accepts all selectors, logs once each.
+  Boot-arg sweetbacklight=0 disables it (if backboardd/CoreBrightness then crash-loops).
+- Boot confirmation (2026-11-09): `kern.bootargs` sweettime matched the 0197 image. ioreg shows service `backlight`
+  as active AppleARMBacklight, `backlight-control = Yes`, `IODisplayParameters`, and its brightness user client.
+  `sweet-displayd -1` now says Night Shift answers (on=1, strength 0.443). `com.sweet.displayd` is running (pid 461).
+  `dmesg` isn't on the SSH shell PATH; ioreg and CBBlueLightClient confirm registration and the query path. Still
+  toggle Night Shift visually; if backboardd crashes, inspect newest .ips and boot with `sweetbacklight=0`.
+- Codex built the full patch chain with 0185 followed by 0197 using the local XNU build script, Xcode 27.2 and
+  KDK 13.5 (22G74). SweetBacklight compiled and the kernel contains its registration/boot-arg strings. Kernel SHA-256:
+  `fb8d12cd859fb6811dc8b0d238ad9fc50a818d6e72a70829932999622b383f43`.
+- Packaged the temporary 60 Hz GPU-present image at
+  `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-0197-60hz-gpu-two-layers.img`, SHA-256
+  `7bf17bb629ab98ae2c2d7166d82bc6a7fbe6946315ea4ed75fb01f4d98b1432d`. It keeps the 0185 boot args and defaults
+  AppleARMBacklight on (no `sweetbacklight=0`). Booted temporarily with `fastboot boot`; Android partitions were
+  not flashed.
+
+# Active handoff — PANEL BRIGHTNESS WORKS; sweet-displayd uses it (2026-11-09, Claude)
+
+- 2026-11-09 Codex rebuilt `userland/out/sweet-displayd` from the current `sweet-displayd.m`, linked Foundation,
+  and signed with `sweet-displayd-ents.plist`. Installed `/var/local/bin/sweet-displayd` on the phone atomically;
+  pulled it back and confirmed it matches the build (SHA-256 `3b74bd42247deb5247e68579d590b294edddf3ff7ffbe18b331fe4504931ab8a`).
+- Added the `NET_JOBS` configuration using `tools/sweet-root-tweaks.py --launchd-plist ... --net` to the phone's
+  `/System/Library/xpc/launchd.plist`; verified the installed plist matches and has `RunAtLoad` + `KeepAlive` for
+  `com.sweet.displayd`. It is not loaded in the current launchd session (previously booted out); the persistent
+  job will be read at next boot. No reboot performed.
+- Bootloader's last DSI packet at 0xffd09000: c0390003 89b80051 = DCS long write 0x51 00 b8 (brightness 184).
+  panelbright set N works (user tested several values incl. 1): 1 = minimum, 1023 = maximum (user's choice).
+  DSI DMA reads plain physical memory (0x9d124000 buffer works).
+- sweet-displayd: slider -> panel level 1 + round(1022 * level^2) via DCS 0x51 (only on change; waits <= 100 ms
+  for CMD_DMA_DONE); the colour stage (PCC) is now only Night Shift (identity -> PCC off). Rebuild + reinstall
+  /var/local/bin/sweet-displayd; start it (or the com.sweet.displayd job).
+- Night Shift still waits on iOS's own feature (CBBlueLightClient answers nobody): next = CoreBrightness logs /
+  binary (see the 'banding fix test + iOS Night Shift investigation' entry below).
+
+# Active handoff — panelbright: panel is COMMAND mode (2026-11-09, Claude)
+
+- probe: DSI0 HW_VERSION 20030000, CTRL 000001f5 (enable, CMD_MODE_EN, 4 lanes, clk; NO video mode),
+  CMD_DMA_CTRL 10000000 (embedded, HS), DMA_BASE ffd09000 / LEN 8 (the bootloader's last packet: looks like a
+  physical address -> DSI DMA probably not behind an SMMU), TRIG_CTRL 4 (SW), INTR_CTRL 00000500.
+  Buffer page 0x9d124000 all zero. `set 200` correctly refused (wanted video mode).
+- Change: send_dcs accepts command mode (CTRL bit0 and bit1|bit2); probe prints the bootloader's last packet.
+  Rebuild panelbright; run `panelbright probe` again (for the packet) then `panelbright set 200`.
+- Unknown: whether a DMA command collides with the display controller's auto-refresh in command mode (Qualcomm's
+  driver pauses autorefresh around commands). If the screen freezes: reboot.
+
+# Active handoff — panel brightness over DSI0 (2026-11-09, Claude)
+
+- User approved real panel brightness. NEW userland/jb/panelbright.c (build.sh -> out/panelbright, /usr/local/bin):
+  `probe` (READ-ONLY: DSI0 0x0ae94000 registers + command buffer page), `set N` (DCS long write 0x51 hi lo,
+  N 0-1023), `raw HEX..` (any DCS long write). Mechanism = Linux msm video-mode transfer: CTRL |= CMD_MODE_EN,
+  CMD_DMA_CTRL embedded (bit28) HS, TRIG_CTRL DMA trigger SW (4), DMA_BASE/LEN, TRIG_DMA=1, poll INTR_CTRL bit0
+  (CMD_DMA_DONE, 100 ms), restore CTRL/CMD_DMA_CTRL/TRIG_CTRL. Offsets = DSI v1 + 4 (Linux io_offset; LK mipi_dsi.h).
+  Packet buffer: 0x9d124000 (splash 0x9c000000 + 3120*5760 page-aligned; low DDR bank, unused by XNU; inside the
+  region the display already reads, in case MDSS's SMMU only maps the bootloader's splash).
+- `set` refuses unless DSI0 HW_VERSION is 0x20xxxxxx and CTRL has enable+video. Risk: panel may blank or show
+  garbage until reboot if the DMA reads the wrong memory. Waiting for the probe output before the first `set`.
+- If it works: sweet-displayd sends the slider as the panel level (PCC back to Night Shift only).
+
+# Active handoff — software dimming limit; real brightness needs the panel (2026-11-09, Claude)
+
+- User: dither changes nothing; dimming wrecks colours (red black at 10%). Cause: PCC scales encoded pixel values,
+  so dimmed content lands in the AMOLED's lowest codes (black crush / poor near-black colour). Not fixable in the
+  colour stage. sweet-displayd now maps the slider to 50%-100% only (k = 0.5 + 0.5 level).
+- Real brightness: panel DCS 0x51 (set display brightness) over DSI0 from the kernel or /dev/pmem, without a
+  display driver (DSI command DMA/FIFO while the bootloader's video mode runs; SMMU of MDSS unknown). Not started:
+  waiting for the user's go-ahead (risk: wrong DSI writes can blank the panel until reboot).
+
+# Active handoff — banding fix test + iOS Night Shift investigation (2026-11-09, Claude)
+
+- sweet-displayd -1: brightness follows (BKS works) but CBBlueLightClient getBlueLightStatus: returns NO, all 0.
+  No CoreBrightness preferences file exists (/var/mobile, /var/root). SpringBoard/Preferences carry only the
+  entitlement com.apple.backboard.displaybrightness. => iOS's Night Shift itself is not running on the port
+  (CoreBrightness in backboardd presumably found no display/backlight it supports). User chose: make iOS's own
+  Night Shift work (not a private toggle).
+- User: dimming bands/blotches at low brightness (PCC scaling of 8-bit pixels on AMOLED).
+  dispcolor now has `dither on|temporal|off`: PINGPONG0/1 dither block (Linux dpu: PP + 0x30e0: +0 enable,
+  +4 depth 2 bits/comp (2 = 8 bit, bit 8 temporal), +8 4x4 matrix 15,7,13,5,3,11,1,9,12,4,14,6,0,8,2,10).
+  Test: dispcolor brightness 10; dispcolor dither on (then temporal, then off) and compare. If it helps,
+  sweet-displayd should enable it.
+- Night Shift next steps:
+  1. `out/oslog` is now built with `flame/oslog-ents.plist` entitlements and installed as `/usr/local/bin/oslog`
+     on `192.168.0.70`; pulled-back copy matches. SHA-256 `8f28d2afa73b5533c8848dc7414928ef0fb2ab15c51b54a28a4f1854eabe1e9a`.
+     Capture CoreBrightness's start-up messages:
+     oslog -t 40 -l backboardd > /var/root/bb.log &  then killall backboardd, wait 40 s,
+     grep -a -i -E 'bright|bluelight|CBDisplay|night|backlight|aab|display module' /var/root/bb.log | head -80
+  2. CoreBrightness binary for offline reading: if `ipsw` and the 20H392 shared cache are available on the Mac,
+     `ipsw dyld extract <dyld_shared_cache_arm64> CoreBrightness -o research/corebrightness/` (+ --strings dump),
+     put it in this folder for Claude (llvm-objdump here).
+
+# Active handoff — sweet-displayd: brightness WORKS; Night Shift fix attempt (2026-11-09, Claude)
+
+- User: brightness slider works through sweet-displayd; Night Shift does not.
+- Change: "on" = status byte 0 (active) OR byte 1 (enabled) (macOS tools use enabled); strength < 0.01 while on
+  -> 0.5; `-1` now prints the first 40 status bytes. Rebuild sweet-displayd, then with Night Shift ON run
+  `sweet-displayd -1` and with it OFF again, and compare (ask the user for both outputs if still not working).
+
+# Active handoff — sweet-displayd: iOS brightness + Night Shift -> DSPP PCC (2026-11-09, Claude)
+
+- dispcolor WORKS (user: rgb, brightness, night, night+bright, off all as expected). PCC path confirmed.
+- NEW userland/jb/sweet-displayd.m (+ sweet-displayd-ents.plist; build.sh builds and signs out/sweet-displayd):
+  polls 10x/s BKSDisplayBrightnessGetCurrent() (slider) and CBBlueLightClient getBlueLightStatus:/getStrength:
+  (Night Shift), writes DSPP0/1 PCC + CTL0 flush on change (same checks as dispcolor; identity -> PCC off).
+  Brightness curve: scale = max(0.03, level^1.8); Night Shift full = G 0.70, B 0.40 (x strength).
+  `sweet-displayd -1` prints what iOS reports and exits (writes nothing); `-v` logs every change.
+- Install: /var/local/bin/sweet-displayd. Boot job com.sweet.displayd added to tools/sweet-root-tweaks.py NET_JOBS
+  (--net), KeepAlive, output /var/local/displayd.out. Not compiled by me (no SDK); entitlement names are guesses.
+- Unknown until tested: whether BKSDisplayBrightnessGetCurrent follows the slider with no backlight hardware,
+  and whether CBBlueLightClient answers from a root daemon.
+
+# Active handoff — dispcolor: DSPP PCC by hand (2026-11-09, Claude)
+
+- dispprobe result: MDSS 0x50000001; MDP base 0x0ae01000 (TOP+0 = 50000001). CTL0 is the only active path:
+  LAYER(LM0) 01000005, LAYER(LM1) 01000028, TOP 00020000, INTF_ACTIVE 2 (INTF1 = DSI0). LM0 and LM1 OUT_SIZE
+  0c3002d0 = 720x3120 each (split 1440x3120). DSPP0/1: all 0, PCC off, coefficients 0. Output stopped after the
+  DSPP2 row (PCC2 read): possibly a bus hang on an unused block -> never touch DSPP2+.
+- NEW userland/jb/dispcolor.c (build.sh: out/dispcolor -> /usr/local/bin): writes ONLY DSPP0/1 PCC (diagonal
+  S3.15 matrix, 0x8000 = 1.0) + CTL0 FLUSH bits 13|14, after checking version/INTF_ACTIVE/LM sizes match the probe.
+  dispcolor show | rgb R G B | brightness PCT | night PCT [BRIGHT] | off. Undo = `dispcolor off` or reboot.
+- If `rgb` shows no change: FLUSH may need bit 17 (CTL) too, or PCC wants the DSPP op-mode enable; report `show`
+  output and CTL0 FLUSH value printed after the write.
+- Next after it works: a kernel backlight service (iPhone X: backlight node next to disp0) so CoreBrightness sends
+  slider / Night Shift values, applied with the same registers from the kernel.
+
+# Active handoff — brightness / Night Shift: display controller probe (2026-11-09, Claude)
+
+- Brightness slider / Night Shift change nothing: while moving the slider and toggling Night Shift the fake IOMFB
+  got only selectors 4/5/6 (+12, 79): CoreBrightness never drives the display (iPhone X uses a backlight service
+  next to disp0, which the port does not publish; IOK trace of backboardd was no longer in dmesg).
+- Plan (no display driver needed): the DPU's DSPP PCC (3x3 colour matrix after each layer mixer, as Linux night
+  light) for Night Shift and AMOLED dimming; then a kernel backlight service so iOS's slider/Night Shift reach it.
+- Step 1: userland/jb/dispprobe.c (READ-ONLY, /dev/pmem; build.sh builds out/dispprobe -> /usr/local/bin).
+  Dumps MDSS version, MDP TOP, CTL0-5, LM0-5, DSPP0-3 + PCC, PP0-3, INTF0-3 for MDP base 0x0ae01000 and 0x0ae00000.
+  Run `dispprobe` and paste the whole output to Claude. Do NOT write PCC registers before that is read.
+
+# Active handoff — 0196 WORKS; default direction now counter-clockwise (2026-11-09, Claude)
+
+- User: Angry Birds Classic now runs and draws in landscape, but upside down with the clockwise turn.
+  Workaround on the installed bundle: touch /var/local/sweet-rotate-ccw; killall backboardd.
+- Source changed: counter-clockwise is the default; the override file is now /var/local/sweet-rotate-cw.
+  After the next bundle rebuild, delete /var/local/sweet-rotate-ccw (no longer read).
+- Open: a game that picks the other landscape orientation would be upside down; the proper fix is to take the
+  direction from the interface orientation (CA's descriptor rotation SPI value is logged as "descriptor rotation N").
+
+# Active handoff — 0196 rotated CoreAnimation framebuffer (landscape apps) (2026-11-09, Claude)
+
+- AB Classic stale screen = the AB2 cause, confirmed: backboardd mtl2.log repeats `texture over buffer refused:
+  RowPitch { bytes_per_row: 4608, row_bytes: 9744 }` (CA asks its 1125x2436 framebuffer surfaces as 2436x1125
+  textures while a landscape app is in front). backboardd composes with Metal, NOT libsweet-gl: 0195's eagl.c log
+  lines never print (harmless). `rotated view asked` (0189) did not print either -> the installed bundle may predate it.
+- 0196 (userland/metal2/NativeBridgeMetalFrontend.mm, bundle rebuild): on that refusal (descriptor w/h = surface h/w,
+  not planar) the device returns a private landscape texture of ours ("shadow", cached per surface/format/size, it
+  keeps CA's drawing so loads/partial redraws work; -iosurface answers the surface) instead of nil. Every command
+  buffer whose render pass targets a shadow (or a view of it) gets, at commit, one full-screen pass drawing the shadow
+  turned 90 degrees into a portrait texture over the surface. The turning shader is MSL compiled at first use with
+  newLibraryWithSource (works per mtltest). Direction: clockwise by default (landscape top row -> surface's right
+  column; phone held with home edge on the right). `touch /var/local/sweet-rotate-ccw` flips it,
+  `touch /var/local/sweet-norotate` disables 0196 (read when a shadow is made; respring to apply).
+- Logs (mtl2.log, backboardd): `rotated framebuffer: surface 0x.. 1125x2436 asked as 2436x1125 ...: a landscape
+  texture of ours, turned clockwise ... (descriptor rotation N)`, `rotated framebuffer: turn N into surface 0x..`
+  (1st-3rd, every 600th); failures: `the turning shader does not compile`, `no pipeline for format`.
+- Not compiled by me (no iOS SDK here). Install: rebuild SweetMetal2.bundle (userland/metal2/build.sh), install,
+  reboot (backboardd loads the bundle at start). Expected: AB Classic (and AB2) draw in landscape; if upside down,
+  touch /var/local/sweet-rotate-ccw and killall backboardd.
+
+# Active handoff — 0195 window-server log for big app surfaces; mgtool setint/unset (2026-11-09, Claude)
+
+- 0194 installed; AB Classic still shows a stale picture. Its present lines: main thread, kCFRunLoopDefaultMode,
+  3600 presents in ~1 min -> the app side is fine (0194's main-thread theory was wrong; flush + seed bump kept).
+- Kernel during the blank: 10-38 swaps/s, every swap ONE layer = surface 2 (CA's 1125x2436 framebuffer), not black.
+  So backboardd composes the game into its own framebuffer and redraws, but its picture of the game never changes.
+  backboardd logged nothing in gl.log (its -texImageIOSurface lines are capped at 24 since boot).
+- 0195 (eagl.c, logging only): in the window server, for surfaces >= 2,000,000 pixels shown as textures:
+  "big surface N (...) as texture T: ... : its own memory (shared) | a copy" at import (first 60), and
+  "big surface N (texture T, shared|copy): bound B times, refilled R, seed S (last copied C), frame F" at bind
+  1, 30 and every 600 (first 80). Rebuild libsweet-gl.dylib; backboardd must restart to load it (reboot or
+  killall backboardd). Then run AB ~10 s and: grep -a 'big surface' /var/local/gl.log | tail -30
+- mgtool: ArtworkDeviceSubType is not in CacheExtra (MobileGestalt computes it). Added `mgtool setint NAME INT`
+  (adds or replaces) and `mgtool unset NAME`. setint ArtworkDeviceSubType 2556 did nothing: the real place is
+  an ENTRY of the ArtworkTraits answer (CacheExtra key oPeik/9e8lQWMszEjbPzng, the one Cowabunga edits).
+  mgtool now takes GROUP/ENTRY and prints dictionaries: mgtool get ArtworkTraits; mgtool setint
+  ArtworkTraits/ArtworkDeviceSubType 2556 (refuses if ArtworkTraits is not cached). Remove the useless top-level
+  one: mgtool unset ArtworkDeviceSubType. Rebuild out/mgtool -> /usr/local/bin/mgtool.
+
+# Active handoff — 0194 app frames reach the screen (2026-11-09, Claude)
+
+- Also: mgtool is not on the phone any more (searched /var/local, /var/root, /var/tmp, /usr/local, /var/jb).
+  build.sh now builds out/mgtool (userland/jb/mgtool.c). Install to /usr/local/bin/mgtool (mkdir -p /usr/local/bin).
+  The user wants to try the Dynamic Island: mgtool set ArtworkDeviceSubType 2556 (undo: 2436), killall SpringBoard.
+
+- 0193 worked: Angry Birds Classic no longer crashes at startup (no new .ips; no AL line, so either the real OpenAL
+  device opened or audio setup has not been reached yet).
+- New symptom (the same as AB had before 0191): blank screen; one frame shows per lock/unlock. gl.log shows
+  "present 600 of renderbuffer 5": the game presents continuously, the frames do not reach the display.
+- 0194 in eagl.c -presentRenderbuffer: (1) after glFinish, IOSurfaceLock/Unlock (write) to move the surface's seed,
+  as all other GPU writes in eagl.c do; (2) [CATransaction flush] on the main thread too (was: other threads only).
+  On the main thread the explicit commit is nested in the run loop's implicit transaction; a game running its own
+  loop never lets the run loop commit it. The present log line now says which thread and which run loop mode.
+- Install: rebuild libsweet-gl.dylib (libsweet-glapp unchanged since 0193); .new + mv -f. Check:
+  grep -c -a 'run loop mode' /usr/lib/libsweet-gl.dylib
+- Watch Cut the Rope for regressions (it presents from a display link on the main thread).
+
+# Active handoff — 0193 silent OpenAL for apps (2026-11-08, Claude)
+
+- Angry Birds Classic crash (SIGSEGV at 0x10, AngryBirdsClassic-2026-11-08-235018.ips) is NOT graphics: its GL
+  context, shaders and textures work. Main thread, -[UIApplication _handleDelegateCallbacks...] -> game code ->
+  "createStartUpAssets" (0x10007f2f4) reads app->[0x30] (game::AudioSystemComponent), which is NULL, at 0x100720ce8
+  (ldr x8,[x0,#0x10]). It is NULL because alcOpenDevice(NULL) fails (no audio on the port): the game throws
+  "Failed to open OpenAL device.", catches it and carries on without audio.
+- FIX: userland/gpu/nullal.c, built into libsweet-glapp.dylib (build.sh: + gpu/nullal.c, -framework OpenAL).
+  Interposes the 21 OpenAL calls the game imports. Real device opens -> all calls pass through unchanged.
+  It does not -> a fake device/context and a timing-only model of sources/buffers (plays nothing; buffers finish
+  at their real length, so streaming and one-shot sounds behave). Logs once to /var/local/gl.log:
+  "AL[pid name]: redwood-al: OpenAL has no device (default): sounds go to a silent stand-in".
+- Install: rebuild libsweet-glapp.dylib only (libsweet-gl unchanged); install via .new + mv -f (signature cache).
+  No change to the game binary (it already loads libsweet-glapp). Check: grep -c -a redwood-al /usr/lib/libsweet-glapp.dylib
+- Host-tested the model (stream of 3 x 0.1 s buffers, one-shot stop). Not compiled for iOS by me (no SDK here).
+
+# Active handoff — 0192 app shaders untouched (2026-11-08, Claude)
+
+- RESULT: Cut the Rope Experiments WORKS (user, 23:50) with libsweet-gl (0190-0192) + libsweet-glapp (0191) and both
+  load commands in ctr-jni. OpenGL ES apps now run on the GPU. Same recipe for any GL app (e.g. Angry Birds Classic).
+- Still open: commit all of this (kernel patches 0169-0185, frontend + eagl.c + glapp.c + tools/insert-dylib.py);
+  GPU hang recovery (daily-wheel shader hang); AB2 landscape (CA rotated framebuffer textures, 0189 trace);
+  sharegroup contexts are not shared yet.
+
+- 0191 result (Cut the Rope): app GL calls reach Mesa; setCurrentContext ours; drawables created (renderbuffer 1:
+  375x812, renderbuffer 3: 1125x2436, 3 surfaces each). Every app shader failed: "#version must appear on the first
+  line": my_glShaderSource rewrites CoreAnimation's shaders (#version 300 es + vertex_start/fragment_start macros +
+  all_highp) ahead of the app's own "#version 100". Follow-on errors 0x501/0x502 = programs missing.
+- CHANGE `userland/gpu/eagl.c`: in apps (in_window_server false, set in install()) glShaderSource passes the app's
+  text unchanged (kept for the failure log); say_long() now goes through say(), so shader texts reach gl.log.
+  Other CA-specific hooks checked: internal_format only maps explicit GL_BGRA; plain/group draws need program 0 or CA
+  group textures; deferred clear only for texture-backed framebuffers -> left as is.
+- Test: rebuild libsweet-gl (only it; install .new + mv), reopen ctr-jni,
+  `grep -a ctr-jni /var/local/gl.log | grep -vE 'replaced|asked for number' | grep -iE "shader|present|error|drawable" | head -30`.
+
+# Active handoff — 0191 app GL calls reach Mesa (Cut the Rope) (2026-11-08, Claude)
+
+- gl.log result (0190 build, after fixing install): libsweet-gl loads in ctr-jni, 13/13 methods replaced, context
+  created on FD640 (ES 3.2 Mesa), but `-renderbufferStorage: renderbuffer 0 ... refused` and every present "has no
+  drawable": the app's own gl* calls (OpenGLES.framework exports) never reached our table, because they look up the
+  context in OpenGLES's internal state, which our contexts never fill (CoreAnimation calls the table directly).
+- Install lesson: replacing a signed dylib IN PLACE keeps the kernel's cached signature -> dyld "code signature does
+  not cover entire file". Always copy to NAME.new, then `mv -f NAME.new NAME`.
+- CHANGES (not compiled yet):
+  - `userland/gpu/eagl.c`: +[EAGLContext setCurrentContext:] / +currentContext replaced in apps (thread-local
+    app_current); exported `void **sweet_gl_current_table(void)`.
+  - NEW `userland/gpu/glapp.c` -> libsweet-glapp.dylib: dyld __DATA,__interpose of OpenGLES's gl* exports onto the
+    current thread's table; linked against OpenGLES + libsweet-gl only. Cross-compiled here with clang
+    -target arm64-apple-ios16.0: 433 interpose entries, glBindRenderbuffer -> table[0x14d8/8](table[0], ...).
+  - `gpu/mkeagl.py`: new section EAGL_GEN_INTERPOSE; optional 5th arg = names iOS's OpenGLES exports (only those
+    are interposed; anything else could bind to Mesa and recurse). `build.sh` makes out/opengles-exports.txt from
+    the SDK's OpenGLES.tbd and builds libsweet-glapp.dylib.
+- Steps: userland/build.sh; install BOTH dylibs via .new + mv; add the second load command to the app:
+  `tools/insert-dylib.py ctr-jni /usr/lib/libsweet-glapp.dylib`, codesign -f -s -, copy back via .new + mv.
+  Expect gl.log: `+[EAGLContext setCurrentContext:] ours`, `an app's drawable: renderbuffer N (N != 0)`,
+  `first present ... read 0x8cd5 draw 0x8cd5`, `present 600 ...`.
+
+# Active handoff — 0190 OpenGL ES for apps (Cut the Rope, Angry Birds Classic) (2026-11-08, Claude)
+
+- Cut the Rope Experiments (/Applications/ctr-jni.app, exe ctr-jni): links Metal and OpenGLES; MTKView and
+  MTLCreateSystemDefaultDevice present, but at runtime it only creates the Metal device (mtl2.log: no library, queue,
+  drawable or pipeline) and draws with OpenGL ES (CAEAGLLayer, renderbufferStorage, presentRenderbuffer) -> no GL
+  in apps -> white screen. Same gap as Angry Birds Classic.
+- CHANGE `userland/gpu/eagl.c` (NOT compiled yet; build with userland/build.sh, libsweet-gl.dylib):
+  - app contexts are created as ES 3 underneath (ES2 apps still told 2) so the present can use glBlitFramebuffer;
+  - new EAGLContext methods (apps only; skipped in backboardd): initWithAPI:, initWithAPI:sharegroup: (sharegroup
+    NOT shared, logged), renderbufferStorage:fromDrawable: (Mesa RGBA8 renderbuffer of the layer's pixel size + 3
+    BGRA IOSurfaces made textures of their own memory via redwood_gl_surface_texture),
+    presentRenderbuffer: (+atTime:, +afterMinimumDuration:): blit the renderbuffer upside down into the next surface's
+    texture, glFinish, layer.contents = surface inside a CATransaction (flush off the main thread).
+  - log lines: `redwood-gl: an app's drawable: ...`, `first present of renderbuffer ... read/draw status`,
+    `present N of renderbuffer ...`.
+- NEW `tools/insert-dylib.py BINARY /usr/lib/libsweet-gl.dylib`: adds an LC_LOAD_DYLIB (thin/fat arm64), tested on
+  mtltest (llvm-objdump shows the new dylib; second run reports "already loads").
+- Steps: build + install libsweet-gl.dylib to /usr/lib on the phone; copy the app executable to the Mac
+  (scp root@PHONE:/Applications/ctr-jni.app/ctr-jni .), keep a .orig copy, run insert-dylib.py, `codesign -f -s -`,
+  copy back, `chmod 755`. Same for /Applications/AngryBirdsClassic.app/AngryBirdsClassic.
+  Logs: libsweet-gl's say() output goes to stderr and (since this change) to /var/local/gl.log if it exists
+  (`touch /var/local/gl.log; chmod 666 /var/local/gl.log`), lines "GL[pid name]: redwood-gl: ...".
+  First result: library installed (23:18), ctr-jni patched; run from SSH: libsweet-gl loads and replaces all 13
+  EAGLContext methods (no scene from SSH, so no context is made there). Home-screen launch: stderr not visible -> gl.log.
+- Risks: sharegroup contexts (async texture loading) get no shared objects; multithreaded GL relies on eagl.c's
+  single global `current`; first build may need compile fixes.
+
+# Active handoff — AB2 parked; Cut the Rope next (2026-11-08, Claude)
+
+- AB2: user reports the game now demands an app update and still shows black; parked. Pending: install the bundle
+  with the 0188/0189 traces and check `rotated view asked` (CA's 2436x1125 views of the portrait framebuffer).
+- Cut the Rope Experiments (process ctr-jni): white screen; previous run had a Turnip device but no render
+  pipelines -> suspected OpenGL ES app (like Angry Birds Classic). Waiting for executable/framework check.
+  If GL: build app-side EAGL (inject libsweet-gl + CAEAGLLayer renderbufferStorage:fromDrawable: /
+  presentRenderbuffer:), which would cover AB Classic too.
+
 # Active handoff — AB2 black = CA's rotated framebuffer textures refused (2026-11-08, Claude)
 
 - Before this rebuild the phone ran the 22:29 bundle (no `watched surface` string); the new diagnostic build below
@@ -1052,3 +2544,38 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Next: user can temporarily boot it with `fastboot boot /Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-scanout-memory-diag.img`, reproduce flicker, then collect `dmesg | grep 'SWEET FB: scanout' | tail -n 20`. Compare bands across samples: stable hashes/nonblack counts while the camera sees black would point downstream of the framebuffer memory (SDE/panel); changing or black bands would show that the buffer being scanned is itself changing or blanking. This is a diagnostic hypothesis test, not a fix.
 - Follow-up to the read-only sampler result: the phone confirms `sweetfb_scanoutdiag=1` is active; repeated samples of all five bands remain all-zero with an identical hash while Subway Surfers is active. This proves only that the CPU-visible `fPixels` mapping reads as zero; it does not prove which memory the panel scans.
 - Prepared a separate probe-validation image `/Users/coreycusick/Documents/Codex/2026-11-06/ok/outputs/guacamole-scanout-cpu-map-check.img` (SHA-256 `5b6b81de270612478b12f92922010863f39d2906efefaca62836a7218e2253a8`). Same diagnostic kernel and Metal/OpenGL/Wi-Fi settings, but `sweetfbgpu=0` forces CPU composition into `fPixels`. Not booted. If its sampler becomes nonzero, compare against the GPU framebuffer-present route; if it stays zero, the sampler's mapping/read method is not seeing the content and must be corrected before interpreting panel behavior.
+# Active handoff — 0200 Metal bundle installed; reboot requested (2026-11-09)
+
+- Rebuilt `userland/metal2/out/SweetMetal2.bundle` from the current source (0200 Photos device-limits fix), ad-hoc
+  signed by `userland/metal2/build.sh`. Build succeeded with four existing incompatible-pointer-type warnings.
+  `SweetMetal2` SHA-256: `2aba7a84dc2eb74e7225c0e70466862de20b0c1a547d1119125c5d5621a7eb63`; Turnip SHA-256:
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`.
+- Installed over SSH at `/System/Library/Extensions/SweetMetal2.bundle`, verified the 0200 limits log string is
+  present, and preserved the prior bundle as `SweetMetal2.bundle.pre-0200-photos-limits-20261109`.
+- `reboot` is not installed on the phone. Invoked `launchctl reboot`; SSH at `192.168.0.70` has not returned after
+  50 seconds, consistent with Wi-Fi needing manual re-enable after boot. Photos test and crash diagnostics pending.
+
+
+# Active handoff — MPSCore cache disassembly (2026-11-09)
+
+- `research/metal/MPSAutoCache-ctor.txt` contains the 60-instruction MPSAutoCache constructor disassembly from the iOS 16.7.16 (20H392) arm64 dyld shared cache. At 0x1d40afa48 it loads the `MPSCommandBufferImageCache` class, then calls `initWithCommandBuffer:` at 0x1d40afa54.
+- `research/metal/MPS-cache-init.txt` contains the named 139-instruction implementation `-[MPSCommandBufferImageCache initWithCommandBuffer:]` at 0x1d40aeda0.
+
+# Active handoff — 0206 Metal object protocols installed (2026-11-09)
+
+- Rebuilt `SweetMetal2.bundle` with the current 0206 `NativeBridgeMetalFrontend.mm` protocol-adoption changes using `sh userland/metal2/build.sh`. Ad-hoc signature verified locally. Four existing incompatible-pointer-type warnings remain.
+- `SweetMetal2` SHA-256: `057bf9db25c72e6074323e6177c78923cfc38ec5d202930d421a511afdb02f84`; Turnip SHA-256: `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`.
+- Installed to `/System/Library/Extensions/SweetMetal2.bundle` on `192.168.0.70`; pulled both binaries back and byte-compared them to the build. Previous bundle preserved as `SweetMetal2.bundle.pre-0206-20261109`. Archive: `outputs/guacamole-SweetMetal2-0206-mps-protocols.tar.gz`, SHA-256 `429d8d50b60cf5e2cf0949dd8273bdf77ddb7742c91d2ce586c5c85e443a21e9`.
+- No reboot performed. Restart/reboot before judging the MPS app behavior so backboardd and app processes load the new bundle.
+
+# Active handoff — MPSDevice support-path disassembly (2026-11-09)
+
+- Added `research/metal/MPSDevice-GetMPSDevice.txt` with the complete named `MPSDevice::GetMPSDevice(id<MTLDevice>)` body from the iOS 16.7.16 (20H392) arm64 dyld shared cache. It is unusually large (428 unique instruction addresses); family/name gating and initializer dispatch are inline.
+- Also added the named base `MPSDevice` constructor and `MPSDevice_Common` constructor, plus two private helpers used on this path: the optional `gpuCoreCount` selector helper and a per-family `MPSDevice_Common` initializer that calls `supportsFamily:`.
+- The selector checks and model-name comparisons appear in `GetMPSDevice`; the disassembly includes `supportsFamily:` calls and hard-coded Apple GPU names (A13/A14/A12X/M1/A10X/A8X/A10/A9X). No Adreno model string appears in those comparisons. This is evidence about the observed selection path, not proof of the runtime `supportsFamily:` answers returned by SweetMetal2.
+
+# Audio handoff — CoreAudio IOAudio2 client contract (2026-11-10)
+
+- Added `research/audio/coreaudio-ioa2-client-contract.md` and linked it from the audio README.
+- Confirmed from iOS 16.7.16 (20H392) CoreAudio: IOAudio2 service matching name and open type, selectors 2/3/5/6/10/11 client call shapes, mapped memory type families, visible registry schema, VirtualAudio's built-in topology expectations, and D22 VAD tuning filenames.
+- Unresolved by static client-side analysis: stock D22 primary device UID/name and full runtime registry dictionaries, notification variant layout, and named offsets/semantics for IOAudio2's status-page clock. These are explicitly called out in the report; do not guess them from the distinct AOP path.

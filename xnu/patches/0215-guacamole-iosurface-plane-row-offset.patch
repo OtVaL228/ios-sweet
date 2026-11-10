@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -765,6 +765,16 @@
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		/*
++		 * 0215: IOSurface.framework reads a plane's row bytes at +0x10 of its record, not +0x08
++		 * (IOSurfaceClientGetBytesPerRowOfPlane: client + 0xd0 + 0x80 * i + 0x10; the record is this result
++		 * block's +0x68, copied to the client's +0x68; research/iosurface/IOSurface). Every planar surface
++		 * answered IOSurfaceGetBytesPerRowOfPlane = 0: PhotosPosterProvider's '420f' photo (606x1145, planes at
++		 * 64 and 737344, rows 640) was read with the whole surface's 968, and whatever wrote its planes by the
++		 * plane's row wrote with 0. Width +0, height +4, offset +0xc, size +0x14, bytes per element +0x18 and
++		 * element width/height +0x1a/+0x1b were right. +0x08 is kept as it was (its meaning is not known here).
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;

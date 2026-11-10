@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -250,8 +250,16 @@
+ 	bzero(ring[2]->getBytesNoCopy(), ring[2]->getLength());
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_AUDIO_RING * NSEC_PER_SEC / SWEET_AUDIO_RATE, &period);
+ 
+-	OSDictionary *in = sweet_audio_stream(SWEET_AUDIO_IN_STREAM, 1, 0x6d696372 /* 'micr' */);
+-	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, SWEET_AUDIO_OUT_CH, 0x73706b72 /* 'spkr' */);
++	/*
++	 * 0234: terminal types from boot-args too (FourCC as a number), so other device personalities can be tried with
++	 * only a new boot image: e.g. sweetaudiotp=0x6d627573 ('mbus') sweetaudioterm=0x68647068 ('hdph')
++	 * sweetaudiointerm=0x686d6963 ('hmic') for a wired-headset-like device. Defaults as 0228: 'spkr' / 'micr'.
++	 */
++	uint32_t outTerm = 0x73706b72, inTerm = 0x6d696372;     /* 'spkr', 'micr' */
++	(void)PE_parse_boot_argn("sweetaudioterm", &outTerm, sizeof(outTerm));
++	(void)PE_parse_boot_argn("sweetaudiointerm", &inTerm, sizeof(inTerm));
++	OSDictionary *in = sweet_audio_stream(SWEET_AUDIO_IN_STREAM, 1, inTerm);
++	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, SWEET_AUDIO_OUT_CH, outTerm);
+ 	OSArray *ins = in != NULL ? OSArray::withObjects((const OSObject **)&in, 1, 1) : NULL;
+ 	OSArray *outs = out != NULL ? OSArray::withObjects((const OSObject **)&out, 1, 1) : NULL;
+ 	/*
+@@ -309,6 +317,8 @@
+ 	uint32_t tp = 0x6e756c6c;                       /* 'null' */
+ 	(void)PE_parse_boot_argn("sweetaudiotp", &tp, sizeof(tp));
+ 	setProperty("transport type", (unsigned long long)tp, 32);
++	IOLog("SWEET AUDIO: transport %#x, out terminal %#x, in terminal %#x (boot-args sweetaudiotp / sweetaudioterm / "
++	    "sweetaudiointerm)\n", tp, outTerm, inTerm);
+ 	setProperty("input latency", 0ULL, 32);
+ 	setProperty("output latency", 0ULL, 32);
+ 	setProperty("input safety offset", 64ULL, 32);

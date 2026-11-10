@@ -1,0 +1,39 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -63,7 +63,10 @@
+ 	}
+ }
+ 
+-/* one linear PCM format: signed 16-bit packed, interleaved */
++/*
++ * one linear PCM format: signed 16-bit packed, interleaved. 0227: "sample rate" is 32.32 fixed point (CoreAudio's
++ * HALS_IOA2UCDevice::GetStreamInfoByID_CurrentFormat reads a UInt64; research/audio/device-tree-virtualaudio-identities.md)
++ */
+ static OSDictionary *
+ sweet_audio_format(uint32_t channels)
+ {
+@@ -71,7 +74,7 @@
+ 	if (f == NULL) {
+ 		return NULL;
+ 	}
+-	sweet_set_num(f, "sample rate", SWEET_AUDIO_RATE);
++	sweet_set_num(f, "sample rate", (uint64_t)SWEET_AUDIO_RATE << 32);
+ 	sweet_set_num(f, "min sample rate", SWEET_AUDIO_RATE);
+ 	sweet_set_num(f, "max sample rate", SWEET_AUDIO_RATE);
+ 	sweet_set_num(f, "format ID", 0x6c70636d)  /* 'lpcm' */;
+@@ -102,8 +105,14 @@
+ 	sweet_set_num(s, "safety offset", 64);
+ 	sweet_set_num(s, "min sample rate", SWEET_AUDIO_RATE);
+ 	sweet_set_num(s, "max sample rate", SWEET_AUDIO_RATE);
+-	/* the current format both as a dictionary and as the first supported / available one */
++	/*
++	 * the current format both as a dictionary and as the first supported / available one. 0227: CoreAudio reads it
++	 * as "current format" ("there is no current format" with 0226's "format") and wants "starting channel" (UInt32,
++	 * "there is no starting channel number"); channels of each direction start at 1.
++	 */
+ 	s->setObject("format", f);
++	s->setObject("current format", f);
++	sweet_set_num(s, "starting channel", 1);
+ 	s->setObject("supported formats", formats);
+ 	s->setObject("available formats", formats);
+ 	f->release();

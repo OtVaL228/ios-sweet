@@ -62,6 +62,8 @@
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -166,6 +168,22 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/*
+	 * 0190: an app's stderr goes nowhere readable: also into /var/local/gl.log when that file exists (create it,
+	 * mode 666), each line marked with the process, as /var/local/mtl2.log.
+	 */
+	static int file = -2;
+	if (file == -2) {
+		file = open("/var/local/gl.log", O_WRONLY | O_APPEND);
+	}
+	if (file >= 0) {
+		char marked[1100];
+		int m = snprintf(marked, sizeof(marked), "GL[%d %s]: %.*s", getpid(), getprogname(), n, line);
+		if (m > (int)sizeof(marked) - 1) {
+			m = sizeof(marked) - 1;
+		}
+		write(file, marked, (size_t)m);
+	}
 }
 
 static void
@@ -237,7 +255,19 @@ struct image {
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
+	unsigned binds, refills;        /* 0195: for the log of big app surfaces (big_surface()) */
 };
+
+/*
+ * 0195: a surface of an app's full-screen drawable (an EAGL drawable is 2436 x 1125 or 1125 x 2436) that the
+ * window server shows. Angry Birds Classic (landscape): the app presents 60 times a second, backboardd swaps 10-38
+ * times a second, the screen keeps an old picture. These lines say what the window server does with such a surface.
+ */
+static bool
+big_surface(struct image *image)
+{
+	return (size_t)image->width * (size_t)image->height >= 2000000 && !image->target;
+}
 
 struct eagl {
 	void *table[SLOTS];             /* [0] is the context itself: what every entry gets as its first argument */
@@ -1170,10 +1200,24 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		e->bound[e->unit] = texture;
 	}
-	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
-	    image->wrapped && !image->painted && surface_changed(e, image))) {
-		surface_to_texture(e, image);
+	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL) {
+		bool refill = !image->shared &&
+		    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
+		    image->wrapped && !image->painted && surface_changed(e, image));
+		if (refill) {
+			surface_to_texture(e, image);
+		}
+		if (big_surface(image)) {
+			image->refills += refill;
+			if (++image->binds == 1 || image->binds == 30 || image->binds % 600 == 0) {
+				static unsigned bind_said;
+				if (bind_said++ < 80) {
+					say("redwood-gl: big surface %u (texture %u, %s): bound %u times, refilled %u, seed %u (last copied %u), "
+					    "frame %u\n", IOSurfaceGetID(image->surface), texture, image->shared ? "shared" : "copy",
+					    image->binds, image->refills, IOSurfaceGetSeed(image->surface), image->seed, e->frames);
+				}
+			}
+		}
 	}
 	EAGL_LEAVE(e, 0x30);
 }
@@ -3317,10 +3361,37 @@ my_glCreateShader(void *context, GLenum type)
  * CoreAnimation does not ask whether its shaders compiled. Here it is asked, and what the
  * compiler said is written down with the shader's text.
  */
+static bool in_window_server = true;    /* 0192: set by install(); false in an app */
+
 static void
 my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *const *strings, const GLint *lengths)
 {
 	struct eagl *e = context;
+
+	/*
+	 * 0192: an app's shaders go to the library as they are. The rewriting below is for CoreAnimation's, which have no
+	 * #version line; an app's begin with "#version 100" (Cut the Rope), and what was put ahead of it made every one
+	 * fail ("#version must appear on the first line"). A context of OpenGL ES 3.2 compiles GLSL ES 1.00 itself.
+	 */
+	if (!in_window_server) {
+		size_t total = 1;
+		char *copy;
+
+		EAGL_ENTER(e, 0x12a0);
+		for (GLsizei i = 0; i < count; i++) {
+			total += lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
+		}
+		if ((copy = calloc(1, total)) != NULL) {
+			for (GLsizei i = 0; i < count; i++) {
+				strncat(copy, strings[i], lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]));
+			}
+			free((void *)e->sources[shader % 64]);
+			e->sources[shader % 64] = copy;         /* for the log, should it not compile */
+		}
+		glShaderSource(shader, count, strings, lengths);
+		EAGL_LEAVE(e, 0x12a0);
+		return;
+	}
 	bool fragment = e->fragment[shader % 64], fetch;
 	const GLchar *parts[6] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "",
 		                   full_precision ? all_highp : "" };
@@ -3367,7 +3438,7 @@ say_long(const char *what, const char *text)
 {
 	say("redwood-gl: %s:\n", what);
 	for (size_t at = 0, length = strlen(text); at < length; at += 900) {
-		write(2, text + at, length - at < 900 ? length - at : 900);
+		say("%.*s", (int)(length - at < 900 ? length - at : 900), text + at);       /* 0192: say(): also gl.log */
 	}
 	say("\n");
 }
@@ -3451,7 +3522,8 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 		say("redwood-gl: no context of API %lu\n", api);
 		return nil;
 	}
-	if ((e->gl = redwood_gl_create((int)api)) == NULL || !redwood_gl_make_current(e->gl)) {
+	/* 0190: an app's OpenGL ES 2 context is made a 3 underneath (the present uses glBlitFramebuffer); it is told 2 */
+	if ((e->gl = redwood_gl_create(api < 3 ? 3 : (int)api)) == NULL || !redwood_gl_make_current(e->gl)) {
 		say("redwood-gl: %s gives no OpenGL ES %lu context\n", redwood_gl_library(), api);
 		free(e);
 		return nil;
@@ -3539,6 +3611,16 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
+	}
+	if (big_surface(image)) {
+		static unsigned big_said;
+		if (big_said++ < 60) {
+			say("redwood-gl: big surface %u ('%.4s' %zu x %zu, seed %u) as texture %d: %d x %d, format %#x/%#x%s%s: %s\n",
+			    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) },
+			    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetSeed(surface), texture, width, height,
+			    image->format, image->type, invert ? ", inverted" : "", image->alpha_first ? ", alpha first" : "",
+			    image->shared ? "its own memory (shared)" : "a copy");
+		}
 	}
 	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
@@ -3698,6 +3780,331 @@ display_waits(void)
 	return waits;
 }
 
+/* ---- 0190: OpenGL ES for apps: CAEAGLLayer ------------------------------------------------------------
+ *
+ * In an app (libsweet-gl.dylib loaded by an LC_LOAD_DYLIB of the app's executable, tools/insert-dylib.py) an
+ * EAGLContext draws into a renderbuffer whose storage comes from its CAEAGLLayer
+ * (-renderbufferStorage:fromDrawable:), and -presentRenderbuffer: puts it on the screen. Here the renderbuffer is an
+ * ordinary one of Mesa's, of the layer's size in pixels; three IOSurfaces of that size are textures of their own
+ * memory (redwood_gl_surface_texture); a present copies the renderbuffer into the next of them on the GPU, upside
+ * down (OpenGL's rows go up, a surface's down), waits for the GPU and makes that surface the layer's contents.
+ * Cut the Rope Experiments and Angry Birds Classic draw this way (white screen / "Failed to create EAGLContext").
+ */
+#ifndef GL_RENDERBUFFER
+#define GL_RENDERBUFFER                 0x8D41
+#endif
+#ifndef GL_RENDERBUFFER_BINDING
+#define GL_RENDERBUFFER_BINDING         0x8CA7
+#endif
+#ifndef GL_RGBA8
+#define GL_RGBA8                        0x8058
+#endif
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER             0x8CA8
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER
+#define GL_DRAW_FRAMEBUFFER             0x8CA9
+#endif
+#ifndef GL_READ_FRAMEBUFFER_BINDING
+#define GL_READ_FRAMEBUFFER_BINDING     0x8CAA
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER_BINDING
+#define GL_DRAW_FRAMEBUFFER_BINDING     0x8CA6
+#endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0            0x8CE0
+#endif
+#ifndef GL_FRAMEBUFFER_COMPLETE
+#define GL_FRAMEBUFFER_COMPLETE         0x8CD5
+#endif
+
+#define APP_SURFACES 3
+
+struct app_drawable {
+	struct eagl *e;
+	GLuint renderbuffer;
+	id layer;
+	GLsizei width, height;
+	IOSurfaceRef surface[APP_SURFACES];
+	GLuint texture[APP_SURFACES];
+	unsigned next;
+	unsigned presents;
+};
+static struct app_drawable app_drawables[16];
+static GLuint app_read_fb, app_draw_fb;                 /* framebuffers of ours for the copy */
+static struct eagl *app_fb_owner;
+
+typedef struct {
+	double x, y, width, height;
+} app_rect;
+
+static void
+app_drawable_free(struct app_drawable *d)
+{
+	for (unsigned i = 0; i < APP_SURFACES; i++) {
+		if (d->texture[i] != 0) {
+			glDeleteTextures(1, &d->texture[i]);
+		}
+		if (d->surface[i] != NULL) {
+			CFRelease(d->surface[i]);
+		}
+	}
+	if (d->layer != nil) {
+		((void (*)(id, SEL))objc_msgSend)(d->layer, sel_registerName("release"));
+	}
+	memset(d, 0, sizeof(*d));
+}
+
+static IOSurfaceRef
+app_surface_new(GLsizei width, GLsizei height)
+{
+	int32_t w = width, h = height, bpe = 4, bpr = (width * 4 + 63) & ~63, format = 0x42475241; /* 'BGRA' */
+	int32_t size = bpr * height;
+	CFStringRef keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+		kIOSurfacePixelFormat, kIOSurfaceAllocSize };
+	int32_t values[] = { w, h, bpe, bpr, format, size };
+	CFNumberRef numbers[6];
+	for (unsigned i = 0; i < 6; i++) {
+		numbers[i] = CFNumberCreate(NULL, kCFNumberSInt32Type, &values[i]);
+	}
+	CFDictionaryRef properties = CFDictionaryCreate(NULL, (const void **)keys, (const void **)numbers, 6,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surface = IOSurfaceCreate(properties);
+	CFRelease(properties);
+	for (unsigned i = 0; i < 6; i++) {
+		CFRelease(numbers[i]);
+	}
+	return surface;
+}
+
+static struct app_drawable *
+app_drawable_of(struct eagl *e, GLuint renderbuffer)
+{
+	for (unsigned i = 0; i < sizeof(app_drawables) / sizeof(app_drawables[0]); i++) {
+		if (app_drawables[i].e == e && app_drawables[i].renderbuffer == renderbuffer) {
+			return &app_drawables[i];
+		}
+	}
+	return NULL;
+}
+
+static BOOL
+my_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
+{
+	struct eagl *e = context_of(self);
+	GLint renderbuffer = 0, bound_texture = 0;
+
+	(void)selector;
+	if (e == NULL || drawable == nil || target != GL_RENDERBUFFER) {
+		say("redwood-gl: -renderbufferStorage:%#lx fromDrawable:%p refused\n", target, (void *)drawable);
+		return NO;
+	}
+	eagl_enter(e, 0);
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+	app_rect bounds = ((app_rect (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("bounds"));
+	double scale = ((double (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("contentsScale"));
+	if (scale <= 0) {
+		scale = 1;
+	}
+	GLsizei width = (GLsizei)(bounds.width * scale + 0.5), height = (GLsizei)(bounds.height * scale + 0.5);
+	if (renderbuffer == 0 || width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+		say("redwood-gl: -renderbufferStorage: renderbuffer %d, %dx%d: refused\n", renderbuffer, width, height);
+		return NO;
+	}
+	struct app_drawable *d = app_drawable_of(e, (GLuint)renderbuffer);
+	if (d != NULL) {
+		app_drawable_free(d);           /* the layer changed size: new storage */
+	} else {
+		for (unsigned i = 0; d == NULL && i < sizeof(app_drawables) / sizeof(app_drawables[0]); i++) {
+			if (app_drawables[i].e == NULL) {
+				d = &app_drawables[i];
+			}
+		}
+		if (d == NULL) {
+			say("redwood-gl: -renderbufferStorage: too many drawables\n");
+			return NO;
+		}
+	}
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+	d->e = e;
+	d->renderbuffer = (GLuint)renderbuffer;
+	d->width = width;
+	d->height = height;
+	d->layer = ((id (*)(id, SEL))objc_msgSend)(drawable, sel_registerName("retain"));
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_texture);
+	for (unsigned i = 0; i < APP_SURFACES; i++) {
+		d->surface[i] = app_surface_new(width, height);
+		glGenTextures(1, &d->texture[i]);
+		glBindTexture(GL_TEXTURE_2D, d->texture[i]);
+		if (d->surface[i] == NULL || !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(d->surface[i]))) {
+			say("redwood-gl: -renderbufferStorage: surface %u of %dx%d cannot be a texture of its own memory\n", i,
+			    width, height);
+			glBindTexture(GL_TEXTURE_2D, (GLuint)bound_texture);
+			app_drawable_free(d);
+			return NO;
+		}
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound_texture);
+	say("redwood-gl: an app's drawable: renderbuffer %d, %dx%d pixels (scale %.1f), %d surfaces %u %u %u\n", renderbuffer,
+	    width, height, scale, APP_SURFACES, IOSurfaceGetID(d->surface[0]), IOSurfaceGetID(d->surface[1]),
+	    IOSurfaceGetID(d->surface[2]));
+	return YES;
+}
+
+static BOOL
+my_presentRenderbuffer(id self, SEL selector, unsigned long target)
+{
+	struct eagl *e = context_of(self);
+	GLint renderbuffer = 0, read_fb = 0, draw_fb = 0;
+	GLboolean scissor;
+
+	(void)selector;
+	if (e == NULL || target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	eagl_enter(e, 0);
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
+	struct app_drawable *d = app_drawable_of(e, (GLuint)renderbuffer);
+	if (d == NULL) {
+		static unsigned said;
+		if (said++ < 5) {
+			say("redwood-gl: -presentRenderbuffer: renderbuffer %d has no drawable\n", renderbuffer);
+		}
+		return NO;
+	}
+	if (app_fb_owner != e) {                /* framebuffers belong to a context */
+		app_fb_owner = e;
+		glGenFramebuffers(1, &app_read_fb);
+		glGenFramebuffers(1, &app_draw_fb);
+	}
+	unsigned i = d->next;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fb);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
+	scissor = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, app_read_fb);
+	glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d->renderbuffer);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, app_draw_fb);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->texture[i], 0);
+	if (d->presents == 0) {
+		say("redwood-gl: first present of renderbuffer %d: read %#x draw %#x\n", d->renderbuffer,
+		    glCheckFramebufferStatus(GL_READ_FRAMEBUFFER), glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+	}
+	/* upside down: the renderbuffer's row 0 is the bottom, the surface's the top */
+	glBlitFramebuffer(0, 0, d->width, d->height, 0, d->height, d->width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_fb);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_fb);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glFinish();                             /* the surface is complete before the layer shows it */
+	/*
+	 * 0194: the GPU wrote the surface: move its seed, as every other GPU write here does, so a window server
+	 * that keeps a copy of it (rather than sharing its memory) sees that it changed.
+	 */
+	if (IOSurfaceLock(d->surface[i], 0, NULL) == 0) {
+		IOSurfaceUnlock(d->surface[i], 0, NULL);
+	}
+	Class transaction = objc_getClass("CATransaction");
+	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("begin"));
+	((void (*)(id, SEL, BOOL))objc_msgSend)((id)transaction, sel_registerName("setDisableActions:"), YES);
+	((void (*)(id, SEL, id))objc_msgSend)(d->layer, sel_registerName("setContents:"), (id)d->surface[i]);
+	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("commit"));
+	/*
+	 * 0194: flush on the main thread too. On the main thread the commit above is nested in the run loop's implicit
+	 * transaction, which CoreAnimation commits when the run loop goes round in a common mode. A game that runs its
+	 * own loop on the main thread (Angry Birds Classic: presents kept counting, the screen showed one frame per
+	 * unlock) never lets it: its frames never left the app. Real EAGL hands frames to the render server directly.
+	 * If this regresses Cut the Rope (it presents from a display link), go back to flushing off the main thread only.
+	 */
+	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("flush"));
+	d->next = (i + 1) % APP_SURFACES;
+	if (++d->presents == 1 || d->presents % 600 == 0) {
+		CFStringRef mode = CFRunLoopCopyCurrentMode(CFRunLoopGetCurrent());
+		char mode_name[96] = "none";
+		if (mode != NULL) {
+			CFStringGetCString(mode, mode_name, sizeof(mode_name), kCFStringEncodingUTF8);
+			CFRelease(mode);
+		}
+		say("redwood-gl: present %u of renderbuffer %d (surface %u), %s thread, run loop mode %s\n", d->presents,
+		    d->renderbuffer, IOSurfaceGetID(d->surface[i]), pthread_main_np() ? "main" : "other", mode_name);
+	}
+	return YES;
+}
+
+static BOOL
+my_presentRenderbufferAtTime(id self, SEL selector, unsigned long target, double when)
+{
+	(void)when;
+	return my_presentRenderbuffer(self, selector, target);
+}
+
+/* -initWithAPI: and -initWithAPI:sharegroup: of an app: the same context as -initWithAPI:properties: (no sharing) */
+static id
+my_initWithAPIOnly(id self, SEL selector, unsigned long api)
+{
+	return my_initWithAPI(self, selector, api, nil);
+}
+
+static id
+my_initWithAPISharegroup(id self, SEL selector, unsigned long api, id sharegroup)
+{
+	if (sharegroup != nil) {
+		say("redwood-gl: -initWithAPI:%lu sharegroup: given: not shared here (objects of the other context are not seen)\n", api);
+	}
+	return my_initWithAPI(self, selector, api, nil);
+}
+
+/*
+ * 0191: an app calls the gl* functions OpenGLES.framework exports, which find their context in OpenGLES's own state
+ * (set by +[EAGLContext setCurrentContext:] from a context made by iOS's -init), not through our table: every call
+ * went nowhere (Cut the Rope: the renderbuffer bound read 0). Here +setCurrentContext: also makes the context ours
+ * for the thread, and libsweet-glapp.dylib (gpu/glapp.c) interposes those gl* functions with ones that call this
+ * thread's table (sweet_gl_current_table()).
+ */
+static __thread struct eagl *app_current;
+static IMP original_setCurrentContext, original_currentContext;
+
+__attribute__((visibility("default"))) void **sweet_gl_current_table(void);
+__attribute__((visibility("default"))) void **
+sweet_gl_current_table(void)
+{
+	struct eagl *e = app_current;
+	if (e == NULL) {
+		return NULL;
+	}
+	if (current != e) {
+		eagl_enter(e, 0);
+	}
+	return e->table;
+}
+
+static BOOL
+my_setCurrentContext(id self, SEL selector, id context)
+{
+	struct eagl *e = context != nil ? context_of(context) : NULL;
+	BOOL ok = YES;
+
+	if (original_setCurrentContext != NULL) {
+		ok = ((BOOL (*)(id, SEL, id))original_setCurrentContext)(self, selector, context);
+	}
+	app_current = e;
+	if (e != NULL) {
+		eagl_enter(e, 0);
+		ok = YES;
+	}
+	return ok;
+}
+
+static id
+my_currentContext(id self, SEL selector)
+{
+	if (app_current != NULL) {
+		return app_current->object;
+	}
+	return original_currentContext != NULL ? ((id (*)(id, SEL))original_currentContext)(self, selector) : nil;
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -3712,6 +4119,13 @@ install(void)
 		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:", (IMP)my_texImageIOSurface },
 		{ "attachImage:toCoreSurface:invertedRender:", (IMP)my_attachImage },
 		{ "dealloc", (IMP)my_dealloc },
+		/* 0190: apps */
+		{ "initWithAPI:", (IMP)my_initWithAPIOnly },
+		{ "initWithAPI:sharegroup:", (IMP)my_initWithAPISharegroup },
+		{ "renderbufferStorage:fromDrawable:", (IMP)my_renderbufferStorage },
+		{ "presentRenderbuffer:", (IMP)my_presentRenderbuffer },
+		{ "presentRenderbuffer:atTime:", (IMP)my_presentRenderbufferAtTime },
+		{ "presentRenderbuffer:afterMinimumDuration:", (IMP)my_presentRenderbufferAtTime },
 	};
 	Class class = objc_getClass("EAGLContext");
 	unsigned replaced = 0;
@@ -3798,9 +4212,16 @@ install(void)
 		say("redwood-gl: this program has no EAGLContext: nothing to do\n");
 		return;
 	}
+	/* 0190: the app methods (the entries after -dealloc) are not replaced in the window server */
+	bool window_server = strcmp(getprogname(), "backboardd") == 0;
+	in_window_server = window_server;
 	for (unsigned i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
 		SEL selector = sel_registerName(methods[i].name);
 		Method method = class_getInstanceMethod(class, selector);
+
+		if (window_server && i >= 7) {
+			continue;
+		}
 
 		if (method == NULL) {
 			say("redwood-gl: EAGLContext has no -%s\n", methods[i].name);
@@ -3814,6 +4235,19 @@ install(void)
 			method_setImplementation(method, methods[i].ours);
 		}
 		replaced++;
+	}
+	if (!window_server) {
+		/* 0191: the class methods that say which context is the thread's */
+		Method set = class_getClassMethod(class, sel_registerName("setCurrentContext:"));
+		Method get = class_getClassMethod(class, sel_registerName("currentContext"));
+		if (set != NULL) {
+			original_setCurrentContext = method_setImplementation(set, (IMP)my_setCurrentContext);
+		}
+		if (get != NULL) {
+			original_currentContext = method_setImplementation(get, (IMP)my_currentContext);
+		}
+		say("redwood-gl: +[EAGLContext setCurrentContext:] %s, +currentContext %s\n", set ? "ours" : "missing",
+		    get ? "ours" : "missing");
 	}
 	say("redwood-gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
 	    sizeof(methods) / sizeof(methods[0]), redwood_gl_library());

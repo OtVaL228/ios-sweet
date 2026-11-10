@@ -1,0 +1,135 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -39,6 +39,11 @@
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
++#include <mach/message.h>
++
++/* 0230: as IOUserClient.cpp sends its async replies */
++extern "C" kern_return_t mach_msg_send_from_kernel_with_options(mach_msg_header_t *msg, mach_msg_size_t send_size,
++    mach_msg_option_t option, mach_msg_timeout_t timeout_val);
+ 
+ #define SWEET_AUDIO_RATE        48000u
+ #define SWEET_AUDIO_RING        4096u           /* frames per ring pass: 85.3 ms */
+@@ -357,6 +362,9 @@
+ 	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	bool started;
++	mach_port_t notifyPort;                 /* 0230: from registerNotificationPort */
++	uint32_t notifyRef;
++	void notify(uint32_t type, uint32_t arg0);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient);
+@@ -376,16 +384,73 @@
+ 	if (started && sweet_audio != NULL) {
+ 		sweet_audio->stopIO();
+ 	}
++	if (notifyPort != MACH_PORT_NULL) {
++		releaseNotificationPort(notifyPort);
++		notifyPort = MACH_PORT_NULL;
++	}
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * 0230: IOAudio2 notifications, as the HAL's receive handler parses them (research/audio/coreaudio-ioa2-client-
++ * contract.md): 24-byte Mach header, refCon (4 bytes) at 0x18, event count (4) at 0x1c, then 32-byte events from
++ * 0x20: ID (4), FourCC type (4), 24-byte payload. A real driver sends 'conf' after a configuration change (the HAL
++ * hands it back unchanged with selector 3), 'goin' after start and 'halt' after stop. 0226-0229 sent none, and the
++ * HAL looped: set format, 2 s, StopIOProcID, "CAException ... ProcessRoute: 'what'", never starting IO.
++ */
++struct sweet_audio_event {
++	uint32_t id;
++	uint32_t type;
++	uint32_t arg[6];
++};
++struct sweet_audio_msg {
++	mach_msg_header_t header;
++	uint32_t refCon;
++	uint32_t count;
++	struct sweet_audio_event event;
++};
++
++static uint32_t sweet_audio_notes_logged;
++
++void
++IOAudio2DeviceUserClient::notify(uint32_t type, uint32_t arg0)
++{
++	if (notifyPort == MACH_PORT_NULL) {
++		return;
++	}
++	struct sweet_audio_msg m;
++	bzero(&m, sizeof(m));
++	m.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
++	m.header.msgh_size = sizeof(m);
++	m.header.msgh_remote_port = notifyPort;
++	m.header.msgh_local_port = MACH_PORT_NULL;
++	m.header.msgh_id = 0;
++	m.refCon = notifyRef;
++	m.count = 1;
++	m.event.id = 0;
++	m.event.type = type;
++	m.event.arg[0] = arg0;
++	kern_return_t kr = mach_msg_send_from_kernel_with_options(&m.header, sizeof(m), MACH_SEND_TIMEOUT, MACH_MSG_TIMEOUT_NONE);
++	if (sweet_audio_notes_logged < 40) {
++		IOLog("SWEET AUDIO: sent '%c%c%c%c' (arg %u) -> %#x\n", (char)(type >> 24), (char)(type >> 16), (char)(type >> 8),
++		    (char)type, arg0, kr);
++		sweet_audio_notes_logged++;
++	}
++}
++
+ IOReturn
+-IOAudio2DeviceUserClient::registerNotificationPort(__unused mach_port_t port, UInt32 type, __unused io_user_reference_t refCon)
++IOAudio2DeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
+ {
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AUDIO: %s notification port type %u (accepted; no notifications are sent)\n", name, type);
++	if (notifyPort != MACH_PORT_NULL && notifyPort != port) {
++		releaseNotificationPort(notifyPort);
++	}
++	notifyPort = port;
++	notifyRef = (uint32_t)refCon;
++	IOLog("SWEET AUDIO: %s notification port type %u refCon %#llx (0230: conf / goin / halt are sent)\n", name, type,
++	    (unsigned long long)refCon);
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -445,6 +510,14 @@
+ 			IOLog("SWEET AUDIO: %s set format stream %llu: rate bits %#llx fmt %#x flags %#x %u B/frame %u ch %u bits\n",
+ 			    name, args->scalarInputCount ? args->scalarInput[0] : 0ULL, rate, fmt, flags, bpf, ch, bits);
+ 		}
++		notify(0x636f6e66 /* 'conf' */, args->scalarInputCount ? (uint32_t)args->scalarInput[0] : 0);
++		break;
++	case 3:         /* 0230: the HAL acknowledges a 'conf' */
++		IOLog("SWEET AUDIO: %s config change ack (%u bytes)\n", name, args->structureInputSize);
++		break;
++	case 6:         /* 0230: stream active */
++		IOLog("SWEET AUDIO: %s stream %llu active %llu\n", name, args->scalarInputCount ? args->scalarInput[0] : 0ULL,
++		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL);
+ 		break;
+ 	case 10:        /* start IO */
+ 		if (sweet_audio != NULL) {
+@@ -452,6 +525,7 @@
+ 			started = true;
+ 		}
+ 		IOLog("SWEET AUDIO: %s start IO (flags %#llx)\n", name, args->scalarInputCount ? args->scalarInput[0] : 0ULL);
++		notify(0x676f696e /* 'goin' */, 0);
+ 		break;
+ 	case 11:        /* stop IO */
+ 		if (sweet_audio != NULL && started) {
+@@ -459,8 +533,9 @@
+ 			started = false;
+ 		}
+ 		IOLog("SWEET AUDIO: %s stop IO (flags %#llx)\n", name, args->scalarInputCount ? args->scalarInput[0] : 0ULL);
+-		break;
+-	default:        /* 3 config ack, 6 stream active, anything else: accepted */
++		notify(0x68616c74 /* 'halt' */, 0);
++		break;
++	default:        /* anything else: accepted */
+ 		break;
+ 	}
+ 	if (selector >= 64 || !(sweet_audio_logged & (1ULL << selector))) {

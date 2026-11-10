@@ -1,0 +1,96 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -33,6 +33,8 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSString.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
+ #include <kern/thread_call.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+@@ -126,6 +128,7 @@
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 
+ 	IOBufferMemoryDescriptor *status;
+ 	IOBufferMemoryDescriptor *ring[3];      /* by stream ID (1 input, 2 output) */
+@@ -293,6 +296,55 @@
+ 	return true;
+ }
+ 
++/*
++ * 0229: CoreAudio writes registry properties (HALB_UCObject::SetProperty -> IORegistryEntrySetCFProperties); the
++ * IOService default answers kIOReturnUnsupported, and VirtualAudio then dropped the device: "Could not add
++ * PhysicalDevice ID: 33 UID: SweetBuiltInAudio. Reason: CAException (-536870201)" (2026-11-10). Accept every key,
++ * keep it as a property of the object written to, log the first 24 writes.
++ */
++static uint32_t sweet_audio_setprops_logged;
++
++static IOReturn
++sweet_audio_set_properties(IORegistryEntry *entry, const char *what, OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (it == NULL) {
++		return kIOReturnNoMemory;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSObject *value = dict->getObject(key);
++		if (sweet_audio_setprops_logged < 24) {
++			OSNumber *n = OSDynamicCast(OSNumber, value);
++			OSString *s = OSDynamicCast(OSString, value);
++			if (n != NULL) {
++				IOLog("SWEET AUDIO: %s sets %s property \"%s\" = %llu (%#llx)\n", name, what, key->getCStringNoCopy(),
++				    n->unsigned64BitValue(), n->unsigned64BitValue());
++			} else {
++				IOLog("SWEET AUDIO: %s sets %s property \"%s\" = %s\n", name, what, key->getCStringNoCopy(),
++				    s != NULL ? s->getCStringNoCopy() : value != NULL ? value->getMetaClass()->getClassName() : "null");
++			}
++			sweet_audio_setprops_logged++;
++		}
++		if (value != NULL) {
++			entry->setProperty(key, value);
++		}
++	}
++	it->release();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOAudio2Device::setProperties(OSObject *properties)
++{
++	return sweet_audio_set_properties(this, "device", properties);
++}
++
+ class IOAudio2DeviceUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOAudio2DeviceUserClient);
+ 
+@@ -303,6 +351,7 @@
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	bool started;
+ };
+ 
+@@ -310,6 +359,12 @@
+ 
+ static uint64_t sweet_audio_logged;     /* selectors already logged (< 64) */
+ static uint32_t sweet_audio_maps_logged;
++
++IOReturn
++IOAudio2DeviceUserClient::setProperties(OSObject *properties)
++{
++	return sweet_audio_set_properties(this, "user client", properties);
++}
+ 
+ IOReturn
+ IOAudio2DeviceUserClient::clientClose(void)

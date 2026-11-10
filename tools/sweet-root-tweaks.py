@@ -26,7 +26,8 @@ screen (image versions v8-v14 in NOTES.md):
                   (userland/autorun) at boot; com.apple.backboardd runs
                   /usr/libexec/sweet-bbd (userland/bbd), which execs the real
                   backboardd with our library in DYLD_INSERT_LIBRARIES;
-                  guacamole: com.sweet.wland (Wi-Fi, /var/local/bin/wland up 0)
+                  guacamole: com.sweet.wland (Wi-Fi, /var/local/bin/wland up 0),
+                  com.sweet.btbridge (Bluetooth, retried until Wi-Fi is up)
                   and com.sweet.sshd (the rootless Procursus bootstrap's sshd in
                   /var/jb), both RunAtLoad, so Wi-Fi and SSH come up on every
                   boot without a SWEETBOX autorun.sh
@@ -91,6 +92,39 @@ NET_JOBS = {
         'POSIXSpawnType': 'Interactive',
         'StandardOutPath': '/var/local/wland.out',
         'StandardErrorPath': '/var/local/wland.out',
+    },
+    # 0202: each container's signing identity -> its path, for the kernel's Sandbox stand-in (extensions need it)
+    '/System/Library/LaunchDaemons/com.sweet.containers.plist': {
+        'Label': 'com.sweet.containers',
+        'ProgramArguments': ['/var/local/bin/sweet-containers'],
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/containers.out',
+        'StandardErrorPath': '/var/local/containers.out',
+    },
+    # brightness slider / Night Shift through the display controller's colour stage (userland/jb/sweet-displayd.m)
+    '/System/Library/LaunchDaemons/com.sweet.displayd.plist': {
+        'Label': 'com.sweet.displayd',
+        'ProgramArguments': ['/var/local/bin/sweet-displayd'],
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/displayd.out',
+        'StandardErrorPath': '/var/local/displayd.out',
+    },
+    # Bluetooth (userland/bt/btbridge): needs wland's rails, so it may fail while Wi-Fi comes up; KeepAlive retries
+    # every 10 s. One instance only (it takes /var/run/btbridge.lock): to run it by hand with packet logging, first
+    # `launchctl bootout system/com.sweet.btbridge`.
+    '/System/Library/LaunchDaemons/com.sweet.btbridge.plist': {
+        'Label': 'com.sweet.btbridge',
+        'ProgramArguments': ['/var/local/bin/btbridge', '-q'],
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'ThrottleInterval': 10,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/btbridge.out',
+        'StandardErrorPath': '/var/local/btbridge.out',
     },
     '/System/Library/LaunchDaemons/com.sweet.sshd.plist': {
         'Label': 'com.sweet.sshd',

@@ -1,0 +1,81 @@
+--- a/bsd/dev/sweet_btuart.c
++++ b/bsd/dev/sweet_btuart.c
+@@ -5,6 +5,7 @@
+  * BlueTool (and bluetoothd) reach a D22's Bluetooth over PF_SYSTEM/SYSPROTO_CONTROL "com.apple.uart.bluetooth"
+  * (research/bluetooth/transport.md: socket(32, 1, 2), CTLIOCGINFO, connect unit 0; then termios as socket options
+  * at level 2: getsockopt 0x40487413 / setsockopt 0x80487414, 0x48 bytes = struct termios; H4 bytes as a stream).
++ * bluetoothd's stack (transport H4BC) opens "com.apple.uart.sk.bluetooth" instead: registered too, same handling.
+  * Here the controller is the WCN3998 behind QUP wrapper 2 SE3, driven from userland by btbridge over /dev/pmem
+  * (userland/bt/btbridge.c), which connects to the privileged control "com.sweet.bt.host". Bytes sent by the iOS
+  * side go to the bridge and the bridge's go to the iOS side (the most recent iOS connection; BlueTool and
+@@ -28,7 +29,8 @@
+ static LCK_GRP_DECLARE(sweet_bt_grp, "sweet_bt");
+ static LCK_MTX_DECLARE(sweet_bt_lock, &sweet_bt_grp);
+ 
+-static kern_ctl_ref sweet_bt_ios_ref, sweet_bt_host_ref;
++static kern_ctl_ref sweet_bt_ios_ref, sweet_bt_sk_ref, sweet_bt_host_ref;
++static kern_ctl_ref sweet_bt_ios_cur;      /* the control of the latest iOS connection (BlueTool or bluetoothd) */
+ static u_int32_t sweet_bt_ios_unit, sweet_bt_host_unit;        /* 0: not connected */
+ static struct termios sweet_bt_termios;
+ static uint64_t sweet_bt_to_host, sweet_bt_to_ios, sweet_bt_lost;
+@@ -40,7 +42,7 @@
+ 	char buf[512];
+ 	size_t len = mbuf_pkthdr_len(m), off = 0;
+ 	lck_mtx_lock(&sweet_bt_lock);
+-	kern_ctl_ref ref = to_host ? sweet_bt_host_ref : sweet_bt_ios_ref;
++	kern_ctl_ref ref = to_host ? sweet_bt_host_ref : sweet_bt_ios_cur;
+ 	u_int32_t unit = to_host ? sweet_bt_host_unit : sweet_bt_ios_unit;
+ 	lck_mtx_unlock(&sweet_bt_lock);
+ 	while (off < len) {
+@@ -61,22 +63,24 @@
+ }
+ 
+ static errno_t
+-sweet_bt_ios_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **info)
++sweet_bt_ios_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **info)
+ {
+ 	char who[32] = "";
+ 	proc_selfname(who, sizeof(who));
+ 	lck_mtx_lock(&sweet_bt_lock);
+ 	sweet_bt_ios_unit = sac->sc_unit;
+-	lck_mtx_unlock(&sweet_bt_lock);
+-	printf("SWEET BT: %s connected (unit %u)%s\n", who, sac->sc_unit, sweet_bt_host_unit ? "" : "; no bridge yet");
+-	return 0;
+-}
+-
+-static errno_t
+-sweet_bt_ios_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *info)
+-{
+-	lck_mtx_lock(&sweet_bt_lock);
+-	if (sweet_bt_ios_unit == unit) {
++	sweet_bt_ios_cur = ref;
++	lck_mtx_unlock(&sweet_bt_lock);
++	printf("SWEET BT: %s connected to %s (unit %u)%s\n", who, ref == sweet_bt_sk_ref ? "uart.sk" : "uart", sac->sc_unit,
++	    sweet_bt_host_unit ? "" : "; no bridge yet");
++	return 0;
++}
++
++static errno_t
++sweet_bt_ios_disconnect(kern_ctl_ref ref, u_int32_t unit, __unused void *info)
++{
++	lck_mtx_lock(&sweet_bt_lock);
++	if (sweet_bt_ios_unit == unit && sweet_bt_ios_cur == ref) {
+ 		sweet_bt_ios_unit = 0;
+ 	}
+ 	lck_mtx_unlock(&sweet_bt_lock);
+@@ -189,8 +193,14 @@
+ 		.ctl_disconnect = sweet_bt_host_disconnect,
+ 		.ctl_send = sweet_bt_host_send,
+ 	};
++	/* bluetoothd's own transport (H4BC: "ioctl(CTLIOCGINFO, com.apple.uart.sk.bluetooth) failed", fatal error 1201):
++	 * a second name for the same iOS side; BlueTool's boot script uses the first, the stack this one */
++	struct kern_ctl_reg sk = ios;
++	strlcpy(sk.ctl_name, "com.apple.uart.sk.bluetooth", sizeof(sk.ctl_name));
+ 	errno_t e1 = ctl_register(&ios, &sweet_bt_ios_ref);
++	errno_t e3 = ctl_register(&sk, &sweet_bt_sk_ref);
+ 	errno_t e2 = ctl_register(&host, &sweet_bt_host_ref);
+-	printf("SWEET BT: kernel controls com.apple.uart.bluetooth (%d) and com.sweet.bt.host (%d)\n", e1, e2);
++	printf("SWEET BT: kernel controls com.apple.uart.bluetooth (%d), com.apple.uart.sk.bluetooth (%d) and "
++	    "com.sweet.bt.host (%d)\n", e1, e3, e2);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

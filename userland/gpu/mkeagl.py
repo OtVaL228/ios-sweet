@@ -23,6 +23,9 @@ import sys
 import xml.etree.ElementTree as ET
 
 slots_path, xml_path, exported_path, source_path = sys.argv[1:5]
+# 0191: optional 5th argument: the gl* names iOS's OpenGLES.framework exports (one a line, no leading underscore);
+# only those get an interposer (a name it lacks would bind elsewhere: Mesa's function of that name)
+ios_exports = set(open(sys.argv[5]).read().split()) if len(sys.argv) > 5 else None
 
 slots = []                                      # (offset, used by QuartzCore, [names])
 for line in open(slots_path):
@@ -147,7 +150,33 @@ for offset in range(8, top, 8):
     emit('\ttable[%#x / 8] = (void *)%s;' % (offset, hand.get(offset, 'slot_%04x' % offset)))
 emit('}')
 emit('#endif')
+# 0191: EAGL_GEN_INTERPOSE (gpu/glapp.c): for every name of an entry the library has a function for (passed on or
+# written by hand), an interposer of OpenGLES.framework's export of that name that calls this thread's table.
+emit('#ifdef EAGL_GEN_INTERPOSE')
+interposed = set()
+for (offset, used, names), (_, name, kind, function) in zip(slots, entries):
+    if kind not in ('pass', 'hand'):
+        continue
+    for n in names:
+        if n in interposed or n not in protos or (ios_exports is not None and n not in ios_exports):
+            continue
+        interposed.add(n)
+        ret, params = protos[n]
+        decl = ', '.join('%s %s' % p for p in params) or 'void'
+        args = ''.join(', ' + p[1] for p in params)
+        types = ''.join(', ' + p[0] for p in params)
+        emit('extern %s %s(%s) __attribute__((weak_import));' % (ret, n, decl))
+        emit('static %s\nglapp_%s(%s)\n{' % (ret, n, decl))
+        emit('\tvoid **table = sweet_gl_current_table();')
+        if ret == 'void':
+            emit('\tif (table != NULL) {\n\t\t((void (*)(void *%s))table[%#x / 8])(table[0]%s);\n\t}\n}' % (types, offset, args))
+        else:
+            emit('\tif (table == NULL) {\n\t\treturn (%s)0;\n\t}' % ret)
+            emit('\treturn ((%s (*)(void *%s))table[%#x / 8])(table[0]%s);\n}' % (ret, types, offset, args))
+        emit('GLAPP_INTERPOSE(glapp_%s, %s);' % (n, n))
+emit('#endif')
 print('\n'.join(out))
+print('mkeagl.py: %d gl* functions interposed for apps' % len(interposed), file=sys.stderr)
 passed = sum(1 for e in entries if e[2] == 'pass')
 missing = [e[1] for e in entries if e[2] == 'none']
 used_missing = [name for (offset, used, names), e in zip(slots, entries) if used and e[2] == 'none' for name in [e[1]]]

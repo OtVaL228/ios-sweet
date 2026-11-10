@@ -230,6 +230,26 @@ def build(seed=None, qemu=False, highmem=False):
             ph(),
             ('device_type', cstr('wlan')),
             ('compatible', cstr('guacamole,wcn3990')),
+        ]),
+        # --guacamole Bluetooth: bluetoothd logs "marconi-bt / bluetooth: Unable to match bluetooth service in device
+        # tree" without the iPhone X's bluetooth node (research/bluetooth/ios-side.md), then opens /dev/cu.bluetooth
+        # or /dev/uart.bluetooth. Properties as D22AP's /arm-io/uart1/bluetooth (compatible bluetooth,n88, 3 Mbaud,
+        # encoding 3, Apple vendor / product IDs, coex 2); local-mac-address is the address itself (iBoot fills it
+        # from syscfg on a real phone), = /chosen mac-address-bluetooth0. It needs an IOService nub, not just a DT
+        # entry: under uart1 (first try, 2026-11-09) bluetoothd still found no service, because SweetPlatformExpert
+        # creates nubs for /arm-io's children only (on an iPhone the UART driver publishes its bluetooth child). So
+        # it sits directly under /arm-io. The controller is the WCN3998 behind QUP wrapper 2 SE3, driven from
+        # userland (userland/bt/).
+        node('bluetooth', [
+            ph(),
+            ('device_type', cstr('bluetooth')),
+            ('compatible', cstr('bluetooth,n88')),
+            ('transport-speed', u32(3000000)),
+            ('transport-encoding', u32(3)),
+            ('vendor-id', u32(0x05ac)),
+            ('product-id', u32(0x12a0)),
+            ('coex', u32(2)),
+            ('local-mac-address', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])),
         ])] if GUACAMOLE else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node

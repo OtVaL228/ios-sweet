@@ -1,0 +1,69 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -88,7 +88,7 @@
+ }
+ 
+ static OSDictionary *
+-sweet_audio_stream(uint32_t id, uint32_t channels)
++sweet_audio_stream(uint32_t id, uint32_t channels, uint32_t terminal)
+ {
+ 	OSDictionary *s = OSDictionary::withCapacity(12);
+ 	OSDictionary *f = sweet_audio_format(channels);
+@@ -113,6 +113,7 @@
+ 	s->setObject("format", f);
+ 	s->setObject("current format", f);
+ 	sweet_set_num(s, "starting channel", 1);
++	sweet_set_num(s, "terminal type", terminal);   /* 0228: 'spkr' / 'micr' (CoreAudio key "terminal type") */
+ 	s->setObject("supported formats", formats);
+ 	s->setObject("available formats", formats);
+ 	f->release();
+@@ -230,11 +231,30 @@
+ 	bzero(ring[2]->getBytesNoCopy(), ring[2]->getLength());
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_AUDIO_RING * NSEC_PER_SEC / SWEET_AUDIO_RATE, &period);
+ 
+-	OSDictionary *in = sweet_audio_stream(SWEET_AUDIO_IN_STREAM, 1);
+-	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, 2);
++	OSDictionary *in = sweet_audio_stream(SWEET_AUDIO_IN_STREAM, 1, 0x6d696372 /* 'micr' */);
++	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, 2, 0x73706b72 /* 'spkr' */);
+ 	OSArray *ins = in != NULL ? OSArray::withObjects((const OSObject **)&in, 1, 1) : NULL;
+ 	OSArray *outs = out != NULL ? OSArray::withObjects((const OSObject **)&out, 1, 1) : NULL;
+-	OSArray *controls = OSArray::withCapacity(1);
++	/*
++	 * 0228: VirtualAudio's codec setup creates "Built-In Speaker" only if the device has the property ('mute',
++	 * 'outp', element 4), "Built-In Receiver" for element 3 (research/audio/devicefactory-codec-addendum.md). CoreAudio
++	 * turns IOAudio2 controls into those properties; keys per codec-controls-addendum.md.
++	 */
++	OSArray *controls = OSArray::withCapacity(2);
++	for (uint32_t el = 3; controls != NULL && el <= 4; el++) {
++		OSDictionary *c = OSDictionary::withCapacity(6);
++		if (c == NULL) {
++			break;
++		}
++		sweet_set_num(c, "control ID", 1000 + el);
++		sweet_set_num(c, "class", 0x6d757465);         /* 'mute' */
++		sweet_set_num(c, "base class", 0x6374726c);    /* 'ctrl' */
++		sweet_set_num(c, "scope", 0x6f757470);         /* 'outp' */
++		sweet_set_num(c, "element", el);
++		sweet_set_num(c, "value", 0);
++		controls->setObject(c);
++		c->release();
++	}
+ 	if (ins != NULL) {
+ 		setProperty("input streams", ins);
+ 	}
+@@ -253,7 +273,14 @@
+ 	setProperty("device name", "Built-In Audio");
+ 	setProperty("clock domain", 1ULL, 32);
+ 	setProperty("io buffer frame size", 512ULL, 32);
+-	setProperty("transport type", 0x626c746eULL, 32)   /* 'bltn' (built-in) */;
++	/*
++	 * 0228: VirtualAudio's DeviceFactory_Aspen has no case for 'bltn' (no device object: listed, never adopted).
++	 * Handled values: null pci thun strk dprt hdmi mbus usb vlri pair blue. Default 'null' (Device_Null_Aspen, after
++	 * which the common codec setup checks the mute elements); boot-arg sweetaudiotp=<32-bit FourCC value> overrides.
++	 */
++	uint32_t tp = 0x6e756c6c;                       /* 'null' */
++	(void)PE_parse_boot_argn("sweetaudiotp", &tp, sizeof(tp));
++	setProperty("transport type", (unsigned long long)tp, 32);
+ 	setProperty("input latency", 0ULL, 32);
+ 	setProperty("output latency", 0ULL, 32);
+ 	setProperty("input safety offset", 64ULL, 32);

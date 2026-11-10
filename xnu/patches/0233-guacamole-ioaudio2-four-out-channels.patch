@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -49,6 +49,12 @@
+ #define SWEET_AUDIO_RING        4096u           /* frames per ring pass: 85.3 ms */
+ #define SWEET_AUDIO_IN_STREAM   1u              /* IOAudio2 convention: 1 input, 2 output */
+ #define SWEET_AUDIO_OUT_STREAM  2u
++/*
++ * 0233: 4 output channels. VirtualAudio's codec setup looks for the HAL properties ('mute','outp', element 4 / 3)
++ * (speaker / receiver); with 2 channels CoreAudio did not turn 0228's mute controls on elements 3 and 4 into those
++ * properties (no "creating a speaker port"; apps then failed with AQMEIO "Error -1 getting output port ID").
++ */
++#define SWEET_AUDIO_OUT_CH      4u
+ 
+ static void
+ sweet_set_num(OSDictionary *d, const char *key, uint64_t v)
+@@ -233,7 +239,7 @@
+ 	ring[SWEET_AUDIO_IN_STREAM] = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared,
+ 	    round_page(SWEET_AUDIO_RING * 2), page_size);
+ 	ring[SWEET_AUDIO_OUT_STREAM] = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared,
+-	    round_page(SWEET_AUDIO_RING * 4), page_size);
++	    round_page(SWEET_AUDIO_RING * 2 * SWEET_AUDIO_OUT_CH), page_size);
+ 	clockCall = thread_call_allocate_with_options(sweet_audio_tick, this, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
+ 	if (sweet_audio_lock == NULL || status == NULL || ring[1] == NULL || ring[2] == NULL || clockCall == NULL) {
+ 		IOLog("SWEET AUDIO: out of memory\n");
+@@ -245,7 +251,7 @@
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_AUDIO_RING * NSEC_PER_SEC / SWEET_AUDIO_RATE, &period);
+ 
+ 	OSDictionary *in = sweet_audio_stream(SWEET_AUDIO_IN_STREAM, 1, 0x6d696372 /* 'micr' */);
+-	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, 2, 0x73706b72 /* 'spkr' */);
++	OSDictionary *out = sweet_audio_stream(SWEET_AUDIO_OUT_STREAM, SWEET_AUDIO_OUT_CH, 0x73706b72 /* 'spkr' */);
+ 	OSArray *ins = in != NULL ? OSArray::withObjects((const OSObject **)&in, 1, 1) : NULL;
+ 	OSArray *outs = out != NULL ? OSArray::withObjects((const OSObject **)&out, 1, 1) : NULL;
+ 	/*
+@@ -261,7 +267,7 @@
+ 		}
+ 		sweet_set_num(c, "control ID", 1000 + el);
+ 		sweet_set_num(c, "class", 0x6d757465);         /* 'mute' */
+-		sweet_set_num(c, "base class", 0x6374726c);    /* 'ctrl' */
++		sweet_set_num(c, "base class", 0x746f676c);    /* 0233: 'togl' (boolean: mute's base class), was 'ctrl' */
+ 		sweet_set_num(c, "scope", 0x6f757470);         /* 'outp' */
+ 		sweet_set_num(c, "element", el);
+ 		sweet_set_num(c, "value", 0);
+@@ -310,8 +316,9 @@
+ 	setProperty(kIOUserClientClassKey, "IOAudio2DeviceUserClient");
+ 	sweet_audio = this;
+ 	registerService();
+-	IOLog("SWEET AUDIO: IOAudio2Device \"SweetBuiltInAudio\" registered (silent: %u Hz, out stream %u 2 ch, in stream %u "
+-	    "1 ch, s16, ring %u frames)\n", SWEET_AUDIO_RATE, SWEET_AUDIO_OUT_STREAM, SWEET_AUDIO_IN_STREAM, SWEET_AUDIO_RING);
++	IOLog("SWEET AUDIO: IOAudio2Device \"SweetBuiltInAudio\" registered (silent: %u Hz, out stream %u %u ch, in stream %u "
++	    "1 ch, s16, ring %u frames)\n", SWEET_AUDIO_RATE, SWEET_AUDIO_OUT_STREAM, SWEET_AUDIO_OUT_CH, SWEET_AUDIO_IN_STREAM,
++	    SWEET_AUDIO_RING);
+ 	return true;
+ }
+ 

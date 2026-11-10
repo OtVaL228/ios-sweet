@@ -1,0 +1,210 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -153,6 +153,100 @@
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ static uint32_t sweet_fb_vsync_us = SWEET_FB_VSYNC_US; /* adjustable synthetic display tick */
++/*
++ * 0198: the panel's own refresh. The OnePlus 7 Pro's panel runs in DSI command mode and paces itself: the display
++ * controller's INTF1 tear check (0x0ae6b800 + 0x280..) sends a frame each time the panel's TE says so (autorefresh
++ * +0x2b4 = 80000001), measured 16.706-16.712 ms = 59.84-59.86 Hz (vsyncprobe, 2026-11-09). The 60.000 Hz this
++ * driver published made CoreAnimation's own frame clock (it never asks for vsync notifications, 0154) drift one
++ * frame against the panel every ~7 s. At start the line counter (+0x2b0, 0 .. height once a frame) is read for
++ * ~100 ms: the measured period is published (IOMFBDisplayRefresh, modes) and runs the vsync timer, which also keeps
++ * its ticks at the frame's start from then on. Boot-arg sweetfblock=0: as before (60 Hz timer, nothing read).
++ */
++#define SWEET_FB_INTF1_PAGE     0x0ae6b000ull
++#define SWEET_FB_INTF1_OFF      0x800u
++#define SWEET_FB_TE_HEIGHT      0x294u          /* tear check: the frame's lines (0c30 = 3120) */
++#define SWEET_FB_TE_LINE        0x2b0u          /* line counter */
++#define SWEET_FB_TE_AUTOREFRESH 0x2b4u          /* bit 31: autorefresh on */
++static volatile uint32_t *sweet_fb_te;          /* INTF1's registers, mapped for good (NULL: not locked) */
++static uint32_t sweet_fb_te_height;
++static uint64_t sweet_fb_period_ns;             /* measured frame period (0: none) */
++
++static bool
++sweet_fb_measure_refresh(void)
++{
++	uint32_t lock = 1;
++	(void)PE_parse_boot_argn("sweetfblock", &lock, sizeof(lock));
++	if (!lock) {
++		IOLog("SWEET FB: panel refresh not measured (sweetfblock=0)\n");
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_FB_INTF1_PAGE, 0x1000, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++	if (map == NULL) {
++		IOLog("SWEET FB: panel refresh: INTF1 not mapped\n");
++		OSSafeReleaseNULL(md);
++		return false;
++	}
++	volatile uint32_t *te = (volatile uint32_t *)(map->getVirtualAddress() + SWEET_FB_INTF1_OFF);
++	uint32_t height = te[SWEET_FB_TE_HEIGHT / 4] & 0xffff, autorefresh = te[SWEET_FB_TE_AUTOREFRESH / 4];
++	if (!(autorefresh & 0x80000000u) || height < 1000 || height > 4000) {
++		IOLog("SWEET FB: panel refresh: INTF1 tear check not as probed (autorefresh %08x, height %u): 60 Hz\n",
++		    autorefresh, height);
++		map->release();
++		md->release();
++		return false;
++	}
++	/* frame starts = the line counter going back down; 7 of them (~100 ms), at most 300 ms */
++	uint64_t began = mach_absolute_time(), limit, first = 0, last = 0, t;
++	nanoseconds_to_absolutetime(300 * NSEC_PER_MSEC, &limit);
++	unsigned starts = 0;
++	uint32_t prev = te[SWEET_FB_TE_LINE / 4] & 0xffff;
++	while (starts < 7 && (t = mach_absolute_time()) - began < limit) {
++		uint32_t line = te[SWEET_FB_TE_LINE / 4] & 0xffff;
++		if (line + 16 < prev) {
++			if (starts++ == 0) {
++				first = t;
++			}
++			last = t;
++		}
++		prev = line;
++	}
++	uint64_t ns = 0;
++	if (starts >= 3) {
++		absolutetime_to_nanoseconds(last - first, &ns);
++		ns /= starts - 1;
++	}
++	if (ns < 8000000 || ns > 25000000) {       /* 40 - 125 Hz, or nothing */
++		IOLog("SWEET FB: panel refresh: %u frame starts in 300 ms (%llu ns each): 60 Hz\n", starts, ns);
++		map->release();
++		md->release();
++		return false;
++	}
++	sweet_fb_te = te;                       /* md and map stay for good */
++	sweet_fb_te_height = height;
++	sweet_fb_period_ns = ns;
++	IOLog("SWEET FB: panel refresh measured: %llu ns a frame = %llu.%03llu Hz (%u lines, %u frame starts)\n", ns,
++	    1000000000000ull / ns / 1000, 1000000000000ull / ns % 1000, height, starts);
++	return true;
++}
++
++/* 0198: the vsync timer's next timeout, so that it fires at the start of the panel's next frame */
++static uint32_t
++sweet_fb_next_tick_us(void)
++{
++	if (sweet_fb_te == NULL) {
++		return sweet_fb_vsync_us;
++	}
++	uint32_t line = sweet_fb_te[SWEET_FB_TE_LINE / 4] & 0xffff;
++	if (line > sweet_fb_te_height) {
++		line = sweet_fb_te_height;
++	}
++	uint64_t us = (uint64_t)sweet_fb_vsync_us * (sweet_fb_te_height - line) / sweet_fb_te_height;
++	if (us < sweet_fb_vsync_us / 4) {
++		us += sweet_fb_vsync_us;        /* nearly there: the one after (no double tick) */
++	}
++	return (uint32_t)us + 50;               /* just past the start */
++}
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -333,12 +427,20 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	uint32_t vsyncHz = 60;
+-	(void)PE_parse_boot_argn("sweetfb_vsync", &vsyncHz, sizeof(vsyncHz));
++	bool vsyncArg = PE_parse_boot_argn("sweetfb_vsync", &vsyncHz, sizeof(vsyncHz));
+ 	if (vsyncHz < 1 || vsyncHz > 240) {
+ 		vsyncHz = 60;
+ 	}
+ 	sweet_fb_vsync_us = 1000000 / vsyncHz;
+-	IOLog("SWEET FB: synthetic vsync %u Hz (%u us)\n", vsyncHz, sweet_fb_vsync_us);
++	if (sweet_fb_measure_refresh() && !vsyncArg) {   /* 0198 */
++		sweet_fb_vsync_us = (uint32_t)(sweet_fb_period_ns / 1000);
++		IOLog("SWEET FB: vsync from the panel: %u us, at each frame's start\n", sweet_fb_vsync_us);
++	} else {
++		if (vsyncArg) {
++			sweet_fb_te = NULL;     /* the boot-arg's rate: no phase lock to a different panel rate */
++		}
++		IOLog("SWEET FB: synthetic vsync %u Hz (%u us)\n", vsyncHz, sweet_fb_vsync_us);
++	}
+ 	uint32_t presentAtSwap = 1;
+ 	(void)PE_parse_boot_argn("sweetfbatswap", &presentAtSwap, sizeof(presentAtSwap));
+ 	sweet_fb_present_at_swap = presentAtSwap != 0;
+@@ -362,7 +464,7 @@
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+ 	IOLog("SWEET FB: GPU present mode %s\n", sweet_fb_present_at_swap ? "at-swap" : "vsync-only");
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(sweet_fb_vsync_us);
++	fVsync->setTimeoutUS(sweet_fb_next_tick_us());
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	uint32_t scanoutDiag = 0;
+@@ -546,7 +648,7 @@
+ 				bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
+ 			}
+ 		}
+-		sender->setTimeoutUS(sweet_fb_vsync_us);
++		sender->setTimeoutUS(sweet_fb_next_tick_us());   /* 0198 */
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -591,7 +693,7 @@
+ 			fb->fDirty = true;
+ 			IOLockUnlock(fb->fLock);
+ 			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-			sender->setTimeoutUS(sweet_fb_vsync_us);
++			sender->setTimeoutUS(sweet_fb_next_tick_us());   /* 0198 */
+ 			return;
+ 		}
+ 		if (gpu == 0) {
+@@ -614,7 +716,7 @@
+ 			spent = 0;
+ 		}
+ 	}
+-	sender->setTimeoutUS(sweet_fb_vsync_us);
++	sender->setTimeoutUS(sweet_fb_next_tick_us());   /* 0198 */
+ }
+ 
+ void
+@@ -1087,13 +1189,16 @@
+ AppleCLCD::publishRefresh(void)
+ {
+ 	uint32_t hz = 60;
+-	(void)PE_parse_boot_argn("sweetfb_refresh", &hz, sizeof(hz));
++	bool hzArg = PE_parse_boot_argn("sweetfb_refresh", &hz, sizeof(hz));
+ 	if (hz < 1 || hz > 240) {
+ 		hz = 60;
+ 	}
++	/* 0198: the panel's measured period, unless sweetfb_refresh asks for a rate */
++	const uint64_t period_ns = (!hzArg && sweet_fb_period_ns != 0) ? sweet_fb_period_ns : NSEC_PER_SEC / hz;
+ 	uint64_t ticks = 0;
+-	nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &ticks);
+-	const uint64_t interval = (1ULL << 32) / hz;
++	nanoseconds_to_absolutetime(period_ns, &ticks);
++	const uint64_t interval = (period_ns << 32) / NSEC_PER_SEC;
++	const uint64_t rate16 = ((uint64_t)NSEC_PER_SEC << 16) / period_ns;      /* Hz, 16.16 */
+ 	OSDictionary *refresh = OSDictionary::withCapacity(4);
+ 	OSDictionary *timing = OSDictionary::withCapacity(8);
+ 	OSDictionary *horizontal = OSDictionary::withCapacity(4);
+@@ -1120,12 +1225,12 @@
+ 		colors->setObject(color);
+ 		sweet_fb_number(horizontal, "Active", fLogicalW);
+ 		sweet_fb_number(horizontal, "Total", fLogicalW);
+-		sweet_fb_number(horizontal, "SyncRate", (uint64_t)hz << 16);
+-		sweet_fb_number(horizontal, "PreciseSyncRate", (uint64_t)hz << 16);
++		sweet_fb_number(horizontal, "SyncRate", rate16);
++		sweet_fb_number(horizontal, "PreciseSyncRate", rate16);
+ 		sweet_fb_number(vertical, "Active", fLogicalH);
+ 		sweet_fb_number(vertical, "Total", fLogicalH);
+-		sweet_fb_number(vertical, "SyncRate", (uint64_t)hz << 16);
+-		sweet_fb_number(vertical, "PreciseSyncRate", (uint64_t)hz << 16);
++		sweet_fb_number(vertical, "SyncRate", rate16);
++		sweet_fb_number(vertical, "PreciseSyncRate", rate16);
+ 		sweet_fb_number(timing, "ID", 1);
+ 		sweet_fb_number(timing, "Score", 1);
+ 		timing->setObject("IsVirtual", kOSBooleanFalse);
+@@ -1136,8 +1241,8 @@
+ 		timings->setObject(timing);
+ 		setProperty("TimingElements", timings);
+ 		setProperty("ColorElements", colors);
+-		IOLog("SWEET FB: IOMFBDisplayRefresh %u Hz (interval %llu of 2^-32 s, %llu ticks), one %ux%u mode\n", hz,
+-		    interval, ticks, fLogicalW, fLogicalH);
++		IOLog("SWEET FB: IOMFBDisplayRefresh %llu.%03llu Hz (interval %llu of 2^-32 s, %llu ticks), one %ux%u mode\n",
++		    rate16 >> 16, ((rate16 & 0xffff) * 1000) >> 16, interval, ticks, fLogicalW, fLogicalH);
+ 	}
+ 	OSSafeReleaseNULL(refresh);
+ 	OSSafeReleaseNULL(timing);
