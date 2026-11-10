@@ -175,18 +175,45 @@ Branch `guacamole` ports the same kernel and userland to the OnePlus 7 Pro (SM81
 1440×3120 AMOLED). The engineering log, board facts and the GPU bring-up are in
 [`docs/guacamole.md`](docs/guacamole.md).
 
+Status as of **2026-11-10** (details and history: [`docs/guacamole.md`](docs/guacamole.md), `NOTES.md`).
+
+### Works
+
 | Area | State |
 | --- | --- |
 | Boot, CPU | Stock OnePlus ABL → `fastboot boot` of the shim; all 8 cores (4× A55, 3× A76, 1× A76 prime) |
-| Display | 1125×2436 presented, scaled to the 1440×3120 panel, 60 Hz (`sweetfb_hz=60`) |
+| Display | 1125×2436 presented, scaled to the 1440×3120 panel; 90 Hz by default (0199, `sweetfb90=0` for 60 Hz); brightness slider and Night Shift through `sweet-displayd` (0197) |
 | Touch, buttons | Samsung S6SY761 over I²C (QUP SE17); power and volume over SPMI |
 | GPU | Adreno 640 brought up from the kernel (GMU, HFI, zap shader, ring, fences); `RedwoodGPU` user client speaking Linux msm's DRM requests |
-| Graphics | Mesa 25.0.7 freedreno (OpenGL ES 3.2, FD640) behind iOS's `EAGLContext`: CoreAnimation in backboardd renders on the GPU, drawing straight into IOSurfaces |
+| Graphics | OpenGL ES: Mesa 25.0.7 freedreno behind iOS's `EAGLContext`; CoreAnimation in backboardd renders on the GPU. Metal: SweetMetal2 (metal2vulkan + Turnip) for backboardd, WebKit and selected apps (`/var/local/mtl2-clients`) |
+| Apps and games | Stock removable apps, Settings, Photos, Wallet, Safari; sideloaded games such as Subway Surfers and Angry Birds run on the GPU (support varies per game); share sheet and Game Center sign-in sheet appear |
+| Wi-Fi | WPA2-PSK join, DHCP, internet (`userland/wland` over `/dev/pmem`, en0 + Apple80211 for wifid and Settings); starts at boot (`com.sweet.wland`) |
+| Bluetooth | Qualcomm WCN3998 behind iOS's Broadcom-expecting stack via `userland/bt/btbridge` at 3 Mbaud, kernel controls + Skywalk channel (0220–0223); starts at boot (`com.sweet.btbridge`). Scanning, pairing, encryption, SDP, AVRCP, HFP, AAP and A2DP setup with Beats / AirPods; the headset appears in Settings and as a selectable audio route |
+| SSH | Procursus `sshd` at boot (`com.sweet.sshd`) |
+| Wallpaper | Wallpaper picker and poster providers; photo wallpapers draw (YCbCr photos converted on the CPU, 0217; the colour fix 0224 is not yet confirmed on the phone) |
 | Clock | Wall time from the PM8150 RTC plus an offset kept on the root (`sweettime=` sets it) |
 | Battery | Percentage, voltage and current from the PM8150B fuel gauge, charger state from its SMB5 (`sweetbattery=2`) |
-| Apps | The stock removable apps (Calculator, Weather, Notes, Maps, ...) installed from `staged_system_apps`; Photos and Wallet open; app extensions register, so the wallpaper picker and its posters work |
 | File drop, autorun | SWEETBOX: a raw image in the `rawdump` partition is unpacked into `/private/var/tmp` (and `ROOT/` entries onto the root); `/private/var/tmp/autorun.sh` runs at boot |
-| Not yet | Wi-Fi, audio, sensors, cellular; Metal |
+
+### Partly working / in progress
+
+| Area | State |
+| --- | --- |
+| Audio | No sound yet, on any route. A silent kernel `IOAudio2Device` stand-in (0226–0235) gives CoreAudio a built-in device; `VirtualAudio.plugin` loads again and builds its default device on it, but the Built-In Speaker / Receiver ports are not created yet, so audio queues fail ("getting output port ID") and Bluetooth audio never starts streaming |
+| Dynamic Island | Optional (`ArtworkDeviceSubType` 2556 via `mgtool`); disappeared over full-screen games until the framebuffer edge-band fix (0225, not yet confirmed on the phone) |
+| Framebuffer composition | Two-layer frames (app + CoreAnimation) on the GPU; partly transparent overlays fall back to a CPU blend, which costs frame rate |
+| Safari | Pages render; YouTube video crashes |
+| Photos | Opens; has crashed in some sessions |
+
+### Does not work (yet)
+
+- **Audio**: see above (no speaker, earpiece, microphone or Bluetooth audio).
+- **Cellular, SIM, calls, SMS**: no modem stack (`CommCenter` removed from launchd).
+- **Camera, sensors** (accelerometer, gyro, proximity, ambient light), **GPS, NFC**, haptics.
+- **SEP / Face ID, Touch ID, passcode-backed data protection**: AppleKeyStore is a stub; security is mostly off.
+- **App Store, Apple ID / iCloud**, FairPlay-encrypted apps, AirPlay (pairing fails).
+- **CPU frequency scaling**, power management, sleep.
+- Bluetooth housekeeping: the controller uses the NVM's default address (no per-device BD_ADDR yet), btbridge polls the UART (CPU), Wi-Fi/Bluetooth coexistence is not configured.
 
 ### Building for guacamole
 

@@ -27,7 +27,11 @@ as coming from a device tree (DT) or Linux.
 | Photos, Settings > About, Wallet | work (0135 sandbox extensions; fairplayd job removed) |
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
 | Wi-Fi | works: WPA2-PSK join, DHCP, internet (wifi25: HTTPS 200 from apple.com); userland/wland from ios-flame over 0138 /dev/pmem; en0 + Apple80211 for wifid/Settings (0139, from ios-flame 0123) |
-| Audio, CPU frequency | not started |
+| Display 90 Hz, brightness, Night Shift | works (0197-0199, sweet-displayd) |
+| Metal | SweetMetal2 (metal2vulkan + Turnip) for backboardd, WebKit and listed apps (see Metal) |
+| Bluetooth | works up to a selectable audio route: userland/bt/btbridge (WCN3998 H4 bridge, 3 Mbaud) + 0220-0223; launchd job com.sweet.btbridge |
+| Audio | in progress: silent IOAudio2Device stand-in (0226-0235), VirtualAudio builds 'vdef' on it; no speaker/receiver ports yet, no sound |
+| CPU frequency, sensors, camera, cellular | not started |
 
 ## Workflow
 
