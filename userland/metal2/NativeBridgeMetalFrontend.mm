@@ -64,6 +64,13 @@ static std::atomic<uint64_t> gSyncSubmitWaits;
 static std::mutex gWatchLock;
 static NSMutableSet<NSNumber *> *gWatchedSurfaces;
 static std::atomic<uint32_t> gWatchLogs{0};
+// 0242: the per-binding / per-draw diagnostics (0182 big-texture draw trace, 0188 watched surfaces, 0219 YCbCr
+// draws) cost Objective-C allocations, associated-object locks and string formatting on every texture and sampler
+// bind, pipeline change and draw. They now run only while /var/local/mtl2-trace exists (read once per process).
+static bool traceOn() {
+ static const bool on=access("/var/local/mtl2-trace",F_OK)==0;
+ return on;
+}
 static bool watchedSurface(IOSurfaceRef sf) {
  if(!sf)return false;
  std::lock_guard<std::mutex> guard(gWatchLock);
@@ -663,6 +670,7 @@ static void notified(void *context,uint64_t value) {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ bool drawsToSurface;      // 0243: a render pass of this buffer writes an IOSurface (a CAMetalLayer drawable, say)
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -684,7 +692,10 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
 @end
-@interface NBEncoder : NBObject
+@interface NBEncoder : NBObject {
+@public
+ void *_lastOwner[2];   // 0242: the buffer / texture last added to the command buffer's owners (not retained: identity only)
+}
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 @end
@@ -719,14 +730,19 @@ static void waitForResource(id resource) {
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
- if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ if(buffer && (__bridge void *)buffer!=_lastOwner[0]){[_commandBuffer.resourceOwners addObject:buffer];_lastOwner[0]=(__bridge void *)buffer;}   // 0242
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
+static void sweetYCbCrRefresh(id<MTLTexture> t);   // 0257b
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
- if(texture)[_commandBuffer.resourceOwners addObject:texture];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && (__bridge void *)texture!=_lastOwner[1]){   // 0242: the same texture again: already owned
+  [_commandBuffer.resourceOwners addObject:texture];_lastOwner[1]=(__bridge void *)texture;
+  if([(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ }
+ if(texture)sweetYCbCrRefresh(texture);   // 0257b
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ if(!traceOn())return;
  // 0188: a watched surface, any stage: the encoder, its pipeline (render) and target, where it is bound
  if(texture && watchedSurface([(NBTexture *)texture surface]) && gWatchLogs.fetch_add(1)<80){
   IOSurfaceRef sf=[(NBTexture *)texture surface];
@@ -751,7 +767,7 @@ static void waitForResource(id resource) {
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
- if(stage==2){   // 0182
+ if(stage==2 && traceOn()){   // 0182 (0242: tracing only)
   NSMutableDictionary *smp=objc_getAssociatedObject(self,"smp");
   if(!smp){smp=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"smp",smp,OBJC_ASSOCIATION_RETAIN);}
   NSString *dsc=sampler?objc_getAssociatedObject(sampler,"desc"):nil;
@@ -806,11 +822,18 @@ static void waitForResource(id resource) {
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
-@interface NBRenderEncoder : NBEncoder
+@interface NBRenderEncoder : NBEncoder {
+@public
+ // 0242: cull mode, winding and fill mode as plain fields (were associated NSNumbers, set on nearly every draw by
+ // Unity) and sent to the runtime only when one changes. Metal's defaults: none, clockwise, fill.
+ uint64_t _cull,_winding,_fill;
+ bool _rasterSent;
+}
 @property(nonatomic) BOOL drawableTarget;
 @end
 // 0182: draws that sample a full-screen surface, with pipeline, samplers and target: each distinct combination once (<= 60)
 static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSUInteger instances) {
+ if(!traceOn())return;   // 0242
  NSDictionary *big=objc_getAssociatedObject(encoder,"bigtex");
  if(!big.count)return;
  static std::mutex lock;static NSMutableSet<NSString *> *seen;
@@ -828,7 +851,7 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
- objc_setAssociatedObject(self,"pipe",objc_getAssociatedObject(state,"desc"),OBJC_ASSOCIATION_RETAIN);   // 0182
+ if(traceOn())objc_setAssociatedObject(self,"pipe",objc_getAssociatedObject(state,"desc"),OBJC_ASSOCIATION_RETAIN);   // 0182 (0242: tracing only)
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -869,18 +892,18 @@ static void traceBigTextureDraw(id encoder,const char *kind,NSUInteger count,NSU
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {
- NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
- [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
+ [self check:nmb_render_set_raster(self.handle,_cull,_winding,_fill) what:"raster state"];
+ _rasterSent=true;
 }
-- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setCullMode:(MTLCullMode)m {if(_rasterSent && _cull==(uint64_t)m)return;_cull=m;[self raster];}
 // 0204: depth clip mode (Find My: "MISSING NBRenderEncoder -setDepthClipMode:"). Clip is Metal's default and what the
 // runtime does; clamp (depth clamping) is not passed on, logged the first time it is asked for.
 - (void)setDepthClipMode:(MTLDepthClipMode)mode {
  if(mode==MTLDepthClipModeClamp){static std::atomic<bool> said{false};
   if(!said.exchange(true))NBLOG(@"native-metal: depth clamp asked for (setDepthClipMode:), drawn with clipping");}
 }
-- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
-- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setFrontFacingWinding:(MTLWinding)w {if(_rasterSent && _winding==(uint64_t)w)return;_winding=w;[self raster];}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f {if(_rasterSent && _fill==(uint64_t)f)return;_fill=f;[self raster];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
 }
@@ -1218,10 +1241,22 @@ static void scheduled(void *context);
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];drawsToSurface=true;}
   if(NBTexture *shadow=rotationShadowOf(texture))[_rotatedShadows addObject:shadow];   // 0196
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+  // 0247: the multisample resolve target (Maps: 4x MSAA resolved into its CAMetalLayer drawable, which stayed black)
+  if(id<MTLTexture> r=a.resolveTexture){
+   if(![(id)r isKindOfClass:[NBTexture class]])return false;
+   NBTexture *resolve=(NBTexture *)r;if(resolve.surface){[_surfaces addObject:resolve];drawsToSurface=true;}
+   if(NBTexture *shadow=rotationShadowOf(resolve))[_rotatedShadows addObject:shadow];
+   [_resourceOwners addObject:resolve];
+   out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   static std::atomic<uint64_t> resolves{0};const uint64_t k=++resolves;
+   if(k<=3 || k%300==0)NBLOG(@"native-metal: pass resolves %lux%lu (%lu samples) into %lux%lu fmt %lu surf %#x #%llu (0247)",(unsigned long)texture.width,
+    (unsigned long)texture.height,(unsigned long)texture.sampleCount,(unsigned long)r.width,(unsigned long)r.height,(unsigned long)r.pixelFormat,
+    resolve.surface?IOSurfaceGetID(resolve.surface):0,(unsigned long long)k);
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
@@ -1245,7 +1280,7 @@ static void scheduled(void *context);
  }
  id encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
  if([encoder isKindOfClass:[NBRenderEncoder class]])((NBRenderEncoder *)encoder).drawableTarget=drawableTarget;
- if([encoder isKindOfClass:[NBRenderEncoder class]]){   // 0182: the pass's colour target, for the draw trace
+ if(traceOn() && [encoder isKindOfClass:[NBRenderEncoder class]]){   // 0182: the pass's colour target, for the draw trace (0242: tracing only)
   id<MTLTexture> t0=d.colorAttachments[0].texture;IOSurfaceRef sf=[(id)t0 isKindOfClass:[NBTexture class]]?[(NBTexture *)t0 surface]:nullptr;
   objc_setAssociatedObject(encoder,"target",[NSString stringWithFormat:@"%lux%lu fmt %lu surf %#x load %lu label %@",(unsigned long)t0.width,(unsigned long)t0.height,
    (unsigned long)t0.pixelFormat,sf?IOSurfaceGetID(sf):0,(unsigned long)d.colorAttachments[0].loadAction,t0.label?:@""],OBJC_ASSOCIATION_RETAIN);
@@ -1478,6 +1513,21 @@ static void scheduled(void *context);
   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
  }
  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
+ /*
+  * 0243: CAMetalLayer.presentsWithTransaction (Maps' VectorKit): the app commits, waits until scheduled and calls
+  * [drawable present] itself, so CoreAnimation composites the drawable's IOSurface at the next transaction. On
+  * Apple's GPU "scheduled" means the work is ordered ahead of the window server's; our Vulkan fence is invisible to
+  * CoreAnimation, so the window server read the surface before Turnip had drawn it: Maps' map stayed black (it
+  * redraws only when something changes). A buffer that renders into an IOSurface now waits for its GPU work here
+  * (the GPU only, not the completed handlers, which may need this very thread). Not in backboardd, whose own
+  * frames are shown through the kernel's swap, which already waits for the GPU.
+  */
+ static const bool windowServer=strcmp(getprogname(),"backboardd")==0;
+ if(drawsToSurface && !windowServer && !self.failedLocally){
+  nmb_command_buffer_wait(_handle,0);
+  static std::atomic<uint64_t> waits{0};const uint64_t w=++waits;
+  if(w<=3 || w%300==0)NBLOG(@"native-metal: waitUntilScheduled on a surface-drawing buffer waited for the GPU #%llu (0243)",(unsigned long long)w);
+ }
  gTimeWaitScheduled.add(began);
 }
 @end
@@ -1825,6 +1875,47 @@ static char sweetMemoryOwnerKey;
 }
 @end
 // 0217: see newTextureWithDescriptor:iosurface:plane:. nil when the surface is not as expected (then the runtime's own refusal stands).
+// 0257b: converts a two-plane 4:2:0 surface into an RGBA8 texture of ow x oh (same math as sweetYCbCrTexture). For video
+// frames it is run again at every bind (sweetYCbCrRefresh): CoreAnimation makes one texture per IOSurface and reuses it,
+// counting on a live import, but ours is a converted copy, so a pooled decoder surface showed the frame it held when
+// first seen (Safari mp4: the right frame mixed with the first ones and middle ones).
+static bool sweetYCbCrFill(id<MTLTexture> t,IOSurfaceRef surface,size_t ow,size_t oh) {
+ const size_t w=IOSurfaceGetWidthOfPlane(surface,0),h=IOSurfaceGetHeightOfPlane(surface,0);
+ const size_t cw=IOSurfaceGetWidthOfPlane(surface,1),ch=IOSurfaceGetHeightOfPlane(surface,1);
+ if(!w || !h || ow>w || oh>h || cw<(w+1)/2 || ch<(h+1)/2)return false;
+ size_t yrow=IOSurfaceGetBytesPerRowOfPlane(surface,0),crow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ if(!yrow)yrow=(w+63)&~(size_t)63;
+ if(!crow)crow=(cw*2+63)&~(size_t)63;
+ const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*c=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ if(!y || !c)return false;
+ const uint32_t pf=IOSurfaceGetPixelFormat(surface);
+ const bool video=pf=='420v' || pf=='x420';
+ std::vector<uint8_t> rgba(ow*oh*4);
+ for(size_t j=0;j<oh;j++){
+  const uint8_t *yr=y+yrow*j,*cr=c+crow*(j/2);uint8_t *o=rgba.data()+ow*4*j;
+  for(size_t i=0;i<ow;i++){
+   int yy=yr[i],cb=cr[(i/2)*2]-128,cv=cr[(i/2)*2+1]-128;
+   if(video){yy=(yy-16)*298;cb=cb*292/256;cv=cv*292/256;}else yy<<=8;
+   const int r=(yy+359*cv+128)>>8,g=(yy-88*cb-183*cv+128)>>8,b=(yy+454*cb+128)>>8;
+   o[0]=(uint8_t)(r<0?0:r>255?255:r);o[1]=(uint8_t)(g<0?0:g>255?255:g);o[2]=(uint8_t)(b<0?0:b>255?255:b);o[3]=255;o+=4;
+  }
+ }
+ [t replaceRegion:MTLRegionMake2D(0,0,ow,oh) mipmapLevel:0 withBytes:rgba.data() bytesPerRow:ow*4];
+ return true;
+}
+
+// 0257b: at bind: a converted video frame is converted again from its surface, as long as the surface lives.
+static void sweetYCbCrRefresh(id<MTLTexture> t) {
+ id src=objc_getAssociatedObject(t,"ycbcr-src");
+ if(!src)return;
+ IOSurfaceRef surface=(__bridge IOSurfaceRef)src;
+ const uint32_t seed=IOSurfaceGetSeed(surface);
+ NSNumber *last=objc_getAssociatedObject(t,"ycbcr-seed");
+ static const bool always=access("/var/local/mtl2-videocache",F_OK)!=0;   // (the file: only when the seed moves)
+ if(!always && last && [last unsignedIntValue]==seed)return;
+ if(sweetYCbCrFill(t,surface,t.width,t.height))objc_setAssociatedObject(t,"ycbcr-seed",@(seed),OBJC_ASSOCIATION_RETAIN);
+}
+
 static id<MTLTexture> sweetYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurfaceRef surface,void *base,size_t allocation) {
  const size_t w=IOSurfaceGetWidthOfPlane(surface,0),h=IOSurfaceGetHeightOfPlane(surface,0);
  const size_t cw=IOSurfaceGetWidthOfPlane(surface,1),ch=IOSurfaceGetHeightOfPlane(surface,1);
@@ -1840,7 +1931,13 @@ static id<MTLTexture> sweetYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurf
  static std::mutex lock;static NSMutableDictionary<NSNumber *,NSArray *> *cache;
  const uint32_t seed=IOSurfaceGetSeed(surface);
  NSNumber *key=@(((uint64_t)IOSurfaceGetID(surface)<<32)|((uint64_t)d.width<<16)|d.height);
- {std::lock_guard<std::mutex> guard(lock);
+ // 0257: video frames ('420v'/'x420': the software decoder's pool, Safari mp4 2026-11-11) are converted on every use, not
+ // cached by seed: playback flickered between two frames, as if a pooled surface's new picture kept its old seed. Photos
+ // ('420f') keep the cache. /var/local/mtl2-videocache restores caching for video too (to compare).
+ static const bool videoCache=access("/var/local/mtl2-videocache",F_OK)==0;
+ const uint32_t pf0=IOSurfaceGetPixelFormat(surface);
+ const bool cacheable=videoCache || !(pf0=='420v' || pf0=='x420');
+ if(cacheable){std::lock_guard<std::mutex> guard(lock);
   if(!cache)cache=[NSMutableDictionary dictionary];
   NSArray *hit=cache[key];
   if(hit && [hit[0] unsignedIntValue]==seed)return hit[1];}
@@ -1881,6 +1978,11 @@ static id<MTLTexture> sweetYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurf
   n?ysum/n:0,ymin,ymax,n?cbsum/n:0,n?crsum/n:0,n);
  objc_setAssociatedObject(t,"ycbcr",[NSString stringWithFormat:@"ycbcr surf %#x %zux%zu as RGBA8",IOSurfaceGetID(surface),ow,oh],
   OBJC_ASSOCIATION_RETAIN);   // 0219
+ if(!cacheable){   // 0257b: a video frame: converted again at every bind (sweetYCbCrRefresh)
+  objc_setAssociatedObject(t,"ycbcr-src",(__bridge id)surface,OBJC_ASSOCIATION_RETAIN);
+  objc_setAssociatedObject(t,"ycbcr-seed",@(seed),OBJC_ASSOCIATION_RETAIN);
+ }
+ if(!cacheable)return t;   // 0257
  std::lock_guard<std::mutex> guard(lock);
  if(cache.count>=24)[cache removeAllObjects];
  cache[key]=@[@(seed),t];
@@ -2403,11 +2505,66 @@ __attribute__((constructor)) static void sweetCoreImageWithoutStitching(void) {
  setenv("CI_ENABLE_METAL_DAG","0",0);
  setenv("CI_ENABLE_FUNCTION_STITCHING","0",0);
 }
+// 0244: how an app hands its CAMetalLayer frames to the screen (Maps' map stays black, 0243): every nextDrawable
+// (the layer's size, format, presentsWithTransaction, framebufferOnly; the first 5 then every 300th) and every
+// -[drawable present] (direct or from presentDrawable:; same sampling). Not in backboardd.
+static IMP gOrigNextDrawable,gOrigPresent;
+// 0245: before a drawable goes to CoreAnimation by its own -present (presentsWithTransaction: Maps commits and calls
+// [drawable present] without waitUntilScheduled, so 0243 did not run for most frames), wait for the GPU on every
+// in-flight command buffer that uses the drawable's texture. GPU only (nmb_command_buffer_wait), never the
+// completed handlers: present runs on the main thread, where those handlers may be queued.
+static void waitGPUForTexture(id<MTLTexture> texture) {
+ if(![(id)texture isKindOfClass:[NBTexture class]])return;
+ NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+ for(NBCommandBuffer *commandBuffer in pending){
+  if(commandBuffer.failedLocally || !commandBuffer.handle)continue;
+  if(nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)texture handle])!=0){
+   nmb_command_buffer_wait(commandBuffer.handle,0);
+   static std::atomic<uint64_t> waits{0};const uint64_t w=++waits;
+   if(w<=3 || w%300==0)NBLOG(@"native-metal: drawable present waited for its GPU work #%llu (0245)",(unsigned long long)w);
+  }
+ }
+}
+static void hookDrawables() {
+ Class layerClass=NSClassFromString(@"CAMetalLayer");
+ Method next=layerClass?class_getInstanceMethod(layerClass,@selector(nextDrawable)):nullptr;
+ if(!next)return;
+ gOrigNextDrawable=method_getImplementation(next);
+ method_setImplementation(next,imp_implementationWithBlock(^id(CAMetalLayer *layer){
+  id drawable=((id(*)(id,SEL))gOrigNextDrawable)(layer,@selector(nextDrawable));
+  static std::atomic<uint64_t> asked{0};const uint64_t k=++asked;
+  if(k<=5 || k%300==0)NBLOG(@"native-metal: nextDrawable #%llu layer %p '%@' %.0fx%.0f fmt %lu presentsWithTransaction=%d framebufferOnly=%d -> %@",
+   (unsigned long long)k,layer,layer.name?:@"",layer.drawableSize.width,layer.drawableSize.height,(unsigned long)layer.pixelFormat,
+   (int)layer.presentsWithTransaction,(int)layer.framebufferOnly,drawable?NSStringFromClass([drawable class]):@"nil");
+  static dispatch_once_t once;
+  if(drawable)dispatch_once(&once,^{
+   Method present=class_getInstanceMethod([drawable class],@selector(present));
+   if(!present)return;
+   gOrigPresent=method_getImplementation(present);
+   method_setImplementation(present,imp_implementationWithBlock(^(id d){
+    static std::atomic<uint64_t> presented{0};const uint64_t j=++presented;
+    if(j<=5 || j%300==0)NBLOG(@"native-metal: -[drawable present] #%llu",(unsigned long long)j);
+    if([d respondsToSelector:@selector(texture)])waitGPUForTexture([(id<CAMetalDrawable>)d texture]);   // 0245
+    // 0246: what the frame holds when it is handed over (8x8 samples; 65 = could not sample): first 10, then every 300th
+    if((j<=10 || j%300==0) && [d respondsToSelector:@selector(texture)]){
+     id<MTLTexture> t=[(id<CAMetalDrawable>)d texture];
+     const unsigned black=prePresentBlackSamples(t);
+     IOSurfaceRef sf=[(id)t isKindOfClass:[NBTexture class]]?[(NBTexture *)t surface]:nullptr;
+     NBLOG(@"native-metal: present #%llu frame %lux%lu fmt %lu surf %#x: %u/64 black (0246)",(unsigned long long)j,(unsigned long)t.width,
+      (unsigned long)t.height,(unsigned long)t.pixelFormat,sf?IOSurfaceGetID(sf):0,black);
+    }
+    ((void(*)(id,SEL))gOrigPresent)(d,@selector(present));
+   }));
+  });
+  return drawable;
+ }));
+}
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+ if(strcmp(getprogname(),"backboardd")!=0)hookDrawables();   // 0244
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).

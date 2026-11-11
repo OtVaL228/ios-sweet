@@ -1,0 +1,119 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetAudio.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetVibrator.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetIPAppender.cpp                             optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -63,6 +63,11 @@
+     "     'IOMatchCategory' = SweetVibrator;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleIPAppender;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleIPAppender;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetIPAppender.cpp
+@@ -0,0 +1,92 @@
++/*
++ * 0253: a stand-in AppleIPAppender for CommCenter (research/commcenter).
++ *
++ * CommCenter's ApplePDPHelper looks this service up (Apple: the baseband IP data path's packet appender); without
++ * it, it logs "Could not find AppleIPAppender service" and its AQMController queue then dereferences NULL (sig 11),
++ * so CommCenter crash-loops. Every crash leaves CoreTelephony clients waiting: Settings > Sounds stalls ~1.2 s on
++ * -[SHSSoundsPrefController refreshShouldHideAllVoicemailUI] until the connection breaks (2026-11-10 log).
++ * There is no baseband here: this service only exists, and its user client accepts every call with zeroed
++ * outputs (as IOWatchdog, 0040); each selector is logged the first time, to learn what CommCenter expects.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/proc.h>
++
++class AppleIPAppender : public IOService {
++	OSDeclareDefaultStructors(AppleIPAppender);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleIPAppender, IOService);
++
++bool
++AppleIPAppender::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleIPAppenderUserClient");
++	registerService();
++	IOLog("SWEET IPAPPENDER: AppleIPAppender registered (stand-in for CommCenter, no baseband)\n");
++	return true;
++}
++
++class AppleIPAppenderUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, IOUserClient);
++
++IOReturn
++AppleIPAppenderUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static uint64_t sweet_ipa_logged;       /* selectors already logged (< 64) */
++
++IOReturn
++AppleIPAppenderUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor != NULL) {
++		IOByteCount len = args->structureOutputDescriptor->getLength();
++		for (IOByteCount off = 0; off < len; off += 8) {
++			static const uint64_t zero = 0;
++			args->structureOutputDescriptor->writeBytes(off, &zero, len - off < 8 ? len - off : 8);
++		}
++	} else if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	if (selector >= 64 || !(sweet_ipa_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_ipa_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET IPAPPENDER: %s sel %u in %u/%u out %u/%u -> ok\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++#endif /* SWEET */

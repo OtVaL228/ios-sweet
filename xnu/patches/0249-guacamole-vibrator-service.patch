@@ -1,0 +1,275 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,6 +11,7 @@
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetAudio.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetVibrator.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -58,6 +58,11 @@
+     "     'IOMatchCategory' = IOAudio2Device;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetVibrator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetVibrator;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -551,6 +551,45 @@
+ 	thread_terminate(current_thread());
+ }
+ 
++/*
++ * 0249: for iokit/Kernel/arm/SweetVibrator.cpp (the "vibrator" FigVibrator drives). 0 = done, else an errno;
++ * ENODEV until the motor is configured (sweethaptic=2).
++ */
++int sweet_haptic_ready(void);
++int sweet_haptic_wave(unsigned wave);
++int sweet_haptic_buzz(int on);
++
++int
++sweet_haptic_ready(void)
++{
++	return hp.ready;
++}
++
++int
++sweet_haptic_wave(unsigned wave)
++{
++	if (!hp.ready || wave == 0 || wave > 127) {
++		return ENODEV;
++	}
++	lck_mtx_lock(hp.lock);
++	int err = hap_play((uint8_t)wave, 0);
++	lck_mtx_unlock(hp.lock);
++	return err;
++}
++
++/* on: waveform 10 looped until buzz(0); off: stop whatever plays */
++int
++sweet_haptic_buzz(int on)
++{
++	if (!hp.ready) {
++		return ENODEV;
++	}
++	lck_mtx_lock(hp.lock);
++	int err = on ? hap_play(10, 15) : hap_stop();
++	lck_mtx_unlock(hp.lock);
++	return err;
++}
++
+ static int
+ sysctl_sweet_haptic SYSCTL_HANDLER_ARGS
+ {
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetVibrator.cpp
+@@ -0,0 +1,200 @@
++/*
++ * 0249: the IOKit "vibrator" iOS's legacy vibration path drives, on the AW8697 motor (bsd/dev/sweet_haptic.c, 0248).
++ *
++ * MediaExperience's FigVibrator (research/haptics/ios-e/RESULTS.md, REQUEST-F.md) uses this path when VibeSynth has
++ * no hardware support (true here): IOServiceGetMatchingService(IOServiceNameMatching("vibrator")) once, then
++ * IORegistryEntrySetCFProperties on it:
++ *   start:   { intensity = SInt32 16.16 (0..1), hertz_millisecs = [ on-state, ms, off-state, ms, ... ], repeat = bool }
++ *            on-state: an intensity dictionary or true; off-state: false; durations SInt64 / SInt32 milliseconds
++ *   pattern: { hertz_millisecs = normalized pattern array, repeat = false }
++ *   stop:    a plain CFNumber 0 (not a dictionary)
++ * UIKit's feedback level 1 (MobileGestalt cBy4BcYs5YWtFHbBpt4C6A = true) plays its feedback as system sounds with
++ * vibration, which end here. Mapping onto the RAM waveforms (research/haptics/README.md, effect catalogue):
++ * an on-segment of at most 40 ms is a tap, waveform 1..5 by intensity (1 light .. 5 keyboard-like, the strongest
++ * 20 at full intensity and >= 25 ms); a longer one buzzes (waveform 10 looped) for its duration. Off-segments wait.
++ * "repeat" loops the pattern until the next stop or pattern (at most 60 s). Every request replaces the running one.
++ * Played on a thread call: setProperties returns at once.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <kern/thread_call.h>
++
++extern "C" {
++int sweet_haptic_ready(void);
++int sweet_haptic_wave(unsigned wave);
++int sweet_haptic_buzz(int on);
++}
++
++#define VIB_SEGMENTS    32u
++
++class SweetVibrator : public IOService {
++	OSDeclareDefaultStructors(SweetVibrator);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++private:
++	static void run(thread_call_param_t self, thread_call_param_t);
++	void play(void);
++	bool waitFor(uint32_t gen, uint32_t ms);
++	IOLock *fLock;
++	thread_call_t fCall;
++	volatile uint32_t fGen;
++	struct { bool on; uint32_t level; uint32_t ms; } fSeg[VIB_SEGMENTS];   /* level: 0..65536 */
++	uint32_t fCount;
++	bool fRepeat;
++	uint32_t fRequests;
++};
++OSDefineMetaClassAndStructors(SweetVibrator, IOService);
++
++bool
++SweetVibrator::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fCall = thread_call_allocate(&SweetVibrator::run, this);
++	if (fLock == NULL || fCall == NULL) {
++		return false;
++	}
++	setName("vibrator");                    /* IOServiceNameMatching("vibrator") */
++	registerService();
++	IOLog("SWEET VIBRATOR: \"vibrator\" registered (FigVibrator -> AW8697, motor %s)\n",
++	    sweet_haptic_ready() ? "ready" : "not configured yet: boot-arg sweethaptic=2");
++	return true;
++}
++
++static uint32_t
++vib_level(OSObject *o, uint32_t fallback)
++{
++	if (OSNumber *n = OSDynamicCast(OSNumber, o)) {
++		uint64_t v = n->unsigned64BitValue();
++		return v > 65536u ? 65536u : (uint32_t)v;
++	}
++	if (OSDictionary *d = OSDynamicCast(OSDictionary, o)) {
++		/* the intensity dictionary's key is not known yet: take the first number in it */
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		uint32_t level = fallback;
++		if (it) {
++			while (OSString *k = OSDynamicCast(OSString, it->getNextObject())) {
++				if (OSNumber *n = OSDynamicCast(OSNumber, d->getObject(k))) {
++					uint64_t v = n->unsigned64BitValue();
++					level = v > 65536u ? 65536u : (uint32_t)v;
++					break;
++				}
++			}
++			it->release();
++		}
++		return level;
++	}
++	return fallback;
++}
++
++IOReturn
++SweetVibrator::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	IOLockLock(fLock);
++	fGen++;
++	fCount = 0;
++	fRepeat = false;
++	if (d != NULL) {
++		uint32_t level = vib_level(d->getObject("intensity"), 65536u);
++		OSArray *a = OSDynamicCast(OSArray, d->getObject("hertz_millisecs"));
++		for (unsigned i = 0; a != NULL && i + 1 < a->getCount() && fCount < VIB_SEGMENTS; i += 2) {
++			OSObject *state = a->getObject(i);
++			OSNumber *ms = OSDynamicCast(OSNumber, a->getObject(i + 1));
++			if (ms == NULL) {
++				continue;
++			}
++			bool on = state != kOSBooleanFalse && state != NULL;
++			fSeg[fCount].on = on;
++			fSeg[fCount].level = on ? vib_level(state, level) : 0;
++			uint64_t v = ms->unsigned64BitValue();
++			fSeg[fCount].ms = v > 10000u ? 10000u : (uint32_t)v;
++			fCount++;
++		}
++		fRepeat = d->getObject("repeat") == kOSBooleanTrue;
++	}
++	uint32_t n = ++fRequests, count = fCount;
++	bool repeat = fRepeat;
++	IOLockUnlock(fLock);
++	if (n <= 20 || n % 100 == 0) {
++		IOLog("SWEET VIBRATOR: request #%u: %s, %u segment(s)%s, first %s %u ms level %u\n", n,
++		    d ? "pattern" : "stop", count, repeat ? ", repeat" : "", count && fSeg[0].on ? "on" : "off",
++		    count ? fSeg[0].ms : 0, count ? fSeg[0].level : 0);
++	}
++	(void)sweet_haptic_buzz(0);
++	if (count != 0) {
++		thread_call_enter(fCall);
++	}
++	return kIOReturnSuccess;
++}
++
++/* false: a newer request came in */
++bool
++SweetVibrator::waitFor(uint32_t gen, uint32_t ms)
++{
++	while (ms > 0) {
++		if (fGen != gen) {
++			return false;
++		}
++		uint32_t step = ms > 10 ? 10 : ms;
++		IOSleep(step);
++		ms -= step;
++	}
++	return fGen == gen;
++}
++
++void
++SweetVibrator::run(thread_call_param_t self, thread_call_param_t)
++{
++	((SweetVibrator *)self)->play();
++}
++
++void
++SweetVibrator::play(void)
++{
++	IOLockLock(fLock);
++	uint32_t gen = fGen, count = fCount;
++	bool repeat = fRepeat;
++	decltype(fSeg) seg;
++	memcpy(seg, fSeg, sizeof(seg));
++	IOLockUnlock(fLock);
++	uint32_t total = 0;
++	do {
++		for (uint32_t i = 0; i < count && fGen == gen; i++) {
++			uint32_t ms = seg[i].ms ? seg[i].ms : 1;
++			if (seg[i].on && ms <= 40) {
++				unsigned wave = 1u + (seg[i].level * 4u) / 65536u;          /* 1..5 */
++				if (seg[i].level >= 62000u && ms >= 25) {
++					wave = 20;                                          /* heavy */
++				}
++				(void)sweet_haptic_wave(wave);
++				(void)waitFor(gen, ms);
++			} else if (seg[i].on) {
++				(void)sweet_haptic_buzz(1);
++				bool same = waitFor(gen, ms);
++				if (same) {
++					(void)sweet_haptic_buzz(0);
++				}
++			} else {
++				(void)waitFor(gen, ms);
++			}
++			total += ms;
++		}
++	} while (repeat && fGen == gen && total < 60000u);
++	if (fGen == gen) {
++		(void)sweet_haptic_buzz(0);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

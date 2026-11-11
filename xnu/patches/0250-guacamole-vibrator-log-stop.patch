@@ -1,0 +1,110 @@
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -558,6 +558,15 @@
+ int sweet_haptic_ready(void);
+ int sweet_haptic_wave(unsigned wave);
+ int sweet_haptic_buzz(int on);
++unsigned sweet_haptic_stops(void);
++/* 0250: `haptic stop` (sysctl 0) count: the vibrator's pattern player gives up when it changes */
++static volatile unsigned hap_stops;
++
++unsigned
++sweet_haptic_stops(void)
++{
++	return hap_stops;
++}
+ 
+ int
+ sweet_haptic_ready(void)
+@@ -607,6 +616,7 @@
+ 	}
+ 	lck_mtx_lock(hp.lock);
+ 	if (value == 0) {
++		hap_stops++;                                            /* 0250: also ends SweetVibrator's pattern */
+ 		err = hap_stop();
+ 	} else if (value > 0) {
+ 		err = hap_play((uint8_t)value, 0);
+--- a/iokit/Kernel/arm/SweetVibrator.cpp
++++ b/iokit/Kernel/arm/SweetVibrator.cpp
+@@ -32,6 +32,7 @@
+ int sweet_haptic_ready(void);
+ int sweet_haptic_wave(unsigned wave);
+ int sweet_haptic_buzz(int on);
++unsigned sweet_haptic_stops(void);
+ }
+ 
+ #define VIB_SEGMENTS    32u
+@@ -52,6 +53,7 @@
+ 	uint32_t fCount;
+ 	bool fRepeat;
+ 	uint32_t fRequests;
++	unsigned fStops;                /* 0250: sweet_haptic_stops() when the pattern started */
+ };
+ OSDefineMetaClassAndStructors(SweetVibrator, IOService);
+ 
+@@ -127,11 +129,26 @@
+ 	}
+ 	uint32_t n = ++fRequests, count = fCount;
+ 	bool repeat = fRepeat;
++	/*
++	 * 0250: every request, every segment (up to 8) and, for a non-dictionary, its class and value: a repeated
++	 * pattern played until the 60 s cap and the request lines (first 20 only) had rolled out of dmesg.
++	 */
++	char segs[8 * 18 + 8] = "";
++	for (uint32_t i = 0; i < count && i < 8; i++) {
++		char one[20];
++		snprintf(one, sizeof(one), " %s%u@%u", fSeg[i].on ? "+" : "-", fSeg[i].ms, fSeg[i].level >> 8);
++		strlcat(segs, one, sizeof(segs));
++	}
+ 	IOLockUnlock(fLock);
+-	if (n <= 20 || n % 100 == 0) {
+-		IOLog("SWEET VIBRATOR: request #%u: %s, %u segment(s)%s, first %s %u ms level %u\n", n,
+-		    d ? "pattern" : "stop", count, repeat ? ", repeat" : "", count && fSeg[0].on ? "on" : "off",
+-		    count ? fSeg[0].ms : 0, count ? fSeg[0].level : 0);
++	if (d == NULL) {
++		OSNumber *num = OSDynamicCast(OSNumber, properties);
++		IOLog("SWEET VIBRATOR: request #%u: stop (%s %llu)\n", n,
++		    properties ? properties->getMetaClass()->getClassName() : "null", num ? num->unsigned64BitValue() : 0ull);
++	} else {
++		OSObject *hm = d->getObject("hertz_millisecs");
++		IOLog("SWEET VIBRATOR: request #%u: %u segment(s)%s [ms@level/256]%s%s (keys %u, hertz_millisecs %s)\n", n, count,
++		    repeat ? " REPEAT" : "", segs, count > 8 ? " ..." : "", d->getCount(),
++		    hm ? hm->getMetaClass()->getClassName() : "missing");
+ 	}
+ 	(void)sweet_haptic_buzz(0);
+ 	if (count != 0) {
+@@ -145,7 +162,7 @@
+ SweetVibrator::waitFor(uint32_t gen, uint32_t ms)
+ {
+ 	while (ms > 0) {
+-		if (fGen != gen) {
++		if (fGen != gen || sweet_haptic_stops() != fStops) {
+ 			return false;
+ 		}
+ 		uint32_t step = ms > 10 ? 10 : ms;
+@@ -167,12 +184,13 @@
+ 	IOLockLock(fLock);
+ 	uint32_t gen = fGen, count = fCount;
+ 	bool repeat = fRepeat;
++	fStops = sweet_haptic_stops();
+ 	decltype(fSeg) seg;
+ 	memcpy(seg, fSeg, sizeof(seg));
+ 	IOLockUnlock(fLock);
+ 	uint32_t total = 0;
+ 	do {
+-		for (uint32_t i = 0; i < count && fGen == gen; i++) {
++		for (uint32_t i = 0; i < count && fGen == gen && sweet_haptic_stops() == fStops; i++) {
+ 			uint32_t ms = seg[i].ms ? seg[i].ms : 1;
+ 			if (seg[i].on && ms <= 40) {
+ 				unsigned wave = 1u + (seg[i].level * 4u) / 65536u;          /* 1..5 */
+@@ -192,8 +210,8 @@
+ 			}
+ 			total += ms;
+ 		}
+-	} while (repeat && fGen == gen && total < 60000u);
+-	if (fGen == gen) {
++	} while (repeat && fGen == gen && sweet_haptic_stops() == fStops && total < 30000u);   /* 0250: 30 s cap */
++	if (fGen == gen && sweet_haptic_stops() == fStops) {
+ 		(void)sweet_haptic_buzz(0);
+ 	}
+ }

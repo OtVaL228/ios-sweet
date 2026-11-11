@@ -27,6 +27,12 @@ codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
 build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
 # MobileGestalt answer cache editor (metal/gamekit for AB2; ArtworkDeviceSubType for the Dynamic Island); install to /usr/local/bin
 build mgtool jb/mgtool.c -framework CoreFoundation
+build haptic jb/haptic.c
+build auprobe jb/auprobe.c -framework CoreFoundation
+build sweet-msd jb/sweet-msd.c
+build libsweet-autrace.dylib jb/autrace.c -dynamiclib -install_name /usr/lib/libsweet-autrace.dylib -Wl,-not_for_dyld_shared_cache -Wl,-U,_AudioObjectGetPropertyData,-U,_AudioObjectGetPropertyDataSize,-U,_AudioObjectSetPropertyData,-U,_AudioObjectHasProperty
+build vibtest jb/vibtest.c -framework AudioToolbox -framework IOKit -framework CoreFoundation
+build mgq jb/mgq.c -lMobileGestalt -framework CoreFoundation
 # read-only look at the display controller the bootloader left running (brightness / Night Shift via DSPP PCC)
 build dispprobe jb/dispprobe.c
 # brightness / Night Shift by hand through DSPP0/1 PCC (CTL0 only; refuses if the controller is not as probed)

@@ -1,3 +1,677 @@
+# Active handoff — iOS haptics reach the motor; AW8697 wedges -> REQUEST-J / 0258 (2026-11-11 02:35, Claude)
+
+- Full iOS haptic chain works: MG DeviceSupportsHaptics=true (new) + DeviceSupportsClosedLoopHaptics=true. VirtualAudio
+  creates VAD 'vzzz' VirtualAudioDevice_Actuator only if MGGetBoolAnswer(DeviceSupportsHaptics) (0x16dd14 in
+  dtb/va/VirtualAudio.plugin); without it AVHapticServer init fails and every vibe returns '!itl'
+  (research/haptics/ios-j.md). Now vibtest system sounds, Settings switches (UIKit level 2 / CoreHaptics) reach
+  /dev/hakios-haptic and the motor.
+- Open: after a few iOS plays the chip wedges (GO=1, GLB_STATE 7, standby off; silent for every path until
+  `haptic init`). Dumps + ask: research/haptics/REQUEST-J.md (patch 0258 for Codex).
+- 0252 confirmed (motor works at first command after boot). 0253 untested: CommCenter now aborts on an uncaught C++
+  exception (no IPAPPENDER lines); CommCenter disabled again (launchctl disable system/com.apple.CommCenter).
+- Rollback haptics: `mgtool unset DeviceSupportsHaptics` + restart mediaserverd.
+
+# MILESTONE — video plays in Safari (2026-11-11 00:52, user)
+
+- With 0256 (display-pipe dictionaries) + SweetMetal2 0257b (video frames re-converted at every bind): mp4 and the
+  non-DRM YouTube videos play correctly (software decode, BT audio). Next for video: YCbCr->RGB on the GPU (sampling
+  the planes in a shader) instead of a CPU copy per bind.
+
+# Active handoff — SweetMetal2 0257b: re-convert video frames at every bind (2026-11-11 00:55, Claude)
+
+- 0257 (no cache) did not help; the user sees the right frame mixed with the very first and middle frames, steady when
+  paused. Cause: CoreAnimation makes ONE texture per IOSurface and keeps it, expecting a live view; our YCbCr texture
+  is a converted copy, so each pooled decoder surface keeps the picture it had when CA first imported it.
+- userland/metal2/NativeBridgeMetalFrontend.mm: sweetYCbCrFill() (the conversion into an existing texture);
+  '420v'/'x420' textures remember their surface ("ycbcr-src") and are re-filled from it in -texture:index:stage:
+  (every bind) via sweetYCbCrRefresh(); /var/local/mtl2-videocache: only when the seed moved. Rebuild + install the
+  bundle; restart backboardd, MobileSafari, com.apple.WebKit.GPU/WebContent. Long-term: convert on the GPU.
+- Codex rebuilt and ad-hoc signature verification passed. Installed on `192.168.0.61`, preserving the prior bundle as
+  `SweetMetal2.bundle.pre-0257b-20261111`; pulled back and byte-compared `SweetMetal2`, Turnip, and CodeResources.
+  SHA-256: `d0fc051e3f6c735a5b4bf27ff1037498ee6c96be20912e256a3f5bab7cdd5836`,
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and
+  `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Resprung with `killall -9 backboardd`; no
+  reboot. Archive: `outputs/guacamole-SweetMetal2-0257b-video-refresh.tar.gz`.
+
+# Active handoff — Safari mp4 plays (0256 worked); flicker fix in SweetMetal2 (2026-11-11 00:45, Claude)
+
+- After 0256 a plain mp4 plays in Safari (software decode) but flickers between two frames. YouTube: most show
+  "error licensing" (FairPlay; not pursued), but some YouTube videos DO play (user, 00:39). mtl2.log: backboardd converts '420v' 1280x720 surfaces (pool of 12+,
+  seed 1 each, different content), so decoding works; suspect the YCbCr->RGBA cache (by surface id + seed) serving a
+  pooled surface's old picture when its seed does not move.
+- userland/metal2/NativeBridgeMetalFrontend.mm sweetYCbCrTexture (labelled 0257): '420v'/'x420' surfaces are converted
+  on every use (no cache); '420f' photos keep it; /var/local/mtl2-videocache restores the old behaviour. Needs the
+  SweetMetal2 bundle rebuilt (userland/metal2/build.sh) and installed. CPU cost: one 720p conversion per composite.
+- Codex rebuilt with `sh userland/metal2/build.sh`; ad-hoc signature verification passed. Installed over SSH to
+  `/System/Library/Extensions/SweetMetal2.bundle` on `192.168.0.61`, preserving the previous bundle as
+  `SweetMetal2.bundle.pre-0257-20261111`. Pulled back and byte-compared `SweetMetal2`, Turnip, and CodeResources.
+  SHA-256: `d638fc2164578ba703afba4d25ff5e163f5e00270a3b29fc9d84877d5bca6116`,
+  `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5`, and
+  `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4`. Archive:
+  `outputs/guacamole-SweetMetal2-0257-video-ycbcr-recache.tar.gz`. Resprung with `killall -9 backboardd`; no reboot.
+
+# Active handoff — 0256: AppleCLCD display-pipe properties as dictionaries (Safari video crash) (2026-11-11 00:30, Claude)
+
+- **Built by Codex (2026-11-11 00:26):** patches 0255 and 0256 applied cleanly in order and the local XNU kernel
+  build succeeded. Kernel: `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`
+  (17,137,824 bytes, SHA-256 `cd1b0d107197c07493a6766ae5b015968e5413e1b49de1826201538302a7dd5d`). Fresh ADT:
+  `work/guacamole-0256-audio-hakios.adt` (`--highmem --guacamole`, includes `/product/audio`). Boot image:
+  `outputs/guacamole-0256-audio-hakios.img` (21,590,016 bytes, SHA-256
+  `b7830e8ef9b87dfe06af1776598ebaf41950985ca3b8281326e30c98104948b9`); arguments, with `sweettime` refreshed and
+  `sweetaudio=0` retained, are in `outputs/guacamole-0256-audio-hakios-boot-args.txt`. Payload verified against the
+  boot image. Built only; not transferred to or booted on the phone.
+
+- Codex: mediaserverd's video crash is VideoToolbox _FigGetAlignmentForIOSurfaceOutputToDisplayService reading AppleCLCD
+  DisplayPipePlaneBaseAlignment as a dictionary (PlaneBaseAlignmentLinear) and DisplayPipeStrideRequirements
+  (StrideLinearHorizontal); ours was the number 64 (since 0046).
+- NEW xnu/patches/0256-guacamole-fb-display-pipe-dicts.patch (SweetFramebuffer.cpp, after 0168): both published as
+  { key: 64 } (the framework's fallback values). The test image keeps sweetaudio=0 + HakiosAudio. Expect: video in
+  Safari plays (software decode; AppleAVD absent).
+
+# Plan — real speakers / mic: research/audio/speaker-mic-plan.md (2026-11-11, Claude)
+
+- TFA9894 x2 (I2C 0x34/0x35 on i2c@890000) + WCD9340 Tavil (SLIMbus, ADSP-owned); LPASS belongs to the ADSP.
+  Steps: ADSP PAS boot + GLINK/QRTR (reuse userland/wland's modem code, same SM8150 as Pixel 4) -> APR (AFE/ADM/ASM,
+  port HackiOS/apollo sweet_adsp.c) -> speaker stream from /dev/hakios-audio -> TFA9894 driver -> later the mic.
+
+# Active handoff — Safari video: mediaserverd crash (2026-11-11 00:20, Claude)
+
+- Playing any video in Safari now gets past audio (routes work) and crashes mediaserverd: "-[__NSCFNumber
+  objectForKey:]" right after MXSession setBestAvailableContentType; crash loop, no .ips. Also seen: CoreVideo
+  "Failed to read HardwarePlatform, MG query returned NULL", AppleAVDCheckPlatform() FALSE (no hardware decoder;
+  expected). Codex request: research/video/README.md (symbolicate the kernel bt / disassemble the caller).
+- **Crash root cause found:** MediaToolbox's video render-pipeline setup calls VideoToolbox
+  `_FigGetAlignmentForIOSurfaceOutputToDisplayService`, which expects `AppleCLCD.DisplayPipePlaneBaseAlignment`
+  to be a dictionary containing `PlaneBaseAlignmentLinear`; Sweet currently publishes scalar `64`, so the CF
+  dictionary lookup throws. The companion property/key is `DisplayPipeStrideRequirements` /
+  `StrideLinearHorizontal`. Both fallback requirements in the framework are 64; stock D22 runtime numbers are not
+  confirmed from the ADT/shared cache. Full symbolication and disassembly: `research/video/README.md`.
+
+# MILESTONE — Bluetooth headphone audio works (2026-11-11 00:07, user)
+
+- With HakiosAudio.driver + sweetaudio=0 (routes on the Speaker device), music/audio plays through Bluetooth
+  headphones (A2DP). The phone's own speaker stays silent (no kernel audio sink yet).
+
+# Active handoff — 0255: iOS haptics as waveforms through HakiosAudio's Actuator (2026-11-11 00:15, Claude)
+
+- ios-apollo (Mi 10T: SAME AW8697) plays iOS haptics this way: HakiosAudio.driver's "Actuator" device gets iOS's
+  haptic waveforms (VibeSynth "Unified Haptic/Vibe Engine", Core Haptics, UIKit level 2, system sounds) and writes them
+  to /dev/apollo-haptic or /dev/hakios-haptic; a kernel service turns them into the chip's effects.
+- NEW xnu/patches/0255-guacamole-haptic-ios-actuator.patch (after 0252..0254; only bsd/dev/sweet_haptic.c; dry-run OK;
+  not compiled): /dev/hakios-haptic (0666) + hi_thread (their serve(), APSL, adapted): tap after a pause = waveform
+  20/5/2 by peak (2/3, 1/3 of full scale), gain DATDBG 0x50..0x80 by peak; > 60 ms = waveform 10 looped until iOS
+  stops (<= 1 s); <= 1 s of driving per 2 s window. Starts after the boot set-up; boot-arg sweethapticios=0 = off.
+- iOS uses the Actuator only with DeviceSupportsClosedLoopHaptics true. Test: `mgtool setbool
+  DeviceSupportsClosedLoopHaptics true`, restart mediaserverd + SpringBoard (expect "Using New Unified Haptic/Vibe
+  Engine", no '!itl' errors now that an Actuator exists, Settings "Sounds & Haptics", switches/keyboard taps). If good:
+  tools/mkadt.py could add /product/haptics (D22: closed-loop, supports-3rd-party-haptics) instead of the cache.
+  The legacy path (SweetVibrator 0249/0250, converted D22 pattern plist) then becomes the fallback.
+
+# Active handoff — MILESTONE: iOS audio routes work (HakiosAudio.driver + sweetaudio=0) (2026-11-10 23:59, Claude)
+
+- sweetaudio=0 image + /System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver (Info.plist MUST be 0644, dir 0755:
+  mediaserverd runs as mobile; scp kept 0600 and the plug-in was silently skipped). VirtualAudio ports: pspk Speaker,
+  pspr Speaker Telemetry, pstp Speaker Tap, phki Hawking Input, pmbi Built-In Microphone, pact Actuator (+ pap, pnul,
+  pnli, papa). AQMEIO "getting output port ID": 0. Speaker samples are dropped (no /dev/hakios-audio): silent.
+- Next: YouTube / Music (silent playback), Bluetooth A2DP sound, Actuator (iOS haptics as waveforms -> AW8697 RTP?).
+
+# Active handoff — audio: switch to ios-apollo's HakiosAudio.driver HAL plug-in (2026-11-10 23:55, Claude)
+
+- github.com/aTechGeekDev/ios-apollo (Mi 10T, same ios-sweet base, iOS 16.7.16) has speakers + Bluetooth A2DP working
+  with hakios-apollo's AudioServerPlugIn (MIT): devices UID "Speaker", "Hawking" (mandatory 'vhaw' companion: why
+  routes stayed on Null_Device), "Codec" (input with data source 'imic': what our 0254 'who?' was), "Actuator"
+  (Taptic waveforms). Copied unchanged to userland/audio/ (README, build.sh).
+- Plan: boot with sweetaudio=0 (our IOAudio2 stand-in off; no sweetaudiotp/term/uid), install
+  /System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/{HakiosAudio,Info.plist}, restart mediaserverd. Without a
+  kernel /dev/hakios-audio the speaker's samples are dropped: routes, app playback (silent) and Bluetooth A2DP first;
+  real speaker = an ADSP/amp path later (hakios-apollo's kernel side is Mi 10T hardware).
+- The mediaserverd autrace wrapper (sweet-msd, dtb/mediaserverd-autrace.plist) is only a runtime bootstrap: a reboot
+  drops it; launchd.plist on the phone has a harmless DYLD env entry (stripped by launchd), backup dtb/launchd.plist.bak.
+
+# Active handoff — MILESTONE: UID "Codec" + 'bltn' runs Device_Codec_Aspen (speaker + receiver ports) (2026-11-10 23:17, Claude)
+
+- 0254 image, boot-args sweetaudiotp=0x626c746e sweetaudiouid=Codec sweetaudioname=Codec: VirtualAudio adopts it,
+  Device_Codec_Aspen.cpp:1341 "creating a speaker port", :1345 "creating a speaker tap input port", :1356 "creating
+  a receiver port", then DeviceManager.cpp:282 "Could not add PhysicalDevice ID: 33 UID: Codec. Reason:
+  CAException (2003332927)" = 'who?' kAudioHardwareUnknownPropertyError: the codec setup asks for a property our
+  device lacks right after the receiver. dtb/cd.log has no HAL line naming it; before it: 'pstp' speaker tap "port
+  name is zero-length", "Device Codec does not support hardware volume range property". Codex request
+  research/audio/README.md 23:20. Music shows no outputs on this boot (device not added).
+
+# Active handoff — 0254 audio UID boot-args; D22 audio-data "Codec" (2026-11-10 23:15, Claude)
+
+- research/ipsw-x/d22ap.adt: real D22 audio = IOAudio2 audio-data devices under arm-io/mca*: audio-codec
+  (audio-data,cs42l75), audio-speaker-top (cs35l26), audio-codec-voice (mikeybus-secondary, data-sources name
+  "Codec"), audio-codec-hawking ("Codec"), audio-loopback ("Loopback"), audio-halogen, audio-haptic ("Actuator"),
+  audio-baseband-voice ("Baseband"); control nodes spi2/audio-codec (cs42l75: imic/lmic/smic/fmic, rx-receiver,
+  receiver-pdm), i2c2/audio-speaker-top (primary-speaker 'SpoT'). VirtualAudio's configuration factory keys (Codec,
+  Speaker, Voice, Reference, Baseband Voice, ...) look like these device names.
+- Theory: built-in ('bltn') devices are not handled by DeviceFactory_Aspen (no case) but by the configuration path,
+  keyed by device UID/name; ours was "SweetBuiltInAudio" (unknown key -> listed, never adopted, 0226/0227).
+- NEW xnu/patches/0254-guacamole-ioaudio2-uid-bootargs.patch (after 0253; dry-run clean against the current 0253 tree):
+  boot-args sweetaudiouid=STR, sweetaudioname=STR. Test image: sweetaudiotp=0x626c746e sweetaudiouid=Codec
+  sweetaudioname=Codec (terminal boot-args back to defaults spkr/micr). Keep the mbus/hdph/hmic image as fallback.
+  Check: oslog -l mediaserverd: Device_Codec_Aspen / "creating a speaker port" / pspk.
+- BUILT 0254 locally after a clean apply check. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,137,456 bytes,
+  SHA-256 `3d6e24ef26af3883924202d7b497c6ffeb62854ab255f44461ffc7cc6ed27e90`). Fresh ADT:
+  `work/guacamole-0254-codec.adt` (`--highmem --guacamole`, includes `/product/audio`). Test image:
+  `outputs/guacamole-0254-audio-codec-identity.img` (21,585,920 bytes, SHA-256
+  `e8fb072ab71577ef61bdf76b942c5b0d17578145b9a91045d818b00be5df9b1c`); boot args are in
+  `outputs/guacamole-0254-audio-codec-identity-boot-args.txt`. The 0253 headset image remains available as fallback.
+  Built only; not copied to or booted on the phone.
+
+# Active handoff — MILESTONE: VirtualAudio builds real ports on SweetBuiltInAudio (2026-11-10 22:05, Claude)
+
+- Boot-args sweetaudiotp=0x6d627573 sweetaudioterm=0x68647068 sweetaudiointerm=0x686d6963 ('mbus'/'hdph'/'hmic')
+  on the 0253 kernel + /product/audio ADT: Device_MikeyBus_Aspen "creating X90 input/output port subtype",
+  published ports pmwi "Mikeybus Headset Microphone", phwt "Mikeybus Headphones Reference", phpw "Mikeybus
+  Headphones" (+ papa). auprobe: device 33 transport 'mbus'. Keep these boot-args in every image from now on.
+- Result: route stays pap -> pnul Null_Device: "no supported route in the current category" ('csav'/'imdf') for
+  the MikeyBus ports; AQMEIO -1 continues; YouTube now reaches FairPlay ("error licensing this video"); Bluetooth
+  route config EndedSuccess but no sound. Codex request research/audio/README.md "22:15" (route tables).
+
+# Active handoff — audio: mbus wrapper engages; needs headset terminal types (2026-11-10 17:06, Claude)
+
+- Built the headset-terminal test image: `outputs/guacamole-0253-audio-mbus-headset.img`, same 0253 kernel and
+  `/product/audio` ADT, with `sweetaudiotp=0x6d627573 sweetaudioterm=0x68647068 sweetaudiointerm=0x686d6963`.
+  Boot args are in `outputs/guacamole-0253-audio-mbus-headset-boot-args.txt`; payload verification confirms those
+  three args and the required `rd=ufsroot0 ufsroot=ios` are present. SHA-256:
+  `33b1e544964b202b12ffa3cb01b02e3d96891c00a99afb26bfbaf529042fc200`. Built only; not copied or booted.
+  The boot-args field is limited to 608 bytes, so this test image omits `-enable_kprintf_spam`, `sweetcpufreq=2`,
+  and `sweethaptic=2` to fit; root, Wi-Fi, Metal and current GPU-present args are retained.
+
+- Booted outputs/guacamole-0253-audio-mbus.img (sweetaudiotp=0x6d627573). dtb/mb.log: VirtualAudio wraps
+  SweetBuiltInAudio as `Device_MikeyBus_Aspen` ("Constructing MikeyBus device"), creates streams (i/35, i/78 = the
+  tap/reference stream it enables, o/34), then `Ignoring headset input stream (0, micr)`, `(1, spkr)`, and
+  `EXCEPTION "Unknown Stream Terminal Type :spkr"` -> "Could not add PhysicalDevice ID: 33". Null_Device stays the route.
+- So MikeyBus wants headset terminal types. NEXT IMAGE (boot-args only, same 0253 kernel + ADT):
+  `sweetaudiotp=0x6d627573 sweetaudioterm=0x68647068 sweetaudiointerm=0x686d6963` ('mbus' / 'hdph' / 'hmic', 0234).
+  Expect a headphones output port (+ headset mic) for SweetBuiltInAudio; then AQMEIO's output port ID should exist
+  (YouTube in Safari, Bluetooth routes). Check: oslog -l mediaserverd for Device_MikeyBus_Aspen / Port_* lines.
+
+# Latest boot image — audio transport `mbus` test (2026-11-10 16:50)
+
+- Built `outputs/guacamole-0253-audio-mbus.img` using the existing 0253 kernel and `/product/audio` ADT, with the existing boot arguments preserved, refreshed `sweettime`, and `sweetaudiotp=0x6d627573` appended. No kernel or ADT changes.
+- Kernel SHA-256: `73aabaf4b788de2de43f0fedc47b5b7f0d3038f8a3d46316162888c4ff49c596`; ADT: `work/guacamole-0253-product-audio.adt`; args: `outputs/guacamole-0253-audio-mbus-boot-args.txt`.
+- Image size: 21,585,920 bytes; SHA-256: `bfed4603d70dad51a7de9eac1314a291240affea05e9827a374adc7f7cf3257e`. Built only; not copied to or booted on the phone.
+
+# Active handoff — audio: /product/audio works; investigate missing codec ports (2026-11-10 16:35, Codex)
+
+- Booted with /product/audio: VirtualAudio now makes ports for SweetBuiltInAudio, but only Null ('pnul'/'pnli').
+- NEW userland/jb/auprobe.c (build.sh): HAL client probe. `auprobe` lists the VADs; `auprobe 33` = our device:
+  transport 'null', HasProperty(mute,outp,3/4) = 1, controls 36/37 mute ctrl outp el 3/4 instantiated (0235 OK).
+- Correction from static analysis: `DeviceFactory_Aspen` does not instantiate a codec wrapper, but common per-device
+  setup directly calls the `Device_Codec_Aspen.cpp` routine at `0x23f8d0` from `0x23d158`, without a transport/UID
+  branch. No AppleAOPAudioController dependency was found on that path. With mute/outp elements 3/4 passing, why the
+  discrete codec ports are absent is still a runtime discrepancy; add jack/outp/0 and volm/outp/2 to auprobe and
+  capture the VirtualAudio connection log. Details: `research/audio/device-codec-construction-1635.md`.
+- Null `pnul` routes are not a usable audio output fallback on this boot: AQMEIO's `dacp/outp/0` lookup returns -1.
+
+# Active handoff — ADT /product/audio for VirtualAudio's speaker port (2026-11-10 16:30, Claude)
+
+- Safari: GPU-process DOM rendering now ON (user, Settings > Safari > Advanced > Feature Flags); pages render, faster.
+  (The old com.apple.mobilesafari key WebKit2GPUProcessForDOMRendering only forces it off; dtb/ has the plist copy.)
+- YouTube in Safari fails on audio: mediaserverd `AQMEIO_HAL Error -1 getting output port ID` at play (no decoder
+  error). With 0235, VirtualAudio still publishes only 'pap' + Null_Device 'pnul'/'pnli' ports, and logs
+  `IORegistryEntryFromPath IODeviceTree:/product/audio returned MACH_PORT_NULL (i.e. failed)` during port setup.
+- tools/mkadt.py --guacamole now adds /product/audio from the D22AP tree (wireless-splitter 1,
+  supports-always-listening 1); NOT /product/haptics (would make MG DeviceSupportsClosedLoopHaptics true ->
+  VibeSynth, no vibration). Verified with `mkadt.py OUT --guacamole --highmem --dump`; dump contains `/product/audio`
+  and no `/product/haptics`. Rebuilt with the existing 0253 kernel and unchanged boot arguments (no kernel change):
+  `outputs/guacamole-0253-product-audio.img` (21,585,920 bytes, SHA-256
+  `e05d2bbb40c9fc95d803dd80fdaeabb4bf2c3ca75777cfc8a108b833df61209a`). ADT:
+  `work/guacamole-0253-product-audio.adt`; args: `outputs/guacamole-0253-product-audio-boot-args.txt`. Image built, not
+  booted. Check after boot: mediaserverd "creating a speaker port" / "Adding port [ type: pspk", no AQMEIO -1.
+- tools/-h (stray mkadt output) moved to _to_delete/ (gitignored); delete it by hand.
+
+# Active handoff — 0253 AppleIPAppender stand-in (CommCenter crash = slow Settings), coreduetd off (2026-11-10 16:05, Claude)
+
+- Settings slowness: Settings > Sounds stalls ~1.2 s on CoreTelephony (voicemail check) while CommCenter crash-loops
+  ("Could not find AppleIPAppender service" -> sig 11). NEW xnu/patches/0253-guacamole-appleipappender-stub.patch
+  (iokit/Kernel/arm/SweetIPAppender.cpp + files.arm64 + KernelConfigTables, like IOWatchdog 0040). On 2026-11-10,
+  `git apply --check` passed against the actual XNU tree (no fuzz/offset); local build through 0253 succeeded. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,047,048 bytes,
+  SHA-256 `73aabaf4b788de2de43f0fedc47b5b7f0d3038f8a3d46316162888c4ff49c596`). Fresh ADT:
+  `work/guacamole-0253.adt` (`--highmem --guacamole`). Boot image:
+  `outputs/guacamole-0253-aw8697-sweethaptic2.img` (21,585,920 bytes, SHA-256
+  `33f3f80c30244fc4257cb879fa22cbcac1d455250669630a9f4b45e6a6108b21`), using the 0252 arguments with refreshed
+  `sweettime`; arguments are saved in `outputs/guacamole-0253-sweethaptic2-boot-args.txt`. Image built, not booted.
+  See `research/commcenter/README.md`.
+- coreduetd ~80% CPU: dasd runs `Duet: executeQuery sync` ~3/s (each ~0.3 s, ~110 Biome file opens). Not CommCenter
+  (stopping it changed nothing). User ran `launchctl disable system/com.apple.coreduetd` + bootout (result pending).
+
+# Active handoff — haptics through mediaserverd WORK with both haptic MG answers OUT of the cache (2026-11-10 15:39, Claude)
+
+- `mgtool unset DeviceSupportsClosedLoopHaptics` + `mgtool unset DeviceSupportsHaptics`, then restart mediaserverd:
+  `vibtest` (4095) -> FigVibrator IOKit route -> SweetVibrator request `+400@256 -1@0`, then stop; the motor vibrates.
+- With DeviceSupportsClosedLoopHaptics in CacheExtra (true OR false!) mediaserverd logs "Using New Unified
+  Haptic/Vibe Engine" (libVibeSynthEngine, research/haptics/ios-i) and every vibration goes to VibeSynth and fails
+  ('!itl' 560559212); SpringBoard's UIKit picks CoreHaptics (level 2) and its haptic server times out.
+  With DeviceSupportsHaptics=false cached: "Device will not vibe as vibrator is not initialized (or not available)"
+  (-16490). Leave both answers to MobileGestalt (not cached); restarting MobileGestaltHelper changes nothing.
+- So the Settings "Sounds & Haptics" title cannot come from MobileGestalt: edit Settings' own specifier instead (todo).
+- vibtest's system-sound modes DO reach mediaserverd (Incoming Request in oslog); they failed only because of the above.
+- Next: reinstall dtb/haptics/SystemSoundVibrationPatterns-legacy.plist (D22, chmod 644, restart mediaserverd) so
+  Atoms-only sounds (1520 OrbPop_Haptic, switches) become taps.
+
+# Active handoff — 0252 haptics: set the chip up again at the first play, one player at a time (2026-11-10, Claude)
+
+- NEW xnu/patches/0252-guacamole-haptic-reinit-serialize.patch (after 0251; sweet_haptic.c + SweetVibrator.cpp).
+  Patch applied cleanly after 0251 and built. Kernel: `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`
+  (17,039,120 bytes, SHA-256 `571dd6154e4f05714dc167ab8c12f9982a7346cccac3e5aa07804a3c46c09694`). Fresh ADT:
+  `work/guacamole-0252.adt` (`--highmem --guacamole`). Boot image:
+  `outputs/guacamole-0252-aw8697-sweethaptic2.img` (21,577,728 bytes, SHA-256
+  `281dfb27581baed882b75a09373d3a5ee55966054558988b31ad888cc9938cb6`), with the usual 0250 haptics test args
+  (`sweethaptic=2`, refreshed `sweettime`). Payload verified byte-for-byte after unpack. Built `userland/out/haptic`
+  and installed atomically to `/var/local/bin/haptic` on 192.168.0.51 (cksum `554221565 50224`). Image not booted.
+  - The boot-time set-up (50 s) leaves the motor silent until `haptic init`; so hp.fresh: the first play after boot
+    (vibrator or sysctl) runs hap_configure again first (no click, ~0.7 s once). Boot-arg sweethapticidle=S also does
+    it before any play after S idle seconds (default 0 = off), in case the chip goes quiet again later.
+  - hap_configure now holds hp.lock for the whole reset + set-up (the reset pulse was outside it).
+  - SweetVibrator's thread call is THREAD_CALL_OPTIONS_ONCE: a request during a playing pattern re-runs after it
+    instead of a second play() racing on another worker (overlapping requests locked the chip).
+- User wants every haptic through mediaserverd (no UIKit hook). Open: from the UI, mediaserverd currently sends the
+  vibrator nothing (Settings switches / long-press / Ringtone>Vibration previews), with either pattern file. Earlier
+  today previews (+1000/-1000) and one long-press (+400/-100 REPEAT) did arrive. vibtest's system-sound modes never
+  reach it (root background client): only `vibtest io` is a valid test. Next: oslog of mediaserverd during a preview.
+
+# Active handoff — 0251 haptics: `haptic init` + per-play chip status (2026-11-10, Claude)
+
+- Status: motor SILENT on the current boots (0250): `haptic 1`, `haptic buzz`, the boot click and `vibtest io` all
+  do nothing, though kern.sweet_haptic reads 0x97 (configured: RAM loaded) and SweetVibrator receives requests
+  (`vibtest io 30` -> request #1 +30@256). The bootloader's vibration works (motor + wiring fine). It worked on the
+  0248/0249 boots, which came straight after Android (register dumps): suspect Android's aw8697 driver leaves
+  something set up that ours does not (cold boot = silent). The boot log is lost to `exec` spam before SSH is up (~60 s).
+- NEW xnu/patches/0251-guacamole-haptic-init-report.patch (after 0250, only bsd/dev/sweet_haptic.c): setup moved
+  into hap_configure(); sysctl kern.sweet_haptic = 200 (`haptic init`, userland/jb/haptic.c) redoes reset + config +
+  RAM + click + register dump on demand; every play/buzz/click logs SYSST/SYSINT/GLB_STATE/SYSCTRL 5 and 25 ms after
+  GO (`SWEET HAPTIC: play: +5ms sysst .. sysint .. glb ..`): shows boost error / UVL / OCD / OT or a play that never
+  starts. `haptic reg R [V]` reads / writes any chip register live (value 0x100000|w<<16|R<<8|V; result in dmesg).
+  `haptic dump` (201): chip registers + SE + GCC vote/branches + TLMM pins, nothing changed.
+  FINDING 15:06 (built 0251): `haptic init` fixes the motor; direct `haptic N/stop/buzz` keep working; ANY
+  `vibtest` run (even modes that never reach SweetVibrator: 4095 / 1520 via mediaserverd) locks the motor until
+  `haptic init`. Suspect the audio side (mediaserverd/AudioToolbox waking our audio code) touching a shared GCC vote,
+  QUP0 / pin (reset GPIO116) the AW8697 uses. Compare `haptic dump` working vs after vibtest.
+  Phone 14:50: no play works at all now, with or without a stop first (one stop+play earlier did buzz once). Patch applied cleanly after 0250 and built locally: `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,039,336 bytes, SHA-256 `9988cced1472d860ea074d685b9027a96109dc396e987818d573f1e9f7aeb634`). Rebuilt `userland/out/haptic` from `userland/jb/haptic.c` and installed atomically to `/var/local/bin/haptic` on 192.168.0.51 (MD5 matches local build: `76952da9220f660510bd08fb49933e48`). Built fresh ADT `work/guacamole-0251.adt` (`--highmem --guacamole`) and boot image `outputs/guacamole-0251-aw8697-sweethaptic2.img` (21,581,824 bytes, SHA-256 `df28c49f70293e3bce3247481d9d2b53c98969bf3fcd53539870c9a79cb77989`), using the 0250 test arguments with refreshed `sweettime`; unpacked ramdisk byte-matches the payload. Image is built but not booted.
+- Also new: userland/jb/vibtest.c (+ build.sh, with mgq): `vibtest [ID]`, `vibtest pat MS..`, `vibtest io [MS]`
+  (straight IORegistryEntrySetCFProperties on "vibrator"). System sounds played from vibtest (root, background) reach
+  nothing: not a valid test of mediaserverd.
+- tools/haptic-patterns.py: adds legacy VibePattern to the Atoms-only entries of MediaExperience's
+  D22/SystemSoundVibrationPatterns.plist (dtb/haptics/*-legacy.plist; currently NOT installed, original restored,
+  backup /var/local/SystemSoundVibrationPatterns-D22.orig.plist on the phone). Untested while the motor is silent.
+
+# Active handoff — Request H haptics disassembly (2026-11-10)
+
+- Completed the iOS 16.7.16 / 20H392 analysis in `research/haptics/ios-h/RESULTS.md`. UIKit’s feedback tier reads `DeviceSupportsHaptics` only when the Core Haptics level-2 branch is unavailable/disabled; it does not read `DeviceSupportsClosedLoopHaptics` there. UIKit’s generic system-sound engine passes Flags and optional Volume, not Loop/LoopPeriod/VibrationPattern, and its stop path calls `AudioServicesStopSystemSound(soundID, true)`.
+- FigVibrator’s legacy IOKit parser only understands `Intensity`, `VibePattern`, or legacy duration keys; it does not parse `Atoms`. Missing a recognized pattern triggers a one-second total-duration fallback. The exact request dictionary / Home Screen action ID and missing-stop point remain unproven without runtime capture. See RESULTS.md for proven details, inferred explanation, and capture points.
+
+# Active handoff — 2026-11-10 (Claude): mgtool takes question names, not obfuscated keys
+
+- `mgtool` hashes its NAME argument (base64(MD5("MGCopyAnswer"+name))[:22]). The haptics steps had passed the already
+  obfuscated keys (`cBy4BcYs5YWtFHbBpt4C6A`, `gqDnklGQnpv5ilgh5uHckw`), which wrote junk keys
+  (`EGAqnEa1S8GfhA8ch9Yh7g` for the latter) and left the real answers unset: why "Sounds & Haptics" never appeared.
+- Fixed in NOTES / research docs: `mgtool setbool DeviceSupportsHaptics true`, `mgtool setbool DeviceSupportsClosedLoopHaptics true`;
+  remove the junk with `mgtool unset cBy4BcYs5YWtFHbBpt4C6A` and `mgtool unset gqDnklGQnpv5ilgh5uHckw`; check with `mgq`.
+
+# Active handoff — 0250 vibrator: every request logged, `haptic stop` ends patterns (2026-11-10, Claude)
+
+- 0249 test: something makes the motor vibrate continuously for a long time; `haptic stop` stopped the motor
+  only until SweetVibrator's pattern loop started the next segment (a REPEAT pattern), so it "stops after a while"
+  (the 60 s cap). Request lines had rolled out of dmesg (only the first 20 were logged). Settings still says
+  "Sounds" (Request G in research/haptics/README.md: the "can vibrate" MobileGestalt answer).
+- NEW xnu/patches/0250-guacamole-vibrator-log-stop.patch (after 0249): sysctl stop (`haptic stop`) bumps a
+  counter (sweet_haptic_stops) that ends the running pattern; repeat cap 30 s; EVERY request logged:
+  `SWEET VIBRATOR: request #n: K segment(s) [REPEAT] [ms@level/256] +500@256 -500@0 ... (keys, hertz_millisecs class)`
+  or `stop (OSNumber 0)`. patch --dry-run OK on 0249. Not compiled.
+- BUILT (2026-11-10): patch 0250 applied cleanly after 0249; local XNU build succeeded. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,129,536 bytes,
+  SHA-256 `7801bcad5e66054a0a40afd5153d7af50d9344fa4369e9a6730d43a288bc3073`). Fresh ADT:
+  `work/guacamole-0250.adt` (`--highmem --guacamole`, 105,596 bytes). Payload:
+  `outputs/payload-guac-0250-aw8697-sweethaptic2.bin`. Boot image:
+  `outputs/guacamole-0250-aw8697-sweethaptic2.img` (21,581,824 bytes, SHA-256
+  `c9c711909e6200785f8006a74627e0feb8a0079f417bab25c4c25c443d50a96f`). Args are saved in
+  `outputs/guacamole-0250-sweethaptic2-boot-args.txt`; same as 0249's `sweethaptic=2` test args with a refreshed
+  `sweettime`. The known 0249 image remains available as fallback. 0250 image has not been booted.
+- Test: boot the 0250 image; when it buzzes, `dmesg | grep -a "SWEET VIB" | tail`; `haptic stop` must stop it
+  for good and every request should be logged.
+
+# Active handoff — 0249 "vibrator" IOService: iOS vibration -> AW8697 (2026-11-10, Claude)
+
+- Request F (research/haptics/ios-e/REQUEST-F.md): UIKit feedback level = 2 only with Core Haptics first-party
+  hardware (not here); else MobileGestalt bool cBy4BcYs5YWtFHbBpt4C6A (false -> 0 "Haptics: unsupported", true ->
+  1). Level 1 plays feedback as system sounds with vibration -> mediaserverd SSServer -> MediaExperience
+  FigVibrator; VibeSynth only if libVibeSynthEngine.dylib's VibeSynthEngineHasHardwareSupport() (expected false
+  here) -> else IOServiceNameMatching("vibrator") + IORegistryEntrySetCFProperties. Keyboard "Haptics: disabled"
+  = the keyboard haptic preference (Settings > Sounds & Haptics > Keyboard Feedback).
+- NEW xnu/patches/0249-guacamole-vibrator-service.patch (after 0248): iokit/Kernel/arm/SweetVibrator.cpp
+  (IOService named "vibrator", KernelConfigTables personality on IOResources, files.arm64), setProperties:
+  {intensity SInt32 16.16, hertz_millisecs [on-state, ms, off-state, ms, ...], repeat} plays on a thread call
+  (on <= 40 ms: tap waveform 1..5 by intensity, 20 if strong and >= 25 ms; longer: buzz; off: wait; repeat
+  loops <= 60 s); a non-dictionary (FigVibrator's stop = CFNumber 0) stops. Logs `SWEET VIBRATOR: request #n`.
+  sweet_haptic.c exports sweet_haptic_ready / _wave / _buzz. Patch applied cleanly after 0248 and compiled.
+- Built through 0249 (2026-11-10): kernel at
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,039,232 bytes,
+  SHA-256 `af53a6f439e748f7d8a215bd7c469406d4b0e94ceb4f18cb79a35683abd42e84`); fresh ADT
+  `work/guacamole-0249.adt` (105,596 bytes, `--highmem --guacamole`); test boot image
+  `outputs/guacamole-0249-aw8697-sweethaptic2.img` (21,577,728 bytes, SHA-256
+  `8e944841d0a7a6f1dff15f047ea9ebb74a57397b8f850bc5a3fb5bc7a0989a12`). Payload is
+  `outputs/payload-guac-0249-aw8697-sweethaptic2.bin`; exact boot args are in
+  `outputs/guacamole-0249-sweethaptic2-boot-args.txt` (same 0248 test args, refreshed `sweettime`, includes
+  `sweethaptic=2`). The packaged ramdisk was unpacked and byte-compared with the payload. Image has not been booted.
+- Test: build through 0249, boot with sweethaptic=2. Phone: `mgtool setbool DeviceSupportsHaptics true`,
+  killall -9 SpringBoard (or reboot); Settings > Sounds & Haptics: System Haptics on, Keyboard Feedback > Haptic.
+  Then keyboard / switches / long-press; `dmesg | grep -a -e "SWEET VIBRATOR" -e "SWEET HAPTIC"`; and
+  `grep -a "_UIKBFeedbackGenerator.*Updating mode"` in an oslog capture (want "Haptics: supported"? level 1 still
+  logs unsupported: only 2 counts as supported there, see REQUEST-F).
+- Caveat: keyboard haptics in _UIKBFeedbackGenerator want level 2; at level 1 the keyboard may stay audio-only
+  while UIKit's impact/selection/notification generators and system vibration use this path.
+
+# Active handoff — 0248 AW8697 haptics driver (stages 1 + 2) (2026-11-10, Claude)
+
+- RESULT (user, 09:05): WORKS. `haptic 5` feels like a keyboard tap; `haptic buzz` like the charging buzz.
+- Hardware (research/haptics/README.md): motor = Awinic AW8697 @ I2C 0x5a on QUP wrapper 0 SE7 (0x89c000),
+  SDA/SCL GPIO98/99 (south, qup7 = mux 1), reset-gpio 116 (south; the DT *property* is what OnePlus's driver
+  uses), irq-gpio 24 (east, unused), GCC vote 0x5200c bits 6/7/17, SE7 RCG 0x17998 (DFS), branches
+  0x17004/0x17008/0x17994 (Request D). f0 168.9 Hz -> aw8697_haptic_168.bin.
+- NEW xnu/patches/0248-guacamole-aw8697-haptics.patch: bsd/dev/sweet_haptic.c (+ bsd/conf/files, called from
+  sweet_ufs.c after sweet_touch_init). Thread starts after sweethapticdelay (50 s). Boot-arg sweethaptic:
+  0 off; 1 (default) probe only: clocks, SE7 init (stops with a log line if the SE has no I2C protocol firmware:
+  `SE7 has no I2C protocol firmware loaded by the boot chain`), reset pulse, ID (want 0x97), register dump;
+  2: soft reset, restore Android's idle configuration (table from dtb/haptics/aw8697-registers-android.txt,
+  config registers only), RAM load from ADT /sweet-haptic "ram", one click, dump. sysctl kern.sweet_haptic:
+  N plays waveform N, -ms buzzes (waveform 10 looped), 0 stops.
+- tools/mkadt.py --guacamole adds /sweet-haptic { ram = dtb/haptics/aw8697_haptic_168.bin } (checksum checked;
+  warning + no node if the file is missing). The file is OnePlus's, not in git.
+- NEW userland/jb/haptic.c (build.sh: build haptic): `haptic`, `haptic N`, `haptic buzz MS`, `haptic stop`.
+- Built (2026-11-10): kernel through 0248 at `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,035,336 bytes); `work/guacamole-0248.adt` includes `/sweet-haptic` with the 5,826-byte RAM image; `sh userland/build.sh` succeeded, including `userland/out/haptic` and the other userland tools. Default probe image: `outputs/guacamole-0248-aw8697-haptics.img` (21,577,728 bytes), SHA-256 `de85a1f0f390bb5e43b77b2adeef48c599dac0ff1fb6b5ee993fea2fadd13d84`, packaged with the fullmetal template/shim and the established 0239 boot arguments (refreshed `sweettime`); exact args in `outputs/guacamole-0248-boot-args.txt`. Test image with `sweethaptic=2`: `outputs/guacamole-0248-aw8697-sweethaptic2.img` (21,577,728 bytes), SHA-256 `475c7afa27c839847991eee16bc28312e2425d4c6042c70918388ed77de13f6c`; exact args in `outputs/guacamole-0248-sweethaptic2-boot-args.txt`. Neither image booted or installed.
+- Test A (safe): build through 0248, new ADT, default boot-args (sweethaptic=1); after ~1 min
+  `dmesg | grep -a "SWEET HAPTIC"`: want `id 0x97` + 8 dump lines matching the Android dump's values.
+- Test B: add sweethaptic=2: a click ~50 s after boot; then `haptic 1` .. `haptic 20`, `haptic buzz 300`.
+
+# Known limit — Weather / Stocks have no data: FairPlay (Mescal) signatures (2026-11-10, Claude)
+
+- Weather shows dashes for every city, Stocks "Stocks unavailable". Stocks' log: `AMSFairPlayGetHardwareInfo:
+  Failed to fetch hardware info. Error = -42184` -> `SDSAuthTokenService failed to generate mescal signature`
+  (AMSErrorDomain 12 "Mescal Failed"); requests are never sent. Weather: no network activity at all, same layer.
+- FairPlay (fairplayd.H2 job removed in v13; no FairPlay kernel extension) is Apple's DRM / device
+  authentication tied to genuine hardware. Not emulated, by decision: services that need Mescal-signed
+  requests (Stocks' data service, WeatherKit) stay empty. News WORKS (user, 08:14): not every Apple service needs
+  Mescal. Third-party apps with their own back ends are unaffected.
+- Not caused by CommCenter (stopping it changed nothing) or by the network path (no offline banner; Safari works).
+
+# Active handoff — vibration / Taptic haptics: research first (2026-11-10, Claude)
+
+- User wants the vibration motor, Taptic-style if possible. Guacamole DT identifies an AW8697 on I2C as the
+  actual motor driver; the PM8150B haptics peripheral is not the motor path, so no SPMI haptics writes are
+  needed. Request C's OnePlus AW8697 source is now copied to `dtb/haptics/src/`; provenance and the verified
+  waveform-bin layout are in `research/haptics/README.md` and `dtb/haptics/src/SOURCE.md`. iOS 16 findings and
+  the remaining uncertainty about the concrete IOKit hardware endpoint are in `research/haptics/README.md`.
+  No kernel implementation yet.
+
+# Active handoff — Location Services row missing = no CommCenter (2026-11-10, Claude)
+
+- RESULT: with CommCenter back the row appears and toggles, but CommCenter crash-loops (NULL in
+  ApplePDPHelperInterface::callStructMethod from the AQMController queue, ~5 s after start). Analysis + Codex request:
+  research/commcenter/README.md (crash report there too).
+- Settings > Privacy & Security shows everything except "Location Services". oslog Preferences:
+  `-[PUIPrivacyController refreshLocationServicesAvailable]: Error retrieving subscription info: ...
+  com.apple.commcenter.coretelephony.xpc was invalidated: failed at lookup with error 3 - No such process`.
+  MobileGestalt location-services is already true; locationd is stable. CommCenter was removed from launchd.plist
+  in v13 (crash loop from objc block trampolines, fixed by the 0044-era cryptex links; and Setup blocked on it,
+  Setup is skipped since v14). vmd's 100% spin is likely the same missing CoreTelephony.
+- NEW tools/sweet-root-tweaks.py `--add-job ORIGINAL_LAUNCHD_PLIST LABEL IN OUT`: copies one job from the IPSW's
+  unmodified launchd.plist (Codex has it from mkiosroot's extraction) into the phone's.
+- Test (Codex + user): pull /System/Library/xpc/launchd.plist from the phone (keep a backup there:
+  /var/local/launchd.plist.pre-commcenter), run `--add-job ORIG com.apple.CommCenter phone.plist new.plist`, push,
+  reboot. Check: `ps -A -o pid,%cpu,time,comm | grep -i commcenter` (stable pid, low CPU), Settings > Privacy row,
+  vmd CPU. Rollback: copy the backup back, reboot. If it works: drop com.apple.CommCenter from REMOVED_JOBS.
+
+# Active handoff — 0247 MSAA resolve targets (Maps black map, ROOT CAUSE) (2026-11-10, Claude)
+
+- RESULT (user, 07:43): Maps' map is no longer black. 0247 confirmed.
+- 0246 RESULT: every Maps drawable 64/64 black at present. Maps' passes: color 1125x2436 fmt 81 load DontCare,
+  store 2 = MTLStoreActionMultisampleResolve: it renders 4x MSAA and resolves into the CAMetalLayer drawable.
+  The bridge ABI (NmbPassAttachment) had no resolve texture at all, so the resolve target was never written.
+- CHANGE (0247), needs the Rust bridge rebuilt (tools/build-m2v-bridge.sh) AND the bundle (userland/metal2/build.sh):
+  - bridge/NativeMetalObjects.h + .rs: NmbPassAttachment gains resolve (NmbTexture*), resolve_level, resolve_slice,
+    resolve_depth_plane (appended; header and Rust #[repr(C)] match); nmb_render_encoder_new sets
+    resolve_texture/_level/_slice/_depth_plane on colour, depth and stencil attachments (metal2vulkan-runtime
+    render_pass.rs already supports them).
+  - NativeBridgeMetalFrontend.mm: attachment() passes a.resolveTexture (owned, surface-tracked, drawsToSurface),
+    logs `pass resolves WxH (N samples) into WxH fmt F surf S #n (0247)` (first 3, every 300th).
+  - Not compiled. Any app using MSAA with a resolve texture (games, Maps, MapKit views) was affected.
+- 0243/0245 waits and the 0244/0246 logging stay for now (cheap); remove 0246 sampling once Maps is confirmed.
+
+# Active handoff — 0243 Maps black map: presentsWithTransaction drawables (2026-11-10, Claude)
+
+- 0245 RESULT: never fired (no in-flight GPU work on the drawable at present): timing is not the cause; still black.
+- 0246 (same file): the present hook samples the drawable (prePresentBlackSamples, 8x8) for presents 1-10 and
+  every 300th: `present #n frame WxH fmt F surf S: B/64 black (0246)`. Black -> Maps' rendering produces black
+  (translation); not black -> backboardd/CA composition of presentsWithTransaction drawables.
+- 0244 RESULT: Maps' layer 1125x2436 fmt 81 presentsWithTransaction=1, -[drawable present] after each
+  nextDrawable; the 0243 wait fired only twice (after 5 presents): Maps presents without waitUntilScheduled.
+- 0245 (same file): the swizzled -[drawable present] first waits (GPU only, nmb_command_buffer_wait) on every
+  in-flight command buffer that uses the drawable's texture (nmb_command_buffer_uses_texture), logged
+  "drawable present waited for its GPU work #n (0245)". Rebuild/install bundle, reboot, test Maps.
+- RESULT: Maps still black (confirm the installed bundle had 0243). 0244 (same file): logs CAMetalLayer
+  nextDrawable (size, fmt, presentsWithTransaction, framebufferOnly) and -[drawable present] (swizzled, not in
+  backboardd; first 5 then every 300th), and the 0243 wait when it fires. Rebuild/install, reboot, log on, open Maps:
+  `grep -a "Maps\]" /var/local/mtl2.log | grep -e nextDrawable -e "drawable present" -e 0243`. No nextDrawable at
+  all = the map is not a CAMetalLayer (IOSurface layer contents: then the IOSurface seed after GPU writes).
+- Maps: map area black. mtl2.log: no refusals/MISSING, 186 pipelines OK, map renders (work commit #60: 75 draws
+  into a 1125x2436 fmt 81 IOSurface target), but NO "drawable queued" line ever: Maps never calls
+  presentDrawable: on a command buffer. GeoServices cache has ResourceManifest/Resources (data side fine).
+  Hypothesis: VectorKit's CAMetalLayer uses presentsWithTransaction (commit, waitUntilScheduled, [drawable present]);
+  CA composites the IOSurface before Turnip has drawn it (our fence is invisible to CA) and the on-demand map
+  never redraws -> black.
+- CHANGE userland/metal2/NativeBridgeMetalFrontend.mm (0243): NBCommandBuffer.drawsToSurface set when a render
+  pass attachment is an IOSurface; waitUntilScheduled then also waits for the GPU (nmb_command_buffer_wait, not the
+  handler group: no deadlock with main-queue handlers). Skipped in backboardd. Not compiled.
+- Test: rebuild/install bundle (with 0242), reboot, open Maps: map visible? If still black, next: log
+  CAMetalDrawable -present calls in Maps (presentsWithTransaction vs plain present) with the trace flag.
+
+# Active handoff — profile backboardd before touching the Rust bridge / blur (2026-11-10, Claude)
+
+- First capture useless: tsample picked thread #23 at 0.5% (instantaneous cpu_usage), ~95% of samples in
+  mach_msg. CHANGE userland/jb/tsample.c: picks the thread with the most CPU time over 1 s (user+system deltas),
+  lists the top 5, optional 4th arg THREAD index. Rebuild + reinstall tsample. User then runs
+  `sleep 4; tsample PID 1500 > /var/local/bb-scroll.txt` and scrolls during the sleep and the ~7 s capture.
+- Home-screen scrolling now ~45-48 fps (was 19.5) after removing CPU hogs; GPU 60-71% busy, backboardd ~140% CPU.
+- User wants cheaper blur or a faster Rust half. The bridge (metal-work/metal2vulkan, 220k lines in
+  metal2vulkan-runtime) is already built with fat LTO, codegen-units 1, cortex-a76. Its per-draw path
+  (render.rs draw -> draw_resident: sync_heaps, degrade_* checks, coverage/routing tracking per draw) is generic;
+  no blind changes: profile first.
+- NEEDED (Codex):
+  1. Build tsample (not in userland/build.sh): `xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2
+     -o out/tsample userland/jb/tsample.c && codesign -f -s - --entitlements userland/jb/tsample.plist out/tsample`,
+     install /var/local/bin/tsample (root, 0755).
+  2. User scrolls the home screen continuously; meanwhile on the phone:
+     `tsample $(ps -A -o pid,comm | awk '/backboardd$/{print $1}') 1500 > /var/local/bb-scroll.txt`
+     (awk may be missing: use the pid from ps). Copy it to research/metal/bb-scroll.txt.
+  3. On the Mac: `tools/tsample-report.py research/metal/bb-scroll.txt --dsym userland/metal2/out/SweetMetal2.dSYM
+     > research/metal/bb-scroll-report.txt` (NEW tool: atos-symbolicates SweetMetal2 frames, self/total %). The dSYM
+     must be the one of the bundle installed on the phone (the 0242 build).
+  4. Telemetry for pass counts (blur cost): `touch /var/local/mtl2-telemetry /var/local/mtl2.log; chmod 666
+     /var/local/mtl2.log`, reboot, scroll 20 s, copy the two last "telemetry" blocks of mtl2.log (R passes, D draws,
+     F full-screen passes, M biggest pass) to research/metal/telemetry-scroll.txt; then remove both files again.
+
+# Active handoff — home screen lag = CPU hogs; btbridge busy loop fixed (2026-11-10, Claude)
+
+- Home-screen scrolling 19.5 fps with GPU busy 10% of vsyncs: CPU-starved. `ps -A -o pid,%cpu,time,comm`:
+  vmd 107% (visual voicemail, no CoreTelephony; the old launchctl disable did not survive), btbridge 99.6%,
+  CalendarWidgetExtension 99%, coreduetd 82%, backboardd 29%, launchd 25%, biomed 20%, wland 17%.
+- FIX userland/bt/btuart.c drain(): was uart_read(.., 3) = a 3 ms MMIO busy-poll on every btbridge main-loop
+  pass (~100% of a core forever). Now empties the RX FIFO and returns at once (whole words when the buffer is
+  nearly full; partial word left in the FIFO); btbridge's own usleep (0.5 / 5 ms) does the waiting. Also changes
+  btuart's test modes (firmware download, scan) to non-waiting drains; their final uart_read waits are unchanged.
+  Syntax-checked only. Rebuild userland (build.sh), install /var/local/bin/btbridge (.new + mv), `launchctl
+  kickstart -k system/com.sweet.btbridge` (or reboot). Check: ps shows btbridge ~0-5%; AirPods still connect/play.
+- User side: `launchctl disable system/com.apple.voicemail.vmd` and `user/501/...`, kill vmd and the calendar widget.
+
+# Active handoff — 0242 frontend per-draw overhead (2026-11-10, Claude)
+
+- @2x dropped: 828x1792 also showed the red rdar bar (user keeps @3x). Boot image A (sweetcpufreq=2, no
+  sweetfb_scale, normal ADT); user restores the MobileGestalt cache from /var/local/MobileGestalt.plist.at3x.
+  0240/0241 stay in the series (no effect without sweetfb_scale=2).
+- CHANGE userland/metal2/NativeBridgeMetalFrontend.mm ("0242", frontend only, no kernel change):
+  - Diagnostics that ran on EVERY bind/draw now only when /var/local/mtl2-trace exists (traceOn(), read once):
+    0182 texture/sampler associated dictionaries + stringWithFormat per fragment texture/sampler bind, pipeline
+    "pipe" association per setRenderPipelineState, traceBigTextureDraw per draw, encoder "target" string per
+    render pass, 0188 watchedSurface mutex + NSNumber per texture bind.
+  - Cull/winding/fill: plain ivars instead of associated NSNumbers; nmb_render_set_raster only when one changes.
+  - resourceOwners / surfaces: skip addObject when the same buffer/texture is bound again in the encoder
+    (_lastOwner[2], identity only; the earlier object is retained by the command buffer, so its address cannot be reused).
+- Rebuilt with `METAL_WORK="$PWD/../metal-work" sh userland/metal2/build.sh`; ad-hoc signature verified. Installed at
+  `/System/Library/Extensions/SweetMetal2.bundle` on `192.168.0.51` through a staged copy and rename. Prior bundle
+  preserved as `SweetMetal2.bundle.pre-codex-20261110-064942`. Installed `SweetMetal2`, Turnip, and CodeResources
+  checksums match the local build. SHA-256: `0ecfd83b432286baaaa136c88d3b4d2b110f8c98e06f72fe15567cfb16938cc8`
+  (SweetMetal2), `55d231439a2aba105f8cbe03883062979f86a41ffe2fed804aadf87efe9b1af5` (Turnip), and
+  `9f7aea4c96dd1fb9c4b3c0769554ecede146d1fc025d1a81e6dd788f4bba79c4` (CodeResources). No reboot performed;
+  restart/reboot before testing so existing processes load the new bundle.
+- Measure before/after: Subway Surfers ~20 s, `dmesg | grep -a "SWEET FB: 5s: .* swaps" | tail -4`, and
+  `tsample` on SubwaySurf's busiest thread (top frames). If the bridge itself (libnative_metal_bridge, Rust,
+  outside this repo in metal-work/m2v-bridge) dominates, that is the next target.
+
+# Active handoff — 0241 @2x screen = 828x1792 (2026-11-10, Claude)
+
+- Image B (750x1624 @2x): red rdar://45025538 bar at the top = UIKit has no status bar layout for 375x812 pt @2x.
+- NEW xnu/patches/0241-guacamole-fb-scale2-xr-size.patch (after 0240): sweetfb_scale=2 -> 828x1792 (414x896 pt @2x,
+  iPhone XR/11 screen, same 19.5:9 aspect; 1.85x fewer pixels than 1125x2436). mkadt.py --scale2 now writes canvas
+  828x1792 (display-scale 2). Rebuild image B with kernel through 0241 + new --scale2 ADT; same boot-args.
+- On the phone before booting it: move the MobileGestalt cache aside again (it now holds the 750x1624 answers);
+  after boot re-apply `mgtool setstr WifiVendor USI` and `mgtool setint ArtworkTraits/ArtworkDeviceSubType 2556`.
+- If UIKit still shows the red bar: the XR layout may also need ArtworkDeviceSubType 1792 (XR) instead of 2556,
+  which would mean no Dynamic Island at @2x.
+- Rebuilt kernel through 0241 successfully. Kernel SHA-256:
+  `d133e619e639450317ed7621b0efef2d966f69560b4ae3d9e58160fc5cddc00a`.
+- Rebuilt Image B with a freshly generated `mkadt.py --highmem --guacamole --scale2` ADT and the previous B boot
+  arguments (including `sweetcpufreq=2 sweetfb_scale=2`; refreshed `sweettime`):
+  `outputs/guacamole-0241-B-cpu-clocks-scale2-xr.img` (21,553,152 bytes), SHA-256
+  `bd76e57430b7a411378d68eb984485e16d2fde5be1058b67a6f5bf9a02373cb8`. Boot args are in
+  `outputs/guacamole-0241-B-boot-args.txt`. Not booted yet.
+
+# Active handoff — performance: CPU clocks + @2x rendering (2026-11-10, Claude)
+
+- User wants (1) CPU clocks up and (2) rendering at @2x.
+- (1) No code change: sweet_cpufreq.c defaults to sweetcpufreq=1 (read/log only; cores stay at the boot's rate).
+  Boot-arg `sweetcpufreq=2` asks both A76 domains (cpu 4-6 2419.2 MHz, cpu 7 2956.8 MHz) for their top row.
+- (2) NEW xnu/patches/0240-guacamole-fb-scale2.patch (SweetFramebuffer.cpp, after 0239): boot-arg `sweetfb_scale=2`
+  -> presented screen 750x1624 (375x812 pt @2x) instead of 1125x2436; panel blit upscales x1.92. Boot log line
+  `SWEET FB: presented screen 750x1624 (@2x, 0240)`. tools/mkadt.py `--scale2`: /chosen display-scale 2 and
+  disp0 canvas 750x1624 (checked: only those 5 bytes differ from a normal --highmem --guacamole ADT).
+  BOTH are needed together (ADT and boot-arg must agree).
+- Build TWO images so the effects can be told apart:
+  A: kernel through 0240, normal ADT, current boot-args + `sweetcpufreq=2`.
+  B: same kernel, ADT `mkadt.py ... --highmem --guacamole --scale2`, boot-args + `sweetcpufreq=2 sweetfb_scale=2`.
+- Before booting B (user, over SSH): MobileGestalt caches the screen size/scale. Record the custom answers, back
+  up the cache and move it aside (rebuilt at boot), then re-apply the answers after B boots:
+  `mgtool get metal gamekit WifiVendor ArtworkTraits` (save output);
+  `cp -p .../com.apple.MobileGestalt.plist /var/local/MobileGestalt.plist.at3x` and `mv` it to `.at3x` in place.
+  Rollback: boot A / old image, put the .at3x copy back, reboot.
+- Risk: the Dynamic Island comes from ArtworkTraits/ArtworkDeviceSubType 2556 (iPhone 14 Pro, an @3x device);
+  at @2x SpringBoard may lay it out wrong or not at all.
+- Built kernel through 0240 successfully. Kernel SHA-256:
+  `995fe52a9057644a8f6f804fdb4a3dc47f51f8332c15e1a1c793e6d7e0a3dbb0`.
+- Image A (CPU clocks at native 1125x2436): `outputs/guacamole-0240-A-cpu-clocks-native-resolution.img`, SHA-256
+  `368a3a40f4ee78d64c0fd56aadbbd1ef766e57c5d3d97cf087d90e0a6546c1b9`.
+- Image B (CPU clocks plus 750x1624 @2x canvas): `outputs/guacamole-0240-B-cpu-clocks-scale2.img`, SHA-256
+  `73231b4e9c4578fde785d8e713b8ad02f8ceb06faf9878f6fcc2f34f20f65447`. Both use the same kernel and refreshed
+  base boot arguments; only Image B uses the scale2 ADT and adds `sweetfb_scale=2`. Boot args are recorded in the
+  corresponding `outputs/guacamole-0240-*-boot-args.txt` files. Neither image has been booted yet.
+
+# Active handoff — 0239 island drawn as strips (2026-11-10, Claude)
+
+- User on 0237: the "square" is still there. The island is a pill copied as its bounding box without blending
+  (CP_BLIT, no blend), so its transparent corners show black.
+- NEW xnu/patches/0239-guacamole-fb-island-strips.patch (SweetFramebuffer.cpp, after 0237): sweet_fb_top_band_box
+  now returns up to 16 horizontal strips (struct sweet_fb_island), each as wide as the island's opaque black
+  pixels in its rows; presentGPU copies each strip from the CA layer and the game layer above/below the island
+  and left/right of each strip (every panel pixel still written once). blits[] = 4 + 3*16 on the stack (~2.9 KB),
+  IB ~1.7k dwords of 4k. New log (first 4, then every 600th): `SWEET FB: island: N strips, logical box ...`.
+- patch --dry-run OK on 0236+0237. Not compiled.
+- Test: build through 0239 (0238 is sweet_gpu.c, independent); Subway Surfers with a timer: pill edges should be a
+  fine staircase, no square. `dmesg | grep -a "SWEET FB: island"` gives the box size if it is still wrong.
+- Built successfully through 0239 with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; kernel
+  includes the 0238 recovery code and 0239 strip log. Kernel SHA-256:
+  `edd0e6320cf17b1fe4110c83246736e32101687c1760e6b521bfd2dfdd01c564`.
+- Boot image: `outputs/guacamole-0239-fb-island-strips.img` (21,553,152 bytes), SHA-256
+  `a2c5fe98a6eccc7ebc111684af65aafef2e0933495c0ed81f6c123f86a859f47`; current ADT generation, fullmetal template,
+  shim and 0238's established arguments with refreshed `sweettime`. Args are in
+  `outputs/guacamole-0239-boot-args.txt`. Not booted yet.
+
+# Active handoff — 0238 GPU hang recovery (2026-11-10, Claude)
+
+- RESULT (user, 05:37): WORKS. Daily-wheel hang -> `RECOVER #1..#3 done` (GBIF acks 1 1 1, ME_INIT ran,
+  SECURE_MODE(0) ran), user can go home. SCM zap resume returns 0xffcfffb7 (refused) yet SECURE_MODE(0) runs:
+  the call is not needed after RBBM_SW_RESET (harmless; could be dropped). The game re-hangs every few seconds
+  (stuck job = SubwaySurf, 3 IBs, IB1 rem 0x3c3 as in 0179): the looping shader itself is still to be found.
+- User asked to fix the GPU hard locks (one stuck shader, e.g. Subway Surfers' daily wheel per the 0179 report,
+  freezes the phone until reboot; killing the app does not help: no GPU reset existed).
+- NEW xnu/patches/0238-guacamole-gpu-hang-recovery.patch (bsd/dev/sweet_gpu.c; independent of 0236/0237):
+  - stage 7's register block moved into gpu_hw_regs(gpu, gmu) (no change for boot); scm_call -> scm_call_svc(svc, ...)
+    with scm_call kept as the PIL (svc 2) wrapper.
+  - sweet_gpu_hang_check(may_recover): a real waiter (sweet_gpu_wait_fence_ns with timeout != 0; never the display
+    path's timeout-0 polls) that sees the done fence stuck >= sweetgpurecoverms (default 3000, min 500, 0 = off)
+    with jobs queued takes gpu_be_lock and runs sweet_gpu_recover_locked(): CP_SQE_CNTL=3, GBIF halt sequence
+    (msm a6xx_bus_clear_pending_transactions), RBBM_SW_RESET_CMD (0x43) 1 -> 200 us -> 0, gpu_hw_regs again, ring
+    from 0 with CP_ME_INIT + WHERE_AM_I, SCM svc 1 cmd 0x0a (BOOT_SET_REMOTE_STATE(0,0) = zap resume),
+    CP_SET_SECURE_MODE(0). be_wptr = new w; fence page = last queued fence (stuck + queued jobs dropped).
+    On failure: be_ready = false (submits refused, display on CPU) instead of a frozen phone.
+  - Logs: `SWEET GPU: RECOVER #n: ...` (stuck job, GBIF acks, ME_INIT, SCM status, SECURE_MODE, done/FAILED).
+- Checked: patch --dry-run on the work/xnu-local-latest tree. Not compiled (no Darwin toolchain here): check the
+  build for warnings-as-errors (unused results, the moved static const arrays in gpu_hw_regs).
+- UNTESTED RISKS: RBBM_SW_RESET without the GMU power collapse msm does; whether the zap resume SCM is accepted;
+  SweetFramebuffer's fbgpu state after the ring restarts. Fallback boot-arg: sweetgpurecoverms=0.
+- Test: build through 0238, boot, reproduce a hang (Subway Surfers daily wheel), wait ~5 s, then
+  `dmesg | grep -a -e "SWEET GPU: RECOVER" -e "SWEET GPU: HANG" | tail -20`.
+- Built successfully through 0238 with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; kernel SHA-256:
+  `96b1f330f1e3d07b9387bb88f7d7add572ced028073ce21243f101dfd1d74e98`. The linked kernel contains the recovery log.
+- Boot image: `outputs/guacamole-0238-gpu-hang-recovery.img` (21,553,152 bytes), SHA-256
+  `fa171d016db6ecc5388efafc914e84a7ec04f8ec75791749e347890907311ebf`, packaged with current ADT generation and
+  the existing 0237 boot arguments (refreshed `sweettime`). Recovery remains at its default 3000 ms threshold;
+  `sweetgpurecoverms=0` is not set. Args are in `outputs/guacamole-0238-boot-args.txt`. Not booted yet.
+
+# Active handoff — 0237 island box: opaque black pixels only (2026-11-10, Claude)
+
+- User on 0236: works ("island box" 375/377 per 5 s), but a black box/strip over the top of Subway Surfers.
+  Cause: the box took every pixel with alpha != 0 in the CA layer's top band, so the status bar clock, icons and
+  shading widened it to the full band; it is copied without blending, so the transparent parts show black.
+- NEW xnu/patches/0237-guacamole-fb-island-box-black-only.patch (after 0236): the box only counts opaque
+  (alpha >= 0xf0), black (RGB sum <= 48) pixels: the island pill. patch --dry-run OK on top of 0236.
+- Test: build through 0237; Subway Surfers with a timer: only the pill (small square black corners at most).
+- Built successfully with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; patches through 0237 are
+  recorded in `work/xnu-local-latest/applied-patches.txt`. Kernel SHA-256:
+  `3230730b523f10a78afa578e60716b4b2492cec7238ec366ad3b62bfaee1b582`.
+- Boot image: `outputs/guacamole-0237-fb-island-black-only.img` (21,553,152 bytes), SHA-256
+  `89d71119aca3bc7d3446267ede67db14a23b1616442016ef2f25fac1ee5359ff`. Packaged from current `mkadt.py
+  --highmem --guacamole`, fullmetal template and shim, with the established 60 Hz GPU-present arguments and refreshed
+  `sweettime`; 0237 is enabled by default. Boot args are in `outputs/guacamole-0237-boot-args.txt`. Not booted yet.
+
+# Active handoff — 0236 Dynamic Island box on the GPU path (2026-11-10, Claude)
+
+- User on 0225: Subway Surfers much slower, island still missing (one crash, no report found, phone did not reboot).
+  Cause: 0225 made every game frame with a visible pixel in the CA layer's edge bands fail
+  sweet_fb_layer_transparent, so presentGPU returned 0 and presentComposed CPU-blended the full screen; there its
+  own 8x8 alpha grid (zero == 64) skipped the CA layer anyway, so no island.
+- NEW xnu/patches/0236-guacamole-fb-island-box-on-gpu.patch (SweetFramebuffer.cpp, after 0225): removes 0225's band
+  scan (transparent test is the 0185 grid again); when the top layer is grid-clear, sweet_fb_top_band_box() finds the
+  box of visible pixels in its top 1/16 (every 2nd row, 4th px, padded 4 px). If found, the frame stays on the GPU:
+  top layer blitted only inside that box, game layer around it (existing 4-cut code). Bottom band (home indicator)
+  not drawn. Boot-arg sweetfbisland=0 disables. 5s log: "of those, drawn with the top layer's island box (0236): N".
+- Checked: patch --dry-run applies on the work/xnu-local-latest tree (0001-0235). Not compiled yet.
+- Test: build through 0236, boot, Subway Surfers with a timer running: island visible, speed as before 0225;
+  `dmesg | grep -a "island box"`.
+- Built through 0236 successfully with `XNU_LOCAL="$PWD/work/xnu-local-latest" sh tools/xnu-local-build.sh`; the applied
+  patch ledger records 0001-0236. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, SHA-256
+  `2cf3b513ef8534ef1cd2b8fcb24bf3dfed92c74d999d9e0a0703fee0c21e038b`.
+- Boot image: `outputs/guacamole-0236-fb-island-box-gpu.img` (21,553,152 bytes), SHA-256
+  `e46ac3b089190f1da724f59c326b05a078c14718488a85f908a5424321d4008a`. It was packaged with the current
+  `mkadt.py --highmem --guacamole`, fullmetal template and shim, the established 0235/0233 GPU-present arguments,
+  and refreshed `sweettime`; `sweetfbisland=0` is omitted so 0236 is enabled by default. Boot args are in
+  `outputs/guacamole-0236-boot-args.txt`. Not yet booted on the phone.
+
 ## 2026-11-10 04:00: mute property fix
 
 CoreAudio's HALS_IOA2Device resolves device-level custom properties against instantiated controls; it does not
@@ -2579,3 +3253,9 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Added `research/audio/coreaudio-ioa2-client-contract.md` and linked it from the audio README.
 - Confirmed from iOS 16.7.16 (20H392) CoreAudio: IOAudio2 service matching name and open type, selectors 2/3/5/6/10/11 client call shapes, mapped memory type families, visible registry schema, VirtualAudio's built-in topology expectations, and D22 VAD tuning filenames.
 - Unresolved by static client-side analysis: stock D22 primary device UID/name and full runtime registry dictionaries, notification variant layout, and named offsets/semantics for IOAudio2's status-page clock. These are explicitly called out in the report; do not guess them from the distinct AOP path.
+
+# Active handoff — Request I haptics capability switches (2026-11-10)
+
+- Completed the iOS 16.7.16 / 20H392 disassembly in `research/haptics/ios-i/RESULTS.md`.
+- Both VibeSynth and Core Haptics ultimately consult `DeviceSupportsClosedLoopHaptics`. VibeSynth also has a legacy CoreAudio `vibe` device fallback only when that answer is false. It caches its capability once. Kernel 0251 does not participate in either check.
+- To preserve both MG answers, disabling `libVibeSynthEngine.dylib` loading is the reversible way to force MediaExperience back to its IOKit `vibrator` fallback; SpringBoard’s independent UIKit level-2 gate is `DisableLevel2Feedback` (preference storage/write path not verified). See results for limits and caveats. No phone changes made.

@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1486,7 +1486,7 @@
+ }
+ 
+ /*
+- * 0236: the box around the visible pixels (alpha != 0) of the layer's top band (the top 1/16 of its source rect,
++ * 0236: the box around the visible pixels (0237: the opaque black ones) of the layer's top band (the top 1/16 of its source rect,
+  * every 2nd row, every 4th pixel, rows cache-invalidated), padded by 4 pixels, as source pixels box = { x0, y0, x1, y1 } (ends exclusive).
+  * False: nothing visible there.
+  */
+@@ -1512,7 +1512,13 @@
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
+ 		for (int32_t x = 0; x < sw; x += 4) {
+-			if ((row[x] >> 24) != 0) {
++			/*
++			 * 0237: only the island itself: opaque (alpha >= 0xf0) and black (RGB sum <= 48). The status bar's
++			 * clock and icons (white) and its faint shading also have alpha != 0, made the box the full width
++			 * of the band and painted a black strip over the game's top.
++			 */
++			uint32_t p = row[x];
++			if ((p >> 24) >= 0xf0 && ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff) <= 48) {
+ 				x0 = x < x0 ? x : x0;
+ 				x1 = x > x1 ? x : x1;
+ 				y0 = y < y0 ? y : y0;

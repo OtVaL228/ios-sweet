@@ -3,6 +3,7 @@
 
   sudo sweet-root-tweaks.py MOUNTED_ROOT
   sweet-root-tweaks.py --launchd-plist IN OUT [--net]
+  sweet-root-tweaks.py --job-env LABEL KEY VALUE IN OUT   (empty VALUE removes KEY)
 
 The second form only applies the launchd.plist changes to a copy of the file
 (IN: /System/Library/xpc/launchd.plist from the IPSW or the phone), for
@@ -220,7 +221,60 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def add_job(original, label, src, dst):
+    """
+    Copy the job LABEL from ORIGINAL (the IPSW's unmodified launchd.plist) into SRC (the phone's current
+    launchd.plist), _PanicOnCrash renamed as everywhere else, and write DST (owner/mode of DST if it exists, else SRC).
+    2026-11-10: Settings hides Privacy > Location Services when CoreTelephony's subscription query fails
+    (PUIPrivacyController refreshLocationServicesAvailable: com.apple.commcenter.coretelephony.xpc "No such process"),
+    i.e. without CommCenter. Its old crash (objc block trampolines, 0044) and Setup's wait on it (Setup is skipped
+    since v14) are gone, so it is tried again at runtime this way before REMOVED_JOBS changes.
+    """
+    orig = load(original)['LaunchDaemons']
+    found = [(k, j) for k, j in orig.items() if j.get('Label') == label]
+    if not found:
+        sys.exit(f'{label}: not in {original}')
+    st = os.stat(dst if os.path.exists(dst) else src)
+    plist = load(src)
+    for k, j in found:
+        j = dict(j)
+        if '_PanicOnCrash' in j:
+            j['_PanicOnCrasX'] = j.pop('_PanicOnCrash')
+        plist['LaunchDaemons'][k] = j
+        print(f'launchd.plist: {label} added as {k}')
+    save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
+def job_env(label, key, value, src, dst):
+    """
+    Set (or, with an empty VALUE, remove) one EnvironmentVariables entry of launchd job LABEL in SRC, write DST.
+    2026-11-10: DYLD_INSERT_LIBRARIES=/usr/lib/libsweet-autrace.dylib on com.apple.mediaserverd traces the CoreAudio
+    property calls VirtualAudio makes (userland/jb/autrace.c).
+    """
+    st = os.stat(dst if os.path.exists(dst) else src)
+    plist = load(src)
+    found = [j for j in plist['LaunchDaemons'].values() if j.get('Label') == label]
+    if not found:
+        sys.exit(f'{label}: not in {src}')
+    for j in found:
+        env = j.setdefault('EnvironmentVariables', {})
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
+            if not env:
+                del j['EnvironmentVariables']
+        print(f'launchd.plist: {label} EnvironmentVariables = {j.get("EnvironmentVariables", {})}')
+    save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
 def main():
+    if len(sys.argv) == 7 and sys.argv[1] == '--job-env':
+        job_env(*sys.argv[2:7])
+        return
+    if len(sys.argv) == 6 and sys.argv[1] == '--add-job':
+        add_job(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        return
     if len(sys.argv) in (4, 5) and sys.argv[1] == '--launchd-plist':
         launchd_plist(sys.argv[2], sys.argv[3])
         return

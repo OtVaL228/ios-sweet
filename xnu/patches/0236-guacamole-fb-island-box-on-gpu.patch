@@ -1,0 +1,181 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -83,6 +83,15 @@
+  */
+ static bool sweet_fb_high_on_top = true;
+ /*
++ * 0236: the Dynamic Island over a full-screen game. 0225 sent every game frame whose (otherwise transparent)
++ * CoreAnimation layer had a visible pixel in its top/bottom edge band to the CPU blend: the game ran much slower,
++ * and the island still did not show (presentComposed's own 8x8 alpha grid left the layer out). Now the frame stays
++ * on the GPU: the game layer is blitted whole except a box around the visible pixels of the top band (the
++ * island), which is copied from the CoreAnimation layer. The box's transparent corners show black (the island
++ * is black). The bottom band (home indicator) is not drawn, as before 0225. Boot-arg sweetfbisland=0: off.
++ */
++static bool sweet_fb_island = true;
++/*
+  * 0171: layer order. Subway Surfers (0170 log): layer 0 = the game's drawable (flag byte 0x467+layer = 1),
+  * layer 1 = CoreAnimation's own framebuffer surface (2/3), fully opaque or fully transparent. Drawing layer 0
+  * lowest hid the game (all black). The record's layer 0 is the TOP: composition goes from the highest
+@@ -111,6 +120,7 @@
+ 	uint32_t top_only;                      /* 0171: multi-layer frames shown as their opaque top layer, on the GPU */
+ 	uint32_t persisted;                     /* 0184: swaps that kept a layer from earlier swaps */
+ 	uint32_t top_clear;                     /* 0185: two-layer frames whose top layer was all transparent */
++	uint32_t island;                        /* 0236: of those, frames drawn with the top band's visible box */
+ 	/*
+ 	 * 0173: what the display reads. Top layer sampled (8x8 RGB) as the GPU blit is queued: frames of the game's
+ 	 * flagged layer / of any other top layer, and those with >= 16 of 64 samples black.
+@@ -539,6 +549,9 @@
+ 	uint32_t highTop = 1;
+ 	(void)PE_parse_boot_argn("sweetfbtop", &highTop, sizeof(highTop));
+ 	sweet_fb_high_on_top = highTop != 0;
++	uint32_t island = 1;
++	(void)PE_parse_boot_argn("sweetfbisland", &island, sizeof(island));
++	sweet_fb_island = island != 0;
+ 	IOLog("SWEET FB: layers persist across swaps %s (0184)\n", sweet_fb_persist ? "on" : "off");
+ 	IOLog("SWEET FB: multi-layer composition %s (0170)\n", sweet_fb_compose ? "on" : "off");
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+@@ -681,6 +694,9 @@
+ 				IOLog("SWEET FB: 5s: two-layer frames with a transparent top layer (lower layer alone): %u\n",
+ 				    sweet_fb_stats.top_clear);
+ 			}
++			if (sweet_fb_stats.island != 0) {
++				IOLog("SWEET FB: 5s: of those, drawn with the top layer's island box (0236): %u\n", sweet_fb_stats.island);
++			}
+ 			if (sweet_fb_stats.persisted != 0) {
+ 				IOLog("SWEET FB: 5s: swaps that kept an earlier layer: %u\n", sweet_fb_stats.persisted);
+ 			}
+@@ -1466,28 +1482,51 @@
+ 			}
+ 		}
+ 	}
+-	/*
+-	 * 0225: the grid's first and last sample rows are 1/16 of the height in (~150 px), so the top and bottom
+-	 * edges were never looked at: SpringBoard's Dynamic Island pill and the home indicator live there. In a
+-	 * full-screen game (Subway Surfers) CoreAnimation's layer is transparent except for them, it counted as
+-	 * "all transparent", and the game layer was shown alone: the island vanished, even with a timer running
+-	 * (2026-11-10). Both edge bands are now scanned too, every 4th row and every 8th pixel (the home
+-	 * indicator is ~5 rows tall). A visible pixel there sends the frame to the blended path.
+-	 */
++	return true;
++}
++
++/*
++ * 0236: the box around the visible pixels (alpha != 0) of the layer's top band (the top 1/16 of its source rect,
++ * every 2nd row, every 4th pixel, rows cache-invalidated), padded by 4 pixels, as source pixels box = { x0, y0, x1, y1 } (ends exclusive).
++ * False: nothing visible there.
++ */
++static bool
++sweet_fb_top_band_box(SweetSurface *s, const uint8_t *a, int32_t box[4])
++{
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++	int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++	uintptr_t src = s->kernelAddress();
++	if (sw <= 0 || sh <= 0) {
++		sw = (int32_t)s->width;
++		sh = (int32_t)s->height;
++	}
++	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || sx < 0 || sy < 0 || sx + sw > (int32_t)s->width ||
++	    sy + sh > (int32_t)s->height ||
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++		return false;
++	}
++	int32_t x0 = sw, y0 = sh, x1 = -1, y1 = -1;
+ 	const int32_t band = sh / 16;
+-	for (int32_t pass = 0; pass < 2; pass++) {
+-		const int32_t y0 = pass == 0 ? 0 : sh - band;
+-		for (int32_t y = y0; y < y0 + band; y += 4) {
+-			uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;
+-			s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+-			const uint32_t *row = (const uint32_t *)(src + off);
+-			for (int32_t x = 0; x < sw; x += 8) {
+-				if ((row[x] >> 24) != 0) {
+-					return false;
+-				}
++	for (int32_t y = 0; y < band; y += 2) {
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;
++		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
++		const uint32_t *row = (const uint32_t *)(src + off);
++		for (int32_t x = 0; x < sw; x += 4) {
++			if ((row[x] >> 24) != 0) {
++				x0 = x < x0 ? x : x0;
++				x1 = x > x1 ? x : x1;
++				y0 = y < y0 ? y : y0;
++				y1 = y;
+ 			}
+ 		}
+ 	}
++	if (x1 < 0) {
++		return false;
++	}
++	box[0] = sx + (x0 > 4 ? x0 - 4 : 0);
++	box[1] = sy + (y0 > 4 ? y0 - 4 : 0);
++	box[2] = sx + (x1 + 8 < sw ? x1 + 8 : sw);
++	box[3] = sy + (y1 + 6 < sh ? y1 + 6 : sh);
+ 	return true;
+ }
+ 
+@@ -1548,13 +1587,20 @@
+ 		sweet_fb_stats.gpu_skip[2]++;
+ 		return 0;
+ 	}
++	int32_t island[4] = { 0, 0, 0, 0 };
++	bool has_island = false;
+ 	if (layers == 2 && sweet_fb_compose) {
+ 		/* 0185: a top layer with nothing visible (all alpha 0, not flagged opaque): the lower layer alone */
+ 		SweetSurface *top = sweet_surface_copy(get32(rec, 0x54 + 4 * order[0]));
+ 		bool clear = top != NULL && !(sweet_fb_opaque_flag && rec[0x467 + order[0]] != 0) &&
+ 		    sweet_fb_layer_transparent(top, rec + 0x64 + 16 * order[0]);
++		/* 0236: a visible island in its top band: drawn as a box over the lower layer (below) */
++		has_island = clear && sweet_fb_island && sweet_fb_top_band_box(top, rec + 0x64 + 16 * order[0], island);
+ 		OSSafeReleaseNULL(top);
+-		if (clear) {
++		if (has_island) {
++			sweet_fb_stats.top_clear++;
++			sweet_fb_stats.island++;
++		} else if (clear) {
+ 			order[0] = order[1];
+ 			layers = 1;
+ 			sweet_fb_stats.top_clear++;
+@@ -1582,7 +1628,7 @@
+ 			sweet_fb_stats.gpu_skip[3]++;
+ 			return 0;
+ 		}
+-		if (i == 0 && layers == 2 && !sweet_fb_layer_is_opaque(rec, l, s)) {
++		if (i == 0 && layers == 2 && !has_island && !sweet_fb_layer_is_opaque(rec, l, s)) {
+ 			s->release();
+ 			sweet_fb_stats.gpu_skip[1]++;   /* a translucent top layer: the CPU path blends it */
+ 			return 0;
+@@ -1622,7 +1668,7 @@
+ 		avoid = slot;
+ 		if (i == 0) {
+ 			/* 0173: is the picture the display is about to copy black already? */
+-			uint32_t black = sweet_fb_layer_black(s, a);
++			uint32_t black = has_island ? 0 : sweet_fb_layer_black(s, a);
+ 			bool game = rec[0x467 + l] != 0;
+ 			if (game) {
+ 				sweet_fb_stats.seen_game++;
+@@ -1656,12 +1702,22 @@
+ 					}
+ 				}
+ 			}
+-			/* the top layer whole */
++			/* the top layer whole (0236: only the island's box, mapped from source to logical pixels) */
+ 			tx0 = dx;
+ 			ty0 = dy;
+ 			tx1 = dx + w;
+ 			ty1 = dy + h;
+-			if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, dx, dy, dx + w, dy + h, &blits[nblits])) {
++			if (has_island) {
++				tx0 = dx + (int32_t)(((int64_t)(island[0] - sx) * w) / aw);
++				ty0 = dy + (int32_t)(((int64_t)(island[1] - sy) * h) / ah);
++				tx1 = dx + (int32_t)(((int64_t)(island[2] - sx) * w + aw - 1) / aw);
++				ty1 = dy + (int32_t)(((int64_t)(island[3] - sy) * h + ah - 1) / ah);
++				tx0 = tx0 < dx ? dx : tx0;
++				ty0 = ty0 < dy ? dy : ty0;
++				tx1 = tx1 > dx + w ? dx + w : tx1;
++				ty1 = ty1 > dy + h ? dy + h : ty1;
++			}
++			if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, tx0, ty0, tx1, ty1, &blits[nblits])) {
+ 				nblits++;
+ 			}
+ 		} else {

@@ -317,10 +317,37 @@ static void exchange(const char *what, const uint8_t *cmd, unsigned n, unsigned 
 }
 
 
-/* everything already received (no waiting beyond the stale timer) */
+/*
+ * everything already received, without waiting. Until 2026-11-10 this was uart_read(.., 3): a 3 ms busy loop on
+ * the FIFO status register on every pass of btbridge's main loop, which kept one core at ~100% all the time
+ * (ps: btbridge 99.6% CPU) and slowed the home screen. Now it empties what the FIFO holds and returns; the
+ * caller's own sleep (btbridge: 0.5 ms while traffic is recent, else 5 ms) does the waiting, and RFR flow control
+ * holds the controller while the FIFO is full.
+ */
 static unsigned drain(uint8_t *buf, unsigned max)
 {
-	return uart_read(buf, max, 3);
+	unsigned got = 0;
+	for (;;) {
+		uint32_t st = se_rd(SE_GENI_RX_FIFO_STATUS);
+		unsigned wc = st & RX_WC;
+		if (!wc || max - got < 4)
+			break;
+		int last_ok = 1;
+		if (wc > (max - got) / 4) {
+			wc = (max - got) / 4;   /* only whole words fit: the partial last word stays in the FIFO */
+			last_ok = 0;
+		}
+		for (unsigned i = 0; i < wc; i++) {
+			uint32_t w = se_rd(SE_GENI_RX_FIFO);
+			unsigned bytes = 4;
+			if (last_ok && i == wc - 1 && (st & RX_LAST) && RX_LAST_BYTES(st))
+				bytes = RX_LAST_BYTES(st);
+			for (unsigned k = 0; k < bytes; k++)
+				buf[got++] = (uint8_t)(w >> (8 * k));
+		}
+		se_wr(SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
+	}
+	return got;
 }
 
 static uint8_t *load_file(const char *path, unsigned *len)

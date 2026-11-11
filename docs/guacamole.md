@@ -1,7 +1,7 @@
 # guacamole: ios-sweet on the OnePlus 7 Pro (SM8150)
 
-Port of ios-sweet (iOS 16.7.16 userland + XNU 8796) from the Redmi Note 10 Pro
-(sweet, SM7150) to the OnePlus 7 Pro (guacamole, SM8150, 8 GB, 256 GB UFS).
+Port of ios-sweet (iOS 16.7.16 userland + XNU 8796) to the OnePlus 7 Pro
+(guacamole, SM8150, 8 GB, 256 GB UFS).
 Branch `guacamole`. Everything here was measured on the phone unless marked
 as coming from a device tree (DT) or Linux.
 

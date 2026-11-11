@@ -22,3 +22,4 @@ outputs/
 work/
 launchd.plist.*
 *.tmp
+_to_delete/

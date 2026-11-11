@@ -26,7 +26,7 @@ int
 main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: tsample PID [SAMPLES] [INTERVAL_US]\n");
+		fprintf(stderr, "usage: tsample PID [SAMPLES] [INTERVAL_US] [THREAD]\n");
 		return 2;
 	}
 	int pid = atoi(argv[1]), samples = argc > 2 ? atoi(argv[2]) : 500, us = argc > 3 ? atoi(argv[3]) : 4000;
@@ -40,16 +40,47 @@ main(int argc, char **argv)
 	mach_msg_type_number_t nth;
 	if (task_threads(task, &th, &nth) != KERN_SUCCESS)
 		return 1;
-	int best = -1, bestcpu = -1;
-	for (unsigned i = 0; i < nth; i++) {
+	/*
+	 * 2026-11-10: the busiest thread by CPU time used over one second (user + system time, measured twice), not
+	 * by thread_info's instantaneous cpu_usage: a scroll sample picked an idle thread (0.5%) and sampled
+	 * mach_msg for 6 s. The five busiest are listed; an optional 4th argument picks a thread index instead.
+	 */
+	enum { MAXT = 512 };
+	static uint64_t t0[MAXT];
+	unsigned n = nth < MAXT ? nth : MAXT;
+	for (unsigned i = 0; i < n; i++) {
 		thread_basic_info_data_t bi;
 		mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
-		if (thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS && bi.cpu_usage > bestcpu) {
-			bestcpu = bi.cpu_usage;
-			best = i;
-		}
+		t0[i] = thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS ?
+		    (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000u + bi.user_time.microseconds +
+		    bi.system_time.microseconds : 0;
 	}
-	printf("T %d threads, busiest #%d at %.1f%%\n", nth, best, bestcpu / 10.0);
+	usleep(1000000);
+	static uint64_t used[MAXT];
+	int best = -1;
+	for (unsigned i = 0; i < n; i++) {
+		thread_basic_info_data_t bi;
+		mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+		uint64_t now = thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS ?
+		    (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000u + bi.user_time.microseconds +
+		    bi.system_time.microseconds : 0;
+		used[i] = now > t0[i] ? now - t0[i] : 0;
+		if (best < 0 || used[i] > used[best])
+			best = (int)i;
+	}
+	for (int k = 0; k < 5; k++) {
+		int m = -1;
+		for (unsigned i = 0; i < n; i++)
+			if (used[i] != (uint64_t)-1 && (m < 0 || used[i] > used[m]))
+				m = (int)i;
+		if (m < 0 || used[m] == 0)
+			break;
+		printf("T thread #%d: %.1f%% of a core over 1 s\n", m, used[m] / 10000.0);
+		used[m] = (uint64_t)-1;
+	}
+	if (argc > 4)
+		best = atoi(argv[4]) < (int)nth ? atoi(argv[4]) : best;
+	printf("T %d threads, sampling #%d\n", nth, best);
 	thread_act_t t = th[best];
 	for (int s = 0; s < samples; s++) {
 		if (thread_suspend(t) != KERN_SUCCESS)

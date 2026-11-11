@@ -209,6 +209,9 @@ struct NmbPassAttachment {
     NmbTexture *texture;
     uint64_t level, slice, depth_plane, load, store;
     double clear[4]; /* color, or clear[0] depth / stencil */
+    /* 0247: the multisample resolve target (store MultisampleResolve / StoreAndMultisampleResolve), or null */
+    NmbTexture *resolve;
+    uint64_t resolve_level, resolve_slice, resolve_depth_plane;
 };
 struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;

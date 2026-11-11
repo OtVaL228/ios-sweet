@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -352,8 +352,14 @@
+  * screen (480x1040 points) matches no iPhone (first guacamole boot:
+  * PosterBoard trapped with sig 5, likely because of it).
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
++/*
++ * 0240: boot-arg sweetfb_scale=2 presents the iPhone X screen at @2x, 750x1624 (the same 375x812 points), as
++ * hakios does: 2.25x fewer pixels for CoreAnimation and the apps to draw, upscaled to the panel by the GPU blit.
++ * Needs an ADT with display-scale 2 and canvas 750x1624 (mkadt.py --scale2) and MobileGestalt's cache cleared.
++ */
++#define SWEET_FB_LOGICAL_W              sweet_fb_logical_w
++#define SWEET_FB_LOGICAL_H              sweet_fb_logical_h
++static uint32_t sweet_fb_logical_w = 1125, sweet_fb_logical_h = 2436;
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -474,6 +480,13 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	uint32_t pscale = 3;
++	PE_parse_boot_argn("sweetfb_scale", &pscale, sizeof(pscale));
++	if (pscale == 2) {
++		sweet_fb_logical_w = 750;
++		sweet_fb_logical_h = 1624;
++	}
++	IOLog("SWEET FB: presented screen %ux%u (@%ux, 0240)\n", sweet_fb_logical_w, sweet_fb_logical_h, pscale == 2 ? 2u : 3u);
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {

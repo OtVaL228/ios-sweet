@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -283,4 +283,23 @@
+ 	setProperty("external", false);
+ 	publishRefresh();
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 0256: VideoToolbox's _FigGetAlignmentForIOSurfaceOutputToDisplayService reads AppleCLCD's
++	 * DisplayPipePlaneBaseAlignment as a DICTIONARY (key PlaneBaseAlignmentLinear) and DisplayPipeStrideRequirements
++	 * (key StrideLinearHorizontal): a plain number made mediaserverd abort on "-[__NSCFNumber objectForKey:]" for
++	 * every video (Safari, 2026-11-11; research/video/README.md). 64 is the framework's own fallback for both.
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1), *stride = OSDictionary::withCapacity(1);
++		OSNumber *n64 = OSNumber::withNumber(64ULL, 32);
++		if (align != NULL && stride != NULL && n64 != NULL) {
++			align->setObject("PlaneBaseAlignmentLinear", n64);
++			stride->setObject("StrideLinearHorizontal", n64);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++			setProperty("DisplayPipeStrideRequirements", stride);
++		}
++		OSSafeReleaseNULL(align);
++		OSSafeReleaseNULL(stride);
++		OSSafeReleaseNULL(n64);
++	}
+ 	registerService();

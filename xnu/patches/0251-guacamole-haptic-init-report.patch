@@ -1,0 +1,203 @@
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -448,6 +448,28 @@
+ 	return err;
+ }
+ 
++/*
++ * 0251: what the chip did with a play, 5 and 25 ms after GO: SYSST (01) / SYSINT (02), bits (aw8697_reg.h)
++ * 7 BSTERR boost error, 6 OV, 5 UVL under-voltage, 4 FF_AE, 3 FF_AF, 2 OCD over-current, 1 OT over-temperature,
++ * 0 DONE; GLB_STATE (46, low nibble 0 = standby / idle) and SYSCTRL (04). A play that never leaves state 0, or
++ * that sets BSTERR / UVL / OCD / OT, is what a silent motor looks like.
++ */
++static void
++hap_report(const char *what)
++{
++	uint8_t s1 = 0, i1 = 0, g1 = 0, c1 = 0, g2 = 0, i2 = 0;
++	hap_wait(5);
++	(void)hap_read(0x01, &s1);
++	(void)hap_read(R_SYSINT, &i1);
++	(void)hap_read(R_GLBSTATE, &g1);
++	(void)hap_read(R_SYSCTRL, &c1);
++	hap_wait(20);
++	(void)hap_read(R_GLBSTATE, &g2);
++	(void)hap_read(R_SYSINT, &i2);
++	printf("SWEET HAPTIC: %s: +5ms sysst %#x sysint %#x glb %#x sysctrl %#x, +25ms glb %#x sysint %#x\n", what, s1, i1, g1,
++	    c1, g2, i2);
++}
++
+ static int
+ hap_ram_load(void)
+ {
+@@ -486,29 +508,14 @@
+ 	return err ? err : err2;
+ }
+ 
+-static void
+-hap_thread(void *arg, wait_result_t result)
++/*
++ * 0251: reset + identify + (configure: soft reset, hap_cfg, RAM) + one click, then the register dump; at boot
++ * (hap_thread, 50 s) and on demand (sysctl kern.sweet_haptic = 200, `haptic init`), so a cold-booted chip can be
++ * inspected and set up again without catching the boot log. Called without hp.lock held. 0 = configured.
++ */
++static int
++hap_configure(bool full)
+ {
+-	(void)arg;
+-	(void)result;
+-	unsigned delay_s = 50;
+-	(void)PE_parse_boot_argn("sweethapticdelay", &delay_s, sizeof(delay_s));
+-	hap_wait(delay_s * 1000u);
+-	hp.gcc = ml_io_map(HAP_GCC_PA, 0x60000);
+-	hp.south = ml_io_map(HAP_SOUTH_PA, HAP_GPIO_CFG(HAP_RST + 1));
+-	hp.east = ml_io_map(HAP_EAST_PA, HAP_GPIO_CFG(HAP_IRQ + 1));
+-	hp.se = ml_io_map(HAP_SE_PA, 0x4000);
+-	if (!hp.gcc || !hp.south || !hp.east || !hp.se) {
+-		printf("SWEET HAPTIC: MMIO mapping failed\n");
+-		goto out;
+-	}
+-	printf("SWEET HAPTIC: TLMM before: sda %#x scl %#x rst %#x/%#x irq %#x/%#x\n",
+-	    hap_rd(hp.south, HAP_GPIO_CFG(HAP_SDA)), hap_rd(hp.south, HAP_GPIO_CFG(HAP_SCL)),
+-	    hap_rd(hp.south, HAP_GPIO_CFG(HAP_RST)), hap_rd(hp.south, HAP_GPIO_IO(HAP_RST)),
+-	    hap_rd(hp.east, HAP_GPIO_CFG(HAP_IRQ)), hap_rd(hp.east, HAP_GPIO_IO(HAP_IRQ)));
+-	if (!hap_clocks() || !hap_se_init()) {
+-		goto out;
+-	}
+ 	hap_gpio(hp.south, HAP_SDA, 1, 0, 0, false, false);      /* qup7, 2 mA, no bias */
+ 	hap_gpio(hp.south, HAP_SCL, 1, 0, 0, false, false);
+ 	hap_gpio(hp.east, HAP_IRQ, 0, 0, 0, false, false);       /* input */
+@@ -520,12 +527,12 @@
+ 	int err = hap_read(R_ID, &id);
+ 	printf("SWEET HAPTIC: AW8697 at %#x: id %#x (want %#x) err %d irq %#x\n", HAP_ADDR, id, HAP_ID, err, hp.irq_last);
+ 	if (err || id != HAP_ID) {
+-		goto out;
++		return err ? err : ENODEV;
+ 	}
+ 	hap_dump();
+-	if (hp.mode < 2) {
++	if (!full) {
+ 		printf("SWEET HAPTIC: probe only (sweethaptic=2 configures and plays)\n");
+-		goto out;
++		return ENODEV;
+ 	}
+ 	lck_mtx_lock(hp.lock);
+ 	err = hap_write(R_ID, 0xaa);                              /* soft reset (aw8697_haptic_softreset) */
+@@ -536,17 +543,46 @@
+ 	}
+ 	err = err ? err : hap_ram_load();
+ 	if (!err) {
+-		hp.ready = true;
+-		err = hap_play(1, 0);                             /* one short click as the boot sign */
++		err = hap_play(1, 0);                             /* one short click as the sign */
++		hap_report("click");
+ 		hap_wait(60);
+ 		(void)hap_stop();
+ 	}
+ 	lck_mtx_unlock(hp.lock);
+-	printf("SWEET HAPTIC: configured %s (sysctl kern.sweet_haptic: N plays waveform N, -ms buzzes, 0 stops)\n",
++	printf("SWEET HAPTIC: configured %s (sysctl kern.sweet_haptic: N plays waveform N, -ms buzzes, 0 stops, 200 init)\n",
+ 	    err ? "with ERRORS" : "OK");
+ 	if (!err) {
+ 		hap_dump();
+ 	}
++	return err;
++}
++
++static void
++hap_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	unsigned delay_s = 50;
++	(void)PE_parse_boot_argn("sweethapticdelay", &delay_s, sizeof(delay_s));
++	hap_wait(delay_s * 1000u);
++	hp.gcc = ml_io_map(HAP_GCC_PA, 0x60000);
++	hp.south = ml_io_map(HAP_SOUTH_PA, HAP_GPIO_CFG(HAP_RST + 1));
++	hp.east = ml_io_map(HAP_EAST_PA, HAP_GPIO_CFG(HAP_IRQ + 1));
++	hp.se = ml_io_map(HAP_SE_PA, 0x4000);
++	if (!hp.gcc || !hp.south || !hp.east || !hp.se) {
++		printf("SWEET HAPTIC: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET HAPTIC: TLMM before: sda %#x scl %#x rst %#x/%#x irq %#x/%#x\n",
++	    hap_rd(hp.south, HAP_GPIO_CFG(HAP_SDA)), hap_rd(hp.south, HAP_GPIO_CFG(HAP_SCL)),
++	    hap_rd(hp.south, HAP_GPIO_CFG(HAP_RST)), hap_rd(hp.south, HAP_GPIO_IO(HAP_RST)),
++	    hap_rd(hp.east, HAP_GPIO_CFG(HAP_IRQ)), hap_rd(hp.east, HAP_GPIO_IO(HAP_IRQ)));
++	if (!hap_clocks() || !hap_se_init()) {
++		goto out;
++	}
++	if (hap_configure(hp.mode >= 2) == 0) {
++		hp.ready = true;
++	}
+ out:
+ 	thread_terminate(current_thread());
+ }
+@@ -608,6 +644,48 @@
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
++	if (value == 201) {                                             /* 0251: `haptic dump`: nothing changed */
++		if (hp.south == 0 || hp.gcc == 0 || hp.se == 0) {
++			return ENODEV;
++		}
++		printf("SWEET HAPTIC: dump: gcc vote %#x (want bits %#x) rcg %#x branches %#x %#x %#x\n",
++		    hap_rd(hp.gcc, HAP_GCC_VOTE), HAP_GCC_MASK, hap_rd(hp.gcc, HAP_RCG), hap_rd(hp.gcc, 0x17004),
++		    hap_rd(hp.gcc, 0x17008), hap_rd(hp.gcc, 0x17994));
++		printf("SWEET HAPTIC: dump: tlmm sda %#x scl %#x rst %#x/%#x irq %#x/%#x\n",
++		    hap_rd(hp.south, HAP_GPIO_CFG(HAP_SDA)), hap_rd(hp.south, HAP_GPIO_CFG(HAP_SCL)),
++		    hap_rd(hp.south, HAP_GPIO_CFG(HAP_RST)), hap_rd(hp.south, HAP_GPIO_IO(HAP_RST)),
++		    hap_rd(hp.east, HAP_GPIO_CFG(HAP_IRQ)), hap_rd(hp.east, HAP_GPIO_IO(HAP_IRQ)));
++		printf("SWEET HAPTIC: dump: se status %#x irq %#x fw %#x clk_sel %#x mclk %#x scl %#x dead %d ready %d\n",
++		    hap_rd(hp.se, SE_STATUS), hap_rd(hp.se, SE_IRQ), hap_rd(hp.se, SE_FW), hap_rd(hp.se, SE_CLK_SEL),
++		    hap_rd(hp.se, SE_MCLK), hap_rd(hp.se, SE_SCL), hp.dead, hp.ready);
++		lck_mtx_lock(hp.lock);
++		uint8_t id = 0;
++		err = hap_read(R_ID, &id);
++		printf("SWEET HAPTIC: dump: id %#x err %d irq %#x\n", id, err, hp.irq_last);
++		if (!err) {
++			hap_dump();
++		}
++		lck_mtx_unlock(hp.lock);
++		return 0;
++	}
++	if (value == 200) {                                             /* 0251: `haptic init` */
++		if (hp.mode < 2 || hp.south == 0) {
++			return ENODEV;
++		}
++		hp.ready = false;
++		err = hap_configure(true);
++		hp.ready = err == 0;
++		return err;
++	}
++	if ((value & ~0x1ffff) == 0x100000 && hp.south != 0) {      /* 0251: `haptic reg R [V]`: 0x100000 | w<<16 | R<<8 | V */
++		uint8_t r = (uint8_t)(value >> 8), v = (uint8_t)value, now = 0;
++		lck_mtx_lock(hp.lock);
++		err = (value & 0x10000) ? hap_write(r, v) : 0;
++		err = err ? err : hap_read(r, &now);
++		lck_mtx_unlock(hp.lock);
++		printf("SWEET HAPTIC: reg %#04x%s = %#04x (err %d)\n", r, (value & 0x10000) ? " written" : "", now, err);
++		return err;
++	}
+ 	if (!hp.ready) {
+ 		return ENODEV;
+ 	}
+@@ -620,8 +698,10 @@
+ 		err = hap_stop();
+ 	} else if (value > 0) {
+ 		err = hap_play((uint8_t)value, 0);
++		hap_report("play");                                      /* 0251 */
+ 	} else {
+ 		err = hap_play(10, 15);                                  /* waveform 10, looped (OnePlus "activate") */
++		hap_report("buzz");                                      /* 0251 */
+ 		if (!err) {
+ 			hap_wait((unsigned)-value);
+ 			err = hap_stop();
+@@ -631,7 +711,7 @@
+ 	return err;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_haptic, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+-    sysctl_sweet_haptic, "I", "AW8697 haptics: N plays RAM waveform N, -ms buzzes, 0 stops");
++    sysctl_sweet_haptic, "I", "AW8697 haptics: N plays RAM waveform N, -ms buzzes, 0 stops, 200 sets the chip up again, 201 dumps");
+ 
+ void
+ sweet_haptic_init(void)

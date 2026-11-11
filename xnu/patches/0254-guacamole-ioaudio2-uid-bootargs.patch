@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetAudio.cpp
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -285,6 +285,23 @@
+ 	setProperty("device UID", "SweetBuiltInAudio");
+ 	setProperty("device name", "Built-In Audio");
+ 	setProperty("clock domain", 1ULL, 32);
++	/*
++	 * 0254: boot-args sweetaudiouid=STRING / sweetaudioname=STRING replace the device UID / name. On the real D22 the
++	 * built-in audio comes from audio-data IOAudio2 devices whose ADT "data-sources" carry the names "Codec",
++	 * "Halogen", "Loopback", "Actuator", "Baseband" (research/ipsw-x/d22ap.adt), and VirtualAudio's configuration
++	 * factory (research/audio/codec-identity-2235.md) builds its Codec object (speaker / receiver / built-in mic ports)
++	 * from entries keyed "Codec", "Speaker", "Voice", "Reference", ... Test: sweetaudiouid=Codec with the transport
++	 * left at 'bltn' (sweetaudiotp=0x626c746e), which DeviceFactory_Aspen leaves to that configuration path.
++	 */
++	{
++		char uid[64], nm[64];
++		if (PE_parse_boot_arg_str("sweetaudiouid", uid, sizeof(uid)) && uid[0] != 0) {
++			setProperty("device UID", uid);
++		}
++		if (PE_parse_boot_arg_str("sweetaudioname", nm, sizeof(nm)) && nm[0] != 0) {
++			setProperty("device name", nm);
++		}
++	}
+ 	/*
+ 	 * 0232: the device's own nominal rate (32.32). Without it CoreAudio reported kAudioDevicePropertyNominalSampleRate
+ 	 * 0 for the device: VirtualAudio set 48000, read 0, waited 2 s ("timed out ... [nsrt/glob/0] ... on id 33", "Error

@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--guacamole]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--guacamole] [--scale2]
 """
 import hashlib, os, struct, sys
 
@@ -37,6 +37,9 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # --highmem window 0x100000000+0xfcc00000 is RAM with no fixed carve-outs, but
 # the low PHYS_BASE window crosses the 0xbbb00000 hole, so use --highmem.
 GUACAMOLE = '--guacamole' in sys.argv
+# --scale2: present an @2x screen, 828x1792 (414x896 points, the iPhone XR / 11 screen; 375x812 @2x has no UIKit
+# status bar layout), with kernel boot-arg sweetfb_scale=2 (xnu 0240 + 0241): 1.85x fewer pixels to draw. MobileGestalt caches the screen: move its cache aside after switching.
+SCALE2 = '--scale2' in sys.argv
 if GUACAMOLE:
     FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
     FB_SIZE = 0x1200000
@@ -57,6 +60,19 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+
+
+def d22ap_product_child(child, path=D22AP_ADT):
+    """Properties of one child node of the real D22AP /product (e.g. 'audio'), or None."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for cc in c.children:
+                if dict((k, v) for k, f, v in cc.props).get('name') == child.encode() + b'\0':
+                    return [(k, v) for k, f, v in cc.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
 
 
 def d22ap_product(path=D22AP_ADT):
@@ -111,6 +127,22 @@ def guac_gpu_node(ph):
     return [node('sweet-gpu', props)]
 
 
+# --guacamole: the AW8697 haptics driver's RAM waveforms (bsd/dev/sweet_haptic.c, ADT /sweet-haptic), from the
+# phone's /vendor/firmware (OnePlus; not in git): the set for this motor's resonance (f0 168.9 Hz -> _168).
+HAPTIC_RAM = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../dtb/haptics/aw8697_haptic_168.bin')
+
+
+def guac_haptic_node(ph):
+    if not os.path.exists(HAPTIC_RAM):
+        print(f'warning: {HAPTIC_RAM} missing, no /sweet-haptic node', file=sys.stderr)
+        return []
+    blob = open(HAPTIC_RAM, 'rb').read()
+    # checksum (2 bytes, big-endian) = sum of every byte after it; then base address (2) and the samples
+    if not 8 < len(blob) <= 0x4000 or ((blob[0] << 8) | blob[1]) != (sum(blob[2:]) & 0xffff):
+        raise ValueError(f'{HAPTIC_RAM}: bad size or checksum')
+    return [node('sweet-haptic', [ph(), ('compatible', cstr('awinic,aw8697')), ('ram', blob)])]
+
+
 def build(seed=None, qemu=False, highmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -142,7 +174,7 @@ def build(seed=None, qemu=False, highmem=False):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        ('display-scale', u32(2 if SCALE2 else 3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -259,8 +291,8 @@ def build(seed=None, qemu=False, highmem=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(828 if SCALE2 else 1125)),
+            ('canvas-height', u32(1792 if SCALE2 else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -300,7 +332,17 @@ def build(seed=None, qemu=False, highmem=False):
         # GPU process never fills here (Safari black, jb1/jb2: "CGImageCreate: invalid
         # image bits/pixel or bytes/row"); its BGRA surfaces it draws.
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # /product/audio of the D22AP tree ({wireless-splitter 1, supports-always-listening 1}): VirtualAudio reads
+    # IODeviceTree:/product/audio while it sets up its ports, and without it ("IORegistryEntryFromPath
+    # IODeviceTree:/product/audio returned MACH_PORT_NULL") it publishes only the Null_Device / AP ports, no speaker
+    # (apps: AQMEIO "Error -1 getting output port ID": no sound, YouTube in Safari fails, no Bluetooth audio).
+    # Deliberately NOT /product/haptics: MobileGestalt derives DeviceSupportsClosedLoopHaptics from it, and with
+    # that true mediaserverd sends every vibration to VibeSynth (no Taptic Engine here) instead of the "vibrator".
+    product_children = []
+    audio_props = d22ap_product_child('audio') if GUACAMOLE else None
+    if audio_props is not None:
+        product_children.append(node('audio', [ph()] + audio_props))
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
     # dram-size we expose, so XNU maps it but never allocates into it.
@@ -318,7 +360,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + (guac_gpu_node(ph) if GUACAMOLE and not qemu else []) + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + (guac_gpu_node(ph) + guac_haptic_node(ph) if GUACAMOLE and not qemu else []) + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

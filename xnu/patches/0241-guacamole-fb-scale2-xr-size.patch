@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -483,8 +483,12 @@
+ 	uint32_t pscale = 3;
+ 	PE_parse_boot_argn("sweetfb_scale", &pscale, sizeof(pscale));
+ 	if (pscale == 2) {
+-		sweet_fb_logical_w = 750;
+-		sweet_fb_logical_h = 1624;
++		/*
++		 * 0241: 828x1792 (414x896 points @2x, iPhone XR / 11), not 750x1624: UIKit has status bar layouts only
++		 * for real iPhone screens, and 375x812 @2x is none (image B showed the red rdar://45025538 bar).
++		 */
++		sweet_fb_logical_w = 828;
++		sweet_fb_logical_h = 1792;
+ 	}
+ 	IOLog("SWEET FB: presented screen %ux%u (@%ux, 0240)\n", sweet_fb_logical_w, sweet_fb_logical_h, pscale == 2 ? 2u : 3u);
+ 	fLogicalW = fWidth;

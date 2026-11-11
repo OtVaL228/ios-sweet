@@ -1,0 +1,261 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1298,19 +1298,14 @@
+ 	return sync && stuck;
+ }
+ 
+-static bool
+-gpu_stage7(void)
++/*
++ * hw_init's register writes (Linux v6.6 a6xx_hw_init), shared by stage 7 and the 0238 hang recovery, which
++ * runs them again after RBBM_SW_RESET: GBIF un-halted, 64-bit address modes, HWCG, UCHE, CP ROQ / protect,
++ * ring empty at GVA_RB (pointers 0), SQE microcode base.
++ */
++static void
++gpu_hw_regs(vm_offset_t gpu, vm_offset_t gmu)
+ {
+-	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
+-	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
+-	if (!gpu || !gmu) {
+-		return false;
+-	}
+-	printf("SWEET GPU: stage 7: GPU SMMU context + memory + hw_init registers (CP stays halted)\n");
+-	if (!gpu_mem_setup() || !gpu_smmu_gpu_context()) {
+-		return false;
+-	}
+-	gpu_checkpoint("about to program the GPU registers");
+ 	gwr(gpu, 0x3c45, 0);                              /* GBIF_HALT */
+ 	gwr(gpu, 0x0016, 0);                              /* RBBM_GBIF_HALT */
+ 	gwr(gpu, 0xf803, 0);                              /* RBBM_SECVID_TSB_CNTL */
+@@ -1364,6 +1359,22 @@
+ 	gwr64(gpu, 0x0800, GVA_RB);                       /* CP_RB_BASE */
+ 	gwr(gpu, 0x0802, 0x0800020cu);                    /* CP_RB_CNTL: BUFSZ 12, BLKSZ 2, NO_UPDATE */
+ 	gwr64(gpu, 0x0804, GVA_SHADOW);                   /* CP_RB_RPTR_ADDR */
++}
++
++static bool
++gpu_stage7(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!gpu || !gmu) {
++		return false;
++	}
++	printf("SWEET GPU: stage 7: GPU SMMU context + memory + hw_init registers (CP stays halted)\n");
++	if (!gpu_mem_setup() || !gpu_smmu_gpu_context()) {
++		return false;
++	}
++	gpu_checkpoint("about to program the GPU registers");
++	gpu_hw_regs(gpu, gmu);
+ 
+ 	printf("SWEET GPU: readback RB_BASE %#x:%#x RB_CNTL %#x SQE_BASE %#x:%#x RPTR_ADDR %#x:%#x\n",
+ 	    grd(gpu, 0x801), grd(gpu, 0x800), grd(gpu, 0x802), grd(gpu, 0x831), grd(gpu, 0x830),
+@@ -1542,9 +1553,9 @@
+ }
+ 
+ static uint64_t
+-scm_call(uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *res)
++scm_call_svc(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *res)
+ {
+-	register uint64_t x0 __asm__("x0") = 0x42000000u | (2u << 8) | cmd;
++	register uint64_t x0 __asm__("x0") = 0x42000000u | ((svc & 0xffu) << 8) | cmd;
+ 	register uint64_t x1 __asm__("x1") = arginfo;
+ 	register uint64_t x2 __asm__("x2") = a2;
+ 	register uint64_t x3 __asm__("x3") = a3;
+@@ -1566,6 +1577,13 @@
+ 	return x0;
+ }
+ 
++/* PIL service (2): every call before 0238 */
++static uint64_t
++scm_call(uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *res)
++{
++	return scm_call_svc(2u, cmd, arginfo, a2, a3, a4, res);
++}
++
+ static const void *
+ gpu_adt_blob(const char *name, unsigned *size)
+ {
+@@ -2232,6 +2250,140 @@
+ 
+ static uint32_t sweet_gpu_hang_seen_done, sweet_gpu_hang_reported, sweet_gpu_hang_reports;
+ static uint64_t sweet_gpu_hang_since;
++
++/*
++ * 0238: GPU hang recovery. A job whose shader never ends (Subway Surfers' daily wheel, 0179 report) kept the CP in
++ * its IB forever: every later fence waited on it and the phone froze until reboot; killing the game did not help.
++ * When a fence waiter (thread context, not the display path) sees the done fence stuck for sweetgpurecoverms
++ * (default 3000, 0 = off) with jobs queued, the GPU core is reset and restarted, as msm's a6xx_recover /
++ * a6xx_gmu_force_off do it short of the power collapse: halt the SQE, clear GBIF's pending transactions, assert
++ * RBBM_SW_RESET_CMD >= 100 us, hw_init's registers again, SQE start + CP_ME_INIT, zap shader resume (SCM
++ * BOOT_SET_REMOTE_STATE(0, 0), msm's path after the first load), CP_SET_SECURE_MODE(0). The ring restarts empty
++ * at 0. The stuck job and every job queued behind it are dropped: the fence page gets the last queued fence, so
++ * their waiters return (their pictures are whatever was drawn). If the restart fails, the backend stops taking
++ * work (submits return 0: clients fail instead of the phone freezing) and the display falls back to the CPU.
++ * GMU, SMMU, page tables and GPU memory are not touched.
++ */
++static uint32_t sweet_gpu_recover_ms = 0xffffffffu;   /* not read yet */
++static uint32_t sweet_gpu_recoveries;
++static vm_offset_t sweet_gpu_recover_gmu;
++
++static bool
++be_ring_run(vm_offset_t g, unsigned w, unsigned ms_max)
++{
++	for (unsigned ms = 0; ms < ms_max; ++ms) {
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++		if (*(volatile uint32_t *)(gpumem + GPUMEM_SHADOW) == w) {
++			return true;
++		}
++		if (grd(g, 0x823) || grd(g, 0x821)) {
++			return false;
++		}
++		delay(1000);
++	}
++	return false;
++}
++
++static bool
++be_wait_reg(vm_offset_t g, uint32_t reg, uint32_t mask, unsigned us)
++{
++	for (unsigned t = 0; t < us; t += 10) {
++		if ((grd(g, reg) & mask) == mask) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/* gpu_be_lock held */
++static bool
++sweet_gpu_recover_locked(uint32_t done, uint32_t last)
++{
++	vm_offset_t g = (vm_offset_t)be_gpu;
++	if (sweet_gpu_recover_gmu == 0) {
++		sweet_gpu_recover_gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	}
++	if (g == 0 || sweet_gpu_recover_gmu == 0) {
++		return false;
++	}
++	uint32_t n = ++sweet_gpu_recoveries;
++	printf("SWEET GPU: RECOVER #%u: job %u stuck, queued up to %u: halting the CP and resetting the GPU core\n",
++	    n, done + 1, last);
++	gwr(g, 0x808, 3);                                 /* CP_SQE_CNTL: halt the SQE (msm a6xx_recover) */
++	/* msm a6xx_bus_clear_pending_transactions(gx_off = true) */
++	gwr(g, 0x0016, 1);                                /* RBBM_GBIF_HALT */
++	bool h0 = be_wait_reg(g, 0x0017, 1u, 10000);      /* RBBM_GBIF_HALT_ACK */
++	gwr(g, 0x3c45, 1u);                               /* GBIF_HALT: client requests */
++	bool h1 = be_wait_reg(g, 0x3c46, 1u, 10000);      /* GBIF_HALT_ACK */
++	gwr(g, 0x3c45, 2u);                               /* GBIF_HALT: AXI arbiter */
++	bool h2 = be_wait_reg(g, 0x3c46, 2u, 10000);
++	gwr(g, 0x3c45, 0);
++	/* msm a6xx_gpu_sw_reset: asserted for at least 100 us */
++	gwr(g, 0x0043, 1);                                /* RBBM_SW_RESET_CMD */
++	(void)grd(g, 0x0043);
++	delay(200);
++	gwr(g, 0x0043, 0);
++	(void)grd(g, 0x0043);
++	delay(100);
++	printf("SWEET GPU: RECOVER #%u: GBIF halt acks %d %d %d; after reset RBBM_STATUS %#x rptr %#x\n",
++	    n, h0, h1, h2, grd(g, 0x210), grd(g, 0x806));
++	gpu_hw_regs(g, sweet_gpu_recover_gmu);
++
++	/* the ring from 0: CP_ME_INIT + CP_WHERE_AM_I, as stage 8 */
++	uint32_t *rb = (uint32_t *)(gpumem + GPUMEM_RB);
++	unsigned w = 0;
++	rb[w++] = pkt7(72, 8);                            /* CP_ME_INIT */
++	rb[w++] = 0x0000002f;
++	rb[w++] = 0x00000003;
++	rb[w++] = 0x20000000;
++	rb[w++] = 0;
++	rb[w++] = 0;
++	rb[w++] = 0;
++	rb[w++] = 0;
++	rb[w++] = 0;
++	rb[w++] = pkt7(98, 2);                            /* CP_WHERE_AM_I -> shadow */
++	rb[w++] = (uint32_t)GVA_SHADOW;
++	rb[w++] = (uint32_t)(GVA_SHADOW >> 32);
++	*(volatile uint32_t *)(gpumem + GPUMEM_SHADOW) = 0xdeadbeefu;
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_RB), RB_SIZE, FALSE);
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr(g, 0x808, 1);                                 /* CP_SQE_CNTL: start */
++	delay(1000);
++	gwr(g, 0x807, w);
++	bool ok = be_ring_run(g, w, 500);
++	printf("SWEET GPU: RECOVER #%u: CP_ME_INIT %s (shadow %#x want %#x, CP_INT %#x HW_FAULT %#x)\n", n,
++	    ok ? "ran" : "FAILED", *(volatile uint32_t *)(gpumem + GPUMEM_SHADOW), w, grd(g, 0x823), grd(g, 0x821));
++	if (ok) {
++		uint64_t r = 0;
++		uint64_t st = scm_call_svc(1u, 0x0au, 2u, 0, 0, 0, &r);   /* BOOT_SET_REMOTE_STATE(ZAP_RESUME, 0) */
++		printf("SWEET GPU: RECOVER #%u: SCM zap resume status %#llx result %#llx\n", n,
++		    (unsigned long long)st, (unsigned long long)r);
++		rb[w++] = pkt7(102, 1);                   /* CP_SET_SECURE_MODE */
++		rb[w++] = 0;
++		rb[w++] = pkt7(98, 2);                    /* CP_WHERE_AM_I */
++		rb[w++] = (uint32_t)GVA_SHADOW;
++		rb[w++] = (uint32_t)(GVA_SHADOW >> 32);
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_RB), RB_SIZE, FALSE);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		gwr(g, 0x807, w);
++		ok = be_ring_run(g, w, 500);
++		printf("SWEET GPU: RECOVER #%u: CP_SET_SECURE_MODE(0) %s\n", n, ok ? "ran" : "FAILED");
++	}
++	be_wptr = w;
++	/* the stuck job and the ones behind it count as done */
++	*be_fence = last;
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCEMEM), 0x1000u, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!ok) {
++		be_ready = false;
++		printf("SWEET GPU: RECOVER #%u FAILED: GPU backend stopped (new GPU work is refused until reboot)\n", n);
++		return false;
++	}
++	printf("SWEET GPU: RECOVER #%u done: GPU running again, jobs %u..%u dropped\n", n, done + 1, last);
++	return true;
++}
+ /*
+  * 0177: stall threshold, boot-arg sweetgpuhangms (default 2000). A short one (e.g. 150) catches the stalls that,
+  * with the ring refusing work, end as DeviceLost/flicker instead of a frozen UI. At most 12 reports a boot.
+@@ -2239,7 +2391,7 @@
+ static uint32_t sweet_gpu_hang_ms;
+ 
+ static void
+-sweet_gpu_hang_check(void)
++sweet_gpu_hang_check(bool may_recover)
+ {
+ 	if (be_fence == NULL || be_gpu == 0) {
+ 		return;
+@@ -2253,6 +2405,23 @@
+ 	}
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(now - sweet_gpu_hang_since, &ns);
++	if (sweet_gpu_recover_ms == 0xffffffffu) {
++		uint32_t rms = 3000;
++		(void)PE_parse_boot_argn("sweetgpurecoverms", &rms, sizeof(rms));
++		sweet_gpu_recover_ms = rms != 0 && rms < 500 ? 500 : rms;
++	}
++	/* 0238: stuck long enough: reset the GPU (once the 0179 report below has had its chance, at 2 s) */
++	if (may_recover && sweet_gpu_recover_ms != 0 && be_ready && ns >= (uint64_t)sweet_gpu_recover_ms * 1000000ull) {
++		lck_mtx_lock(gpu_be_lock);
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCEMEM), 0x1000u, FALSE);
++		if (be_ready && *be_fence == done && be_seqno != done) {
++			(void)sweet_gpu_recover_locked(done, be_seqno);
++		}
++		lck_mtx_unlock(gpu_be_lock);
++		sweet_gpu_hang_seen_done = *be_fence;
++		sweet_gpu_hang_since = mach_absolute_time();
++		return;
++	}
+ 	if (sweet_gpu_hang_ms == 0) {
+ 		uint32_t ms = 2000;
+ 		(void)PE_parse_boot_argn("sweetgpuhangms", &ms, sizeof(ms));
+@@ -2581,7 +2750,7 @@
+ 			return 0;
+ 		}
+ 		if (timeout_ns == 0 || mach_absolute_time() >= deadline) {
+-			sweet_gpu_hang_check();                 /* 0176 */
++			sweet_gpu_hang_check(timeout_ns != 0);  /* 0176; 0238: a real waiter may reset the GPU */
+ 			return ETIMEDOUT;
+ 		}
+ 		if (spin < 64) {

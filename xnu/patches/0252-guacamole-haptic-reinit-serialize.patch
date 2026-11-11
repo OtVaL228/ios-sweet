@@ -1,0 +1,177 @@
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -19,6 +19,7 @@
+ #include <sys/errno.h>
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
+@@ -107,6 +108,9 @@
+ 	vm_offset_t gcc, south, east, se;
+ 	unsigned clk_sel, mode;
+ 	bool dead, ready;
++	bool fresh;             /* 0252: set up by a play-time (re)configure since boot */
++	unsigned idle_s;        /* 0252: boot-arg sweethapticidle: set up again before a play after this many idle s */
++	uint64_t last;          /* 0252: mach_absolute_time of the last play */
+ 	unsigned sent, got;
+ 	uint32_t irq_last;
+ 	lck_grp_t *grp;
+@@ -513,8 +517,22 @@
+  * (hap_thread, 50 s) and on demand (sysctl kern.sweet_haptic = 200, `haptic init`), so a cold-booted chip can be
+  * inspected and set up again without catching the boot log. Called without hp.lock held. 0 = configured.
+  */
++static int hap_configure_locked(bool full, bool click);
++
+ static int
+-hap_configure(bool full)
++hap_configure(bool full, bool click)
++{
++	lck_mtx_lock(hp.lock);                                   /* 0252: the reset pulse too (vibrator thread vs sysctl) */
++	int err = hap_configure_locked(full, click);
++	lck_mtx_unlock(hp.lock);
++	if (!err) {
++		hp.fresh = true;
++	}
++	return err;
++}
++
++static int
++hap_configure_locked(bool full, bool click)
+ {
+ 	hap_gpio(hp.south, HAP_SDA, 1, 0, 0, false, false);      /* qup7, 2 mA, no bias */
+ 	hap_gpio(hp.south, HAP_SCL, 1, 0, 0, false, false);
+@@ -534,7 +552,6 @@
+ 		printf("SWEET HAPTIC: probe only (sweethaptic=2 configures and plays)\n");
+ 		return ENODEV;
+ 	}
+-	lck_mtx_lock(hp.lock);
+ 	err = hap_write(R_ID, 0xaa);                              /* soft reset (aw8697_haptic_softreset) */
+ 	hap_wait(2);
+ 	err = err ? err : hap_standby();
+@@ -542,21 +559,48 @@
+ 		err = hap_write(hap_cfg[i][0], hap_cfg[i][1]);
+ 	}
+ 	err = err ? err : hap_ram_load();
+-	if (!err) {
++	if (!err && click) {
+ 		err = hap_play(1, 0);                             /* one short click as the sign */
+ 		hap_report("click");
+ 		hap_wait(60);
+ 		(void)hap_stop();
+ 	}
+-	lck_mtx_unlock(hp.lock);
+ 	printf("SWEET HAPTIC: configured %s (sysctl kern.sweet_haptic: N plays waveform N, -ms buzzes, 0 stops, 200 init)\n",
+ 	    err ? "with ERRORS" : "OK");
+-	if (!err) {
++	if (!err && click) {
+ 		hap_dump();
+ 	}
+ 	return err;
+ }
+ 
++/*
++ * 0252: the chip set up at boot (50 s) is silent until `haptic init` sets it up again: plays run (GLB_STATE 7,
++ * DONE, no faults) but the motor does not move. Not yet understood (haptic dump, 0251, before/after will say).
++ * So the first play after boot sets the chip up again (hp.fresh), and with boot-arg sweethapticidle=S any play
++ * after S idle seconds does too (default 0: off). ~0.7 s, mostly the RAM load. Called without hp.lock.
++ */
++static void
++hap_ensure(const char *who)
++{
++	if (!hp.ready || hp.mode < 2) {
++		return;
++	}
++	bool need = !hp.fresh;
++	uint64_t now = mach_absolute_time();
++	if (!need && hp.idle_s != 0 && hp.last != 0) {
++		uint64_t idle_ns = 0;
++		absolutetime_to_nanoseconds(now - hp.last, &idle_ns);
++		need = idle_ns / NSEC_PER_SEC >= hp.idle_s;
++	}
++	if (need) {
++		printf("SWEET HAPTIC: setting the chip up again before a play (%s, %s)\n", who, hp.fresh ? "idle" : "first since boot");
++		if (hap_configure(true, false) != 0) {
++			printf("SWEET HAPTIC: set-up FAILED\n");
++		}
++	}
++	hp.last = mach_absolute_time();
++}
++
+ static void
+ hap_thread(void *arg, wait_result_t result)
+ {
+@@ -580,8 +624,9 @@
+ 	if (!hap_clocks() || !hap_se_init()) {
+ 		goto out;
+ 	}
+-	if (hap_configure(hp.mode >= 2) == 0) {
++	if (hap_configure(hp.mode >= 2, true) == 0) {
+ 		hp.ready = true;
++		hp.fresh = false;                               /* 0252: set up again at the first play */
+ 	}
+ out:
+ 	thread_terminate(current_thread());
+@@ -616,6 +661,7 @@
+ 	if (!hp.ready || wave == 0 || wave > 127) {
+ 		return ENODEV;
+ 	}
++	hap_ensure("vibrator");
+ 	lck_mtx_lock(hp.lock);
+ 	int err = hap_play((uint8_t)wave, 0);
+ 	lck_mtx_unlock(hp.lock);
+@@ -629,6 +675,9 @@
+ 	if (!hp.ready) {
+ 		return ENODEV;
+ 	}
++	if (on) {
++		hap_ensure("vibrator");
++	}
+ 	lck_mtx_lock(hp.lock);
+ 	int err = on ? hap_play(10, 15) : hap_stop();
+ 	lck_mtx_unlock(hp.lock);
+@@ -673,7 +722,7 @@
+ 			return ENODEV;
+ 		}
+ 		hp.ready = false;
+-		err = hap_configure(true);
++		err = hap_configure(true, true);
+ 		hp.ready = err == 0;
+ 		return err;
+ 	}
+@@ -692,6 +741,9 @@
+ 	if (value > 127 || value < -10000) {
+ 		return EINVAL;
+ 	}
++	if (value != 0) {
++		hap_ensure("sysctl");                                   /* 0252 */
++	}
+ 	lck_mtx_lock(hp.lock);
+ 	if (value == 0) {
+ 		hap_stops++;                                            /* 0250: also ends SweetVibrator's pattern */
+@@ -722,6 +774,7 @@
+ 		return;
+ 	}
+ 	hp.mode = mode;
++	(void)PE_parse_boot_argn("sweethapticidle", &hp.idle_s, sizeof(hp.idle_s));
+ 	hp.grp = lck_grp_alloc_init("sweet-haptic", LCK_GRP_ATTR_NULL);
+ 	hp.lock = lck_mtx_alloc_init(hp.grp, LCK_ATTR_NULL);
+ 	thread_t t;
+--- a/iokit/Kernel/arm/SweetVibrator.cpp
++++ b/iokit/Kernel/arm/SweetVibrator.cpp
+@@ -64,7 +64,13 @@
+ 		return false;
+ 	}
+ 	fLock = IOLockAlloc();
+-	fCall = thread_call_allocate(&SweetVibrator::run, this);
++	/*
++	 * 0252: ONCE: a request arriving while a pattern still plays re-runs the call after it instead of starting a
++	 * second play() on another thread call worker; two players interleaving on the chip left it silent until
++	 * `haptic init`.
++	 */
++	fCall = thread_call_allocate_with_options(&SweetVibrator::run, this, THREAD_CALL_PRIORITY_KERNEL,
++	    THREAD_CALL_OPTIONS_ONCE);
+ 	if (fLock == NULL || fCall == NULL) {
+ 		return false;
+ 	}

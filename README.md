@@ -26,7 +26,7 @@ Status as of **2026-11-10** (details and history: [`docs/guacamole.md`](docs/gua
 | Graphics | OpenGL ES: Mesa 25.0.7 freedreno behind iOS's `EAGLContext`; CoreAnimation in backboardd renders on the GPU. Metal: SweetMetal2 (metal2vulkan + Turnip) for backboardd, WebKit and selected apps (`/var/local/mtl2-clients`) |
 | Apps and games | Stock removable apps, Settings, Photos, Wallet, Safari; sideloaded games such as Subway Surfers and Angry Birds run on the GPU (support varies per game); share sheet and Game Center sign-in sheet appear |
 | Wi-Fi | WPA2-PSK join, DHCP, internet (`userland/wland` over `/dev/pmem`, en0 + Apple80211 for wifid and Settings); starts at boot (`com.sweet.wland`) |
-| Bluetooth | Qualcomm WCN3998 behind iOS's Broadcom-expecting stack via `userland/bt/btbridge` at 3 Mbaud, kernel controls + Skywalk channel (0220–0223); starts at boot (`com.sweet.btbridge`). Scanning, pairing, encryption, SDP, AVRCP, HFP, AAP and A2DP setup with Beats / AirPods; the headset appears in Settings and as a selectable audio route |
+| Bluetooth | Qualcomm WCN3998 behind iOS's Broadcom-expecting stack via `userland/bt/btbridge` at 3 Mbaud, kernel controls + Skywalk channel (0220–0223); starts at boot (`com.sweet.btbridge`). Scanning, pairing, encryption, SDP, AVRCP, HFP, AAP and A2DP setup with Beats / AirPods; the headset appears in Settings and plays audio (A2DP) |
 | SSH | Procursus `sshd` at boot (`com.sweet.sshd`) |
 | Wallpaper | Wallpaper picker and poster providers; photo wallpapers draw (YCbCr photos converted on the CPU, 0217; the colour fix 0224 is not yet confirmed on the phone) |
 | Clock | Wall time from the PM8150 RTC plus an offset kept on the root (`sweettime=` sets it) |
@@ -37,15 +37,15 @@ Status as of **2026-11-10** (details and history: [`docs/guacamole.md`](docs/gua
 
 | Area | State |
 | --- | --- |
-| Audio | No sound yet, on any route. A silent kernel `IOAudio2Device` stand-in (0226–0235) gives CoreAudio a built-in device; `VirtualAudio.plugin` loads again and builds its default device on it, but the Built-In Speaker / Receiver ports are not created yet, so audio queues fail ("getting output port ID") and Bluetooth audio never starts streaming |
+| Audio | Bluetooth headphones play (A2DP). mediaserverd loads `HakiosAudio.driver` (`userland/audio`, from [ios-apollo](https://github.com/aTechGeekDev/ios-apollo) / hakios-apollo, MIT) with the iPhone X's device names (Speaker, Hawking, Codec, Actuator), so VirtualAudio builds the speaker, built-in mic and actuator routes; boot with `sweetaudio=0`. The phone's own speaker and mic are silent (no kernel audio path to the DSP / amplifiers yet) |
 | Dynamic Island | Optional (`ArtworkDeviceSubType` 2556 via `mgtool`); disappeared over full-screen games until the framebuffer edge-band fix (0225, not yet confirmed on the phone) |
 | Framebuffer composition | Two-layer frames (app + CoreAnimation) on the GPU; partly transparent overlays fall back to a CPU blend, which costs frame rate |
-| Safari | Pages render; YouTube video crashes |
+| Safari | Pages render (GPU page drawing on); video plays (software decode); YouTube plays videos without DRM (FairPlay ones show a licensing error) |
 | Photos | Opens; has crashed in some sessions |
 
 ### Does not work (yet)
 
-- **Audio**: see above (no speaker, earpiece, microphone or Bluetooth audio).
+- **Audio**: see above (Bluetooth headphones work; no speaker, earpiece or microphone).
 - **Cellular, SIM, calls, SMS**: no modem stack (`CommCenter` removed from launchd).
 - **Camera, sensors** (accelerometer, gyro, proximity, ambient light), **GPS, NFC**, haptics.
 - **SEP / Face ID, Touch ID, passcode-backed data protection**: AppleKeyStore is a stub; security is mostly off.

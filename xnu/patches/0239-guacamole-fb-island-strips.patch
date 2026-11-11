@@ -1,0 +1,222 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1486,16 +1486,26 @@
+ }
+ 
+ /*
+- * 0236: the box around the visible pixels (0237: the opaque black ones) of the layer's top band (the top 1/16 of its source rect,
+- * every 2nd row, every 4th pixel, rows cache-invalidated), padded by 4 pixels, as source pixels box = { x0, y0, x1, y1 } (ends exclusive).
+- * False: nothing visible there.
++ * 0236/0239: the island in the layer's top band (the top 1/16 of its source rect, every 2nd row, every 4th pixel,
++ * rows cache-invalidated). 0237 counted only opaque (alpha >= 0xf0) black (RGB sum <= 48) pixels. 0239: the
++ * island is a pill, and copying its bounding box unblended showed the transparent corners as a black rectangle.
++ * It is now cut into up to SWEET_FB_ISLAND_STRIPS horizontal strips, each only as wide as the island in its rows,
++ * so the rounded ends are drawn as a fine staircase over the game. In source pixels, ends exclusive.
+  */
++#define SWEET_FB_ISLAND_STRIPS  16      /* blits[] on the stack: 4 + 3 * 16 */
++struct sweet_fb_island {
++	int32_t n;
++	int32_t y0[SWEET_FB_ISLAND_STRIPS], y1[SWEET_FB_ISLAND_STRIPS];
++	int32_t x0[SWEET_FB_ISLAND_STRIPS], x1[SWEET_FB_ISLAND_STRIPS];     /* x0 == x1: nothing in the strip */
++};
++
+ static bool
+-sweet_fb_top_band_box(SweetSurface *s, const uint8_t *a, int32_t box[4])
++sweet_fb_top_band_box(SweetSurface *s, const uint8_t *a, struct sweet_fb_island *isl)
+ {
+ 	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
+ 	int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
+ 	uintptr_t src = s->kernelAddress();
++	isl->n = 0;
+ 	if (sw <= 0 || sh <= 0) {
+ 		sw = (int32_t)s->width;
+ 		sh = (int32_t)s->height;
+@@ -1505,34 +1515,48 @@
+ 	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
+ 		return false;
+ 	}
+-	int32_t x0 = sw, y0 = sh, x1 = -1, y1 = -1;
+-	const int32_t band = sh / 16;
+-	for (int32_t y = 0; y < band; y += 2) {
++	enum { ROWS = 128 };
++	int16_t rmin[ROWS], rmax[ROWS];
++	int32_t band = sh / 16, nrows = 0, first = -1, last = -1;
++	band = band > 2 * ROWS ? 2 * ROWS : band;
++	for (int32_t y = 0; y < band; y += 2, nrows++) {
+ 		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
++		int32_t lo = -1, hi = -1;
+ 		for (int32_t x = 0; x < sw; x += 4) {
+-			/*
+-			 * 0237: only the island itself: opaque (alpha >= 0xf0) and black (RGB sum <= 48). The status bar's
+-			 * clock and icons (white) and its faint shading also have alpha != 0, made the box the full width
+-			 * of the band and painted a black strip over the game's top.
+-			 */
+ 			uint32_t p = row[x];
+ 			if ((p >> 24) >= 0xf0 && ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff) <= 48) {
+-				x0 = x < x0 ? x : x0;
+-				x1 = x > x1 ? x : x1;
+-				y0 = y < y0 ? y : y0;
+-				y1 = y;
++				lo = lo < 0 ? x : lo;
++				hi = x;
+ 			}
+ 		}
++		rmin[nrows] = (int16_t)lo;
++		rmax[nrows] = (int16_t)hi;
++		if (lo >= 0) {
++			first = first < 0 ? nrows : first;
++			last = nrows;
++		}
+ 	}
+-	if (x1 < 0) {
++	if (first < 0) {
+ 		return false;
+ 	}
+-	box[0] = sx + (x0 > 4 ? x0 - 4 : 0);
+-	box[1] = sy + (y0 > 4 ? y0 - 4 : 0);
+-	box[2] = sx + (x1 + 8 < sw ? x1 + 8 : sw);
+-	box[3] = sy + (y1 + 6 < sh ? y1 + 6 : sh);
++	int32_t rows = last - first + 1;
++	int32_t per = (rows + SWEET_FB_ISLAND_STRIPS - 1) / SWEET_FB_ISLAND_STRIPS;
++	for (int32_t r = first; r <= last; r += per) {
++		int32_t lo = sw, hi = -1;
++		for (int32_t q = r; q < r + per && q <= last; q++) {
++			if (rmin[q] >= 0) {
++				lo = rmin[q] < lo ? rmin[q] : lo;
++				hi = rmax[q] > hi ? rmax[q] : hi;
++			}
++		}
++		int32_t k = isl->n++;
++		isl->y0[k] = sy + 2 * r;
++		isl->y1[k] = sy + 2 * (r + per < last + 1 ? r + per : last + 1);
++		isl->x0[k] = hi < 0 ? sx + sw : sx + lo;
++		isl->x1[k] = hi < 0 ? sx + sw : sx + (hi + 4 < sw ? hi + 4 : sw);
++	}
+ 	return true;
+ }
+ 
+@@ -1568,6 +1592,7 @@
+ }
+ 
+ static uint32_t sweet_fb_black_logged;
++static uint32_t sweet_fb_island_logged;   /* 0239 */
+ 
+ /* 1 shown (queued on the GPU), 0 not for the GPU (the CPU path shows it), -1 the GPU is busy: next vsync */
+ int
+@@ -1593,15 +1618,18 @@
+ 		sweet_fb_stats.gpu_skip[2]++;
+ 		return 0;
+ 	}
+-	int32_t island[4] = { 0, 0, 0, 0 };
++	struct sweet_fb_island island;
++	island.n = 0;
+ 	bool has_island = false;
++	/* 0239: the island's strips in logical pixels (rows [ly0, ly1), island [lx0, lx1)) */
++	int32_t ly0[SWEET_FB_ISLAND_STRIPS], ly1[SWEET_FB_ISLAND_STRIPS], lx0[SWEET_FB_ISLAND_STRIPS], lx1[SWEET_FB_ISLAND_STRIPS];
+ 	if (layers == 2 && sweet_fb_compose) {
+ 		/* 0185: a top layer with nothing visible (all alpha 0, not flagged opaque): the lower layer alone */
+ 		SweetSurface *top = sweet_surface_copy(get32(rec, 0x54 + 4 * order[0]));
+ 		bool clear = top != NULL && !(sweet_fb_opaque_flag && rec[0x467 + order[0]] != 0) &&
+ 		    sweet_fb_layer_transparent(top, rec + 0x64 + 16 * order[0]);
+ 		/* 0236: a visible island in its top band: drawn as a box over the lower layer (below) */
+-		has_island = clear && sweet_fb_island && sweet_fb_top_band_box(top, rec + 0x64 + 16 * order[0], island);
++		has_island = clear && sweet_fb_island && sweet_fb_top_band_box(top, rec + 0x64 + 16 * order[0], &island);
+ 		OSSafeReleaseNULL(top);
+ 		if (has_island) {
+ 			sweet_fb_stats.top_clear++;
+@@ -1620,7 +1648,7 @@
+ 	if (sweet_fbgpu.fence[k] != 0 && sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 0) != 0) {
+ 		return -1;
+ 	}
+-	struct sweet_fb_blit blits[5];
++	struct sweet_fb_blit blits[4 + 3 * SWEET_FB_ISLAND_STRIPS];
+ 	unsigned nblits = 0;
+ 	int32_t tx0 = 0, ty0 = 0, tx1 = 0, ty1 = 0;     /* the top layer's logical rectangle (clipped) */
+ 	int avoid = -1;
+@@ -1714,16 +1742,39 @@
+ 			tx1 = dx + w;
+ 			ty1 = dy + h;
+ 			if (has_island) {
+-				tx0 = dx + (int32_t)(((int64_t)(island[0] - sx) * w) / aw);
+-				ty0 = dy + (int32_t)(((int64_t)(island[1] - sy) * h) / ah);
+-				tx1 = dx + (int32_t)(((int64_t)(island[2] - sx) * w + aw - 1) / aw);
+-				ty1 = dy + (int32_t)(((int64_t)(island[3] - sy) * h + ah - 1) / ah);
+-				tx0 = tx0 < dx ? dx : tx0;
+-				ty0 = ty0 < dy ? dy : ty0;
+-				tx1 = tx1 > dx + w ? dx + w : tx1;
+-				ty1 = ty1 > dy + h ? dy + h : ty1;
+-			}
+-			if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, tx0, ty0, tx1, ty1, &blits[nblits])) {
++				/* 0239: each strip, mapped with one rounding so neighbouring strips meet exactly */
++#define SWEET_LX(v)     (dx + (int32_t)(((int64_t)((v) - sx) * w) / aw))
++#define SWEET_LY(v)     (dy + (int32_t)(((int64_t)((v) - sy) * h) / ah))
++				tx0 = dx + w;
++				tx1 = dx;
++				for (int32_t q = 0; q < island.n; q++) {
++					ly0[q] = SWEET_LY(island.y0[q]);
++					ly1[q] = SWEET_LY(island.y1[q]);
++					lx0[q] = SWEET_LX(island.x0[q]);
++					lx1[q] = SWEET_LX(island.x1[q]);
++					ly0[q] = ly0[q] < dy ? dy : (ly0[q] > dy + h ? dy + h : ly0[q]);
++					ly1[q] = ly1[q] < dy ? dy : (ly1[q] > dy + h ? dy + h : ly1[q]);
++					lx0[q] = lx0[q] < dx ? dx : (lx0[q] > dx + w ? dx + w : lx0[q]);
++					lx1[q] = lx1[q] < dx ? dx : (lx1[q] > dx + w ? dx + w : lx1[q]);
++					if (lx1[q] > lx0[q]) {
++						tx0 = lx0[q] < tx0 ? lx0[q] : tx0;
++						tx1 = lx1[q] > tx1 ? lx1[q] : tx1;
++					}
++					if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, lx0[q], ly0[q], lx1[q], ly1[q],
++					    &blits[nblits])) {
++						nblits++;
++					}
++				}
++#undef SWEET_LX
++#undef SWEET_LY
++				ty0 = island.n ? ly0[0] : dy;
++				ty1 = island.n ? ly1[island.n - 1] : dy;
++				if (sweet_fb_island_logged < 4 || (sweet_fb_stats.island % 600) == 1) {
++					sweet_fb_island_logged++;
++					IOLog("SWEET FB: island: %d strips, logical box %d,%d - %d,%d (top layer b %d,%d %dx%d, a %dx%d)\n",
++					    island.n, tx0, ty0, tx1, ty1, dx, dy, w, h, aw, ah);
++				}
++			} else if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, tx0, ty0, tx1, ty1, &blits[nblits])) {
+ 				nblits++;
+ 			}
+ 		} else {
+@@ -1732,6 +1783,34 @@
+ 			 * never scans the bottom layer where the game is (no black flash between two blits)
+ 			 */
+ 			int32_t bx0 = dx, by0 = dy, bx1 = dx + w, by1 = dy + h;
++			if (has_island) {
++				/* 0239: above and below the island's rows, then left and right of it in each strip */
++				int32_t c2[2][4] = {
++					{ bx0, by0, bx1, by1 < ty0 ? by1 : ty0 },
++					{ bx0, by0 > ty1 ? by0 : ty1, bx1, by1 },
++				};
++				for (unsigned c = 0; c < 2; c++) {
++					if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, c2[c][0], c2[c][1], c2[c][2],
++					    c2[c][3], &blits[nblits])) {
++						nblits++;
++					}
++				}
++				for (int32_t q = 0; q < island.n; q++) {
++					int32_t r0 = ly0[q] < by0 ? by0 : ly0[q], r1 = ly1[q] > by1 ? by1 : ly1[q];
++					int32_t l1 = lx1[q] > lx0[q] ? lx0[q] : bx1;    /* an empty strip: the whole row */
++					l1 = l1 > bx1 ? bx1 : l1;
++					int32_t rt0 = lx1[q] > lx0[q] ? lx1[q] : bx1;
++					rt0 = rt0 < bx0 ? bx0 : rt0;
++					if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, bx0, r0, l1, r1, &blits[nblits])) {
++						nblits++;
++					}
++					if (sweet_fb_part(this, src, s, sx, sy, aw, ah, dx, dy, w, h, rt0, r0, bx1, r1, &blits[nblits])) {
++						nblits++;
++					}
++				}
++				s->release();
++				continue;
++			}
+ 			int32_t my0 = by0 > ty0 ? by0 : ty0, my1 = by1 < ty1 ? by1 : ty1;
+ 			int32_t cut[4][4] = {
+ 				{ bx0, by0, bx1, by1 < ty0 ? by1 : ty0 },                       /* above */
