@@ -503,6 +503,27 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   codec device (DeviceFactory_Aspen sorts physical devices by transport
   type; Device_Codec_Aspen), likely a HAL plug-in of ours; the same is
   needed for the speakers.
+- SweetCodec (userland/audio/sweetcodec.c + Info.plist, a HAL
+  AudioServerPlugIn in /Library/Audio/Plug-Ins/HAL/SweetCodec.driver; built
+  with the macOS SDK's CoreAudio headers, `-bundle`): a built-in device named
+  and UID'd "Codec" (VirtualAudio's DeviceManager picks Device_Codec by that
+  name, DeviceFactory 0x21ebc8). Device_Codec makes one port per HAL element
+  with a mute/volume control: output element 4 -> Built-In Speaker (pspk),
+  3 -> Receiver (prec), 1 + 'jack' -> wired headphones (phpw), input 0 ->
+  mics. With it VirtualAudio lists pspk, pstp (speaker tap) and prec ports
+  and mediaserverd stays up, but the playback route still ends on
+  Null_Device (VirtualAudio's own device): pap -> pspk is a connection (it is
+  culled only for ringer categories with the switch on silent), yet the
+  playback handler never picks it. Likely missing: a separate "Speaker"
+  device (the amp: Device_Speaker_Aspen, speaker protection / telemetry).
+  /var/local/codec.trace makes the plug-in log every property query.
+- State left on the phone (2026-11-12): SweetCodec.driver and
+  VirtualAudio.plugin in /Library/Audio/Plug-Ins/HAL, mswrap.off removed
+  (OOB patch active). Not tested yet: Bluetooth playback with codec + patch
+  together. To go back to the working volume: `touch /var/local/mswrap.off`,
+  move VirtualAudio.plugin to HAL.disabled, remove SweetCodec.driver,
+  restart mediaserverd. Disk was 98% full: oslog -l captures are ~20 MB a
+  minute, delete them.
 - With VirtualAudio.plugin in place the volume is stuck at maximum (the
   route ends on Null_Device, whose port has no volume properties). Both are
   off again: VirtualAudio.plugin back in HAL.disabled, /var/local/mswrap.off
