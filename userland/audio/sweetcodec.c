@@ -44,7 +44,26 @@ enum {
 	kObj_OutSource = 7,
 	kObj_InSource = 8,
 	kObj_FirstElemCtl = 10,	/* per-element volume/mute pairs, see elem_ctls[] */
+	kObj_HawkDevice = 30,	/* second device, "Hawking": see below */
+	kObj_HawkInStream = 31,
+	kObj_HawkVolume = 32,	/* input element 0 */
+	kObj_HawkMute = 33,
 };
+
+/*
+ * "Hawking" is the haptics (audio-haptic) device. VirtualAudio's default VAD requires a mandatory
+ * alternate VAD of type vhaw on port types { 'phki', 'pnli' } for every playback route (RoutingManager.cpp
+ * 4383, "VAD is Mandatory"); without a 'phki' port every route but AP -> Null_Device fails ("Recursion
+ * failed after skipping optional alternate VAD"), speaker and Bluetooth A2DP included. Device_Hawking_Aspen
+ * (found by the name "Hawking", DeviceFactory_Aspen) makes the 'phki' port ("Hawking Input") from input
+ * element 0 and puts a volume and a mute control on it ({inpt, 0}).
+ */
+#define HAWK_NAME "Hawking"
+#define HAWK_UID  "Hawking"
+static Float32 hawk_volume = 1.0f;
+static UInt32 hawk_mute;
+
+static Boolean is_hawk(AudioObjectID obj) { return obj >= kObj_HawkDevice && obj <= kObj_HawkMute; }
 
 /*
  * VirtualAudio's Device_Codec creates a port per HAL element that has a mute (and volume) control:
@@ -185,7 +204,7 @@ static Boolean has_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a)
 			return true;
 		}
 		return false;
-	case kObj_Device:
+	case kObj_Device: case kObj_HawkDevice:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: case kAudioObjectPropertyOwner:
 		case kAudioObjectPropertyName: case kAudioObjectPropertyManufacturer: case kAudioObjectPropertyOwnedObjects:
@@ -201,10 +220,11 @@ static Boolean has_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a)
 			return true;
 		case kAudioDevicePropertyDataSource: case kAudioDevicePropertyDataSources:
 		case kAudioDevicePropertyDataSourceNameForIDCFString: case kAudioDevicePropertyDataSourceKindForID:
-			return a->mScope == kAudioObjectPropertyScopeInput || a->mScope == kAudioObjectPropertyScopeOutput;
+			return obj == kObj_Device &&
+			    (a->mScope == kAudioObjectPropertyScopeInput || a->mScope == kAudioObjectPropertyScopeOutput);
 		}
 		return false;
-	case kObj_OutStream: case kObj_InStream:
+	case kObj_OutStream: case kObj_InStream: case kObj_HawkInStream:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: case kAudioObjectPropertyOwner:
 		case kAudioObjectPropertyName: case kAudioStreamPropertyIsActive: case kAudioStreamPropertyDirection:
@@ -214,7 +234,7 @@ static Boolean has_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a)
 			return true;
 		}
 		return false;
-	case kObj_OutVolume:
+	case kObj_OutVolume: case kObj_HawkVolume:
 	elem_volume_props:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: case kAudioObjectPropertyOwner:
@@ -225,7 +245,7 @@ static Boolean has_prop(AudioObjectID obj, const AudioObjectPropertyAddress *a)
 			return true;
 		}
 		return false;
-	case kObj_OutMute:
+	case kObj_OutMute: case kObj_HawkMute:
 	elem_mute_props:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: case kAudioObjectPropertyOwner:
@@ -285,17 +305,18 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef s, AudioObjectID o
 	if (!has_prop(obj, a))
 		return kAudioHardwareUnknownPropertyError;
 	*out = false;
-	if (obj == kObj_Device && (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kAudioDevicePropertyDataSource))
+	if ((obj == kObj_Device || obj == kObj_HawkDevice) &&
+	    (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kAudioDevicePropertyDataSource))
 		*out = true;
-	if ((obj == kObj_OutStream || obj == kObj_InStream) &&
+	if ((obj == kObj_OutStream || obj == kObj_InStream || obj == kObj_HawkInStream) &&
 	    (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat || a->mSelector == kAudioStreamPropertyIsActive))
 		*out = true;
 	Boolean em;
 	int ei = elem_ctl_of(obj, &em);
-	if ((obj == kObj_OutVolume || (ei >= 0 && !em)) &&
+	if ((obj == kObj_OutVolume || obj == kObj_HawkVolume || (ei >= 0 && !em)) &&
 	    (a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue))
 		*out = true;
-	if ((obj == kObj_OutMute || (ei >= 0 && em)) && a->mSelector == kAudioBooleanControlPropertyValue)
+	if ((obj == kObj_OutMute || obj == kObj_HawkMute || (ei >= 0 && em)) && a->mSelector == kAudioBooleanControlPropertyValue)
 		*out = true;
 	if ((obj == kObj_OutSource || obj == kObj_InSource) && a->mSelector == kAudioSelectorControlPropertyCurrentItem)
 		*out = true;
@@ -343,15 +364,18 @@ static OSStatus size_of(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
 	case kAudioDevicePropertyDataSourceNameForIDCFString: case kAudioPlugInPropertyTranslateUIDToDevice:
 		*out = obj == kObj_PlugIn ? sizeof(AudioObjectID) : sizeof(AudioValueTranslation); return 0;
 	case kAudioObjectPropertyOwnedObjects:
-		if (obj == kObj_PlugIn) { *out = 4; return 0; }
+		if (obj == kObj_PlugIn) { *out = 2 * 4; return 0; }
+		if (obj == kObj_HawkDevice) { *out = a->mScope == kAudioObjectPropertyScopeOutput ? 0 : 3 * 4; return 0; }
 		*out = (a->mScope == kAudioObjectPropertyScopeGlobal ? 6 + 2 * N_ELEM_CTLS :
 			a->mScope == kAudioObjectPropertyScopeOutput ? 4 + 2 * 2 : 2 + 2 * 1) * 4;
 		return 0;
-	case kAudioPlugInPropertyDeviceList: *out = 4; return 0;
+	case kAudioPlugInPropertyDeviceList: *out = 2 * 4; return 0;
 	case kAudioDevicePropertyRelatedDevices: *out = 4; return 0;
 	case kAudioDevicePropertyStreams:
+		if (obj == kObj_HawkDevice) { *out = a->mScope == kAudioObjectPropertyScopeOutput ? 0 : 4; return 0; }
 		*out = a->mScope == kAudioObjectPropertyScopeGlobal ? 8 : 4; return 0;
-	case kAudioObjectPropertyControlList: *out = (4 + 2 * N_ELEM_CTLS) * 4; return 0;
+	case kAudioObjectPropertyControlList:
+		*out = (obj == kObj_HawkDevice ? 2 : 4 + 2 * N_ELEM_CTLS) * 4; return 0;
 	case kAudioDevicePropertyNominalSampleRate: *out = 8; return 0;
 	case kAudioDevicePropertyAvailableNominalSampleRates: *out = 2 * sizeof(AudioValueRange); return 0;
 	case kAudioDevicePropertyPreferredChannelsForStereo: *out = 8; return 0;
@@ -402,7 +426,39 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 	Boolean is_in = a->mScope == kAudioObjectPropertyScopeInput || obj == kObj_InStream || obj == kObj_InSource;
 	Boolean em = false;
 	int ei = elem_ctl_of(obj, &em);
-	Float32 vol = ei >= 0 ? elem_volume[ei] : out_volume;
+	Float32 vol = ei >= 0 ? elem_volume[ei] : obj == kObj_HawkVolume ? hawk_volume : out_volume;
+	if (is_hawk(obj)) {
+		/* what differs from the codec; the rest (rates, formats, clock, levels) is shared below */
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass:
+			RET_U32(obj == kObj_HawkVolume ? kAudioLevelControlClassID : obj == kObj_HawkMute ? kAudioBooleanControlClassID :
+				kAudioObjectClassID);
+		case kAudioObjectPropertyClass:
+			RET_U32(obj == kObj_HawkDevice ? kAudioDeviceClassID : obj == kObj_HawkInStream ? kAudioStreamClassID :
+				obj == kObj_HawkVolume ? kAudioVolumeControlClassID : kAudioMuteControlClassID);
+		case kAudioObjectPropertyOwner: RET_U32(obj == kObj_HawkDevice ? kObj_PlugIn : kObj_HawkDevice);
+		case kAudioObjectPropertyName: RET_CFS(obj == kObj_HawkDevice ? HAWK_NAME : "Hawking Input");
+		case kAudioObjectPropertyOwnedObjects: {
+			static const AudioObjectID own[] = { kObj_HawkInStream, kObj_HawkVolume, kObj_HawkMute };
+			if (a->mScope == kAudioObjectPropertyScopeOutput) { *out = 0; return 0; }
+			RET_IDS(own, 3);
+		}
+		case kAudioDevicePropertyDeviceUID: RET_CFS(HAWK_UID);
+		case kAudioDevicePropertyModelUID: RET_CFS("sweet-hawking");
+		case kAudioDevicePropertyRelatedDevices: { static const AudioObjectID dev[] = { kObj_HawkDevice }; RET_IDS(dev, 1); }
+		case kAudioDevicePropertyStreams: {
+			static const AudioObjectID st[] = { kObj_HawkInStream };
+			if (a->mScope == kAudioObjectPropertyScopeOutput) { *out = 0; return 0; }
+			RET_IDS(st, 1);
+		}
+		case kAudioObjectPropertyControlList: { static const AudioObjectID c[] = { kObj_HawkVolume, kObj_HawkMute }; RET_IDS(c, 2); }
+		case kAudioStreamPropertyDirection: RET_U32(1);
+		case kAudioStreamPropertyTerminalType: RET_U32(kAudioStreamTerminalTypeMicrophone);
+		case kAudioControlPropertyScope: RET_U32(kAudioObjectPropertyScopeInput);
+		case kAudioControlPropertyElement: RET_U32(0);
+		case kAudioBooleanControlPropertyValue: RET_U32(hawk_mute);
+		}
+	}
 	switch (a->mSelector) {
 	case kAudioObjectPropertyBaseClass:
 		if (ei >= 0) RET_U32(em ? kAudioBooleanControlClassID : kAudioLevelControlClassID);
@@ -421,24 +477,26 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 		RET_CFS(obj == kObj_OutStream ? "Codec Output" : "Codec Input");
 	case kAudioObjectPropertyManufacturer: RET_CFS(MAKER);
 	case kAudioObjectPropertyOwnedObjects: {
-		static const AudioObjectID dev[] = { kObj_Device };
+		static const AudioObjectID dev[] = { kObj_Device, kObj_HawkDevice };
 		static const AudioObjectID all[] = { kObj_OutStream, kObj_InStream, kObj_OutVolume, kObj_OutMute, kObj_OutSource, kObj_InSource,
 						      ELEM_VOL(0), ELEM_MUTE(0), ELEM_VOL(1), ELEM_MUTE(1), ELEM_VOL(2), ELEM_MUTE(2) };
 		static const AudioObjectID outs[] = { kObj_OutStream, kObj_OutVolume, kObj_OutMute, kObj_OutSource,
 						       ELEM_VOL(0), ELEM_MUTE(0), ELEM_VOL(1), ELEM_MUTE(1) };
 		static const AudioObjectID ins[] = { kObj_InStream, kObj_InSource, ELEM_VOL(2), ELEM_MUTE(2) };
-		if (obj == kObj_PlugIn) RET_IDS(dev, 1);
+		if (obj == kObj_PlugIn) RET_IDS(dev, 2);
 		if (a->mScope == kAudioObjectPropertyScopeOutput) RET_IDS(outs, 8);
 		if (a->mScope == kAudioObjectPropertyScopeInput) RET_IDS(ins, 4);
 		RET_IDS(all, 12);
 	}
-	case kAudioPlugInPropertyDeviceList: { static const AudioObjectID dev[] = { kObj_Device }; RET_IDS(dev, 1); }
+	case kAudioPlugInPropertyDeviceList: { static const AudioObjectID dev[] = { kObj_Device, kObj_HawkDevice }; RET_IDS(dev, 2); }
 	case kAudioPlugInPropertyTranslateUIDToDevice: {
 		if (in < 4 || qs < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
 		CFStringRef want = *(const CFStringRef *)qd;
-		CFStringRef mine = cfs(DEVICE_UID);
-		*(AudioObjectID *)data = (want && CFEqual(want, mine)) ? kObj_Device : kAudioObjectUnknown;
+		CFStringRef mine = cfs(DEVICE_UID), hawk = cfs(HAWK_UID);
+		*(AudioObjectID *)data = !want ? kAudioObjectUnknown : CFEqual(want, mine) ? kObj_Device :
+			CFEqual(want, hawk) ? kObj_HawkDevice : kAudioObjectUnknown;
 		CFRelease(mine);
+		CFRelease(hawk);
 		*out = 4;
 		return 0;
 	}
@@ -567,8 +625,9 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 	UInt32 nchanged = 0;
 	Boolean em = false;
 	int ei = elem_ctl_of(obj, &em);
-	Float32 *volp = ei >= 0 ? &elem_volume[ei] : &out_volume;
-	UInt32 *mutep = ei >= 0 ? &elem_mute[ei] : &out_mute;
+	Float32 *volp = ei >= 0 ? &elem_volume[ei] : obj == kObj_HawkVolume ? &hawk_volume : &out_volume;
+	UInt32 *mutep = ei >= 0 ? &elem_mute[ei] : obj == kObj_HawkMute ? &hawk_mute : &out_mute;
+	AudioObjectID dev = is_hawk(obj) ? kObj_HawkDevice : kObj_Device;
 	pthread_mutex_lock(&state_mutex);
 	switch (a->mSelector) {
 	case kAudioDevicePropertyNominalSampleRate: {
@@ -576,7 +635,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 		pthread_mutex_unlock(&state_mutex);
 		if (r != 44100.0 && r != 48000.0) return kAudioHardwareIllegalOperationError;
 		if (r != sample_rate && host)
-			host->RequestDeviceConfigurationChange(host, kObj_Device, (UInt64)r, NULL);
+			host->RequestDeviceConfigurationChange(host, dev, (UInt64)r, NULL);
 		return 0;
 	}
 	case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: {
@@ -585,7 +644,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 		pthread_mutex_unlock(&state_mutex);
 		if (r != 44100.0 && r != 48000.0) return kAudioDeviceUnsupportedFormatError;
 		if (r != sample_rate && host)
-			host->RequestDeviceConfigurationChange(host, kObj_Device, (UInt64)r, NULL);
+			host->RequestDeviceConfigurationChange(host, dev, (UInt64)r, NULL);
 		return 0;
 	}
 	case kAudioStreamPropertyIsActive: break;

@@ -29,7 +29,8 @@ as coming from a device tree (DT) or Linux.
 | Photos, Settings > About, Wallet | work (0135 sandbox extensions; fairplayd job removed) |
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
 | Wi-Fi | works: WPA2-PSK join, DHCP, internet (wifi25: HTTPS 200 from apple.com); userland/wland from ios-flame over 0138 /dev/pmem; en0 + Apple80211 for wifid/Settings (0139, from ios-flame 0123) |
-| Audio, CPU frequency | not started |
+| Bluetooth audio (A2DP) | works: AAC to headphones, volume (userland/audio SweetCodec "Codec" + "Hawking", btd at 3.2 Mbaud; see Bluetooth) |
+| Speaker audio, CPU frequency | not started (speaker: ADSP audio PD) |
 
 ## Workflow
 
@@ -414,11 +415,19 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   seemed to ignore the power pulses every other run.
 - Power: 0xC0 at 2400 baud without flow control (off), 0xFC at 115200 (on),
   then RTS/CTS on. btd waits 2 s / 1 s (Linux 10 ms / 100 ms) to be safe.
+- Operating speed 3.2 Mbaud (hci_qca.c qca_set_speed for WCN3990): once the
+  version answers at 115200, RTS held off and CTS ignored, EDL_SET_BAUDRATE
+  (0xfc48, index 0x11), host RCG to 102.4 MHz (M/N 64/375, div 1), flow
+  control back; the controller answers with vendor event 0xff at the new
+  rate, then the version again. If that fails btd power-cycles and stays at
+  115200; /var/local/btd.slow forces 115200. At 115200 (~11 KB/s) A2DP AAC
+  at 224 kbit/s broke up: bluetoothd "ANDP packet flushed: Audio Queue full".
 - Firmware (btqca.c): the whole file in 243-byte EDL_PATCH_TLV_REQ (0x1e)
   segments of vendor command 0xfc00. The patch is download mode 3: no answer
   per segment, the last one ends with a Command Complete for opcode 0 and
   then the vendor event 0x04. The NVM is answered per segment. The NVM's
-  HCI tag (17) is set to 115200 (data[2] = 0) and in-band sleep off
+  HCI tag (17) gets the operating baud index (data[2]; the file already has
+  0x11) and in-band sleep off
   (data[0] &= ~0x80), so no IBS wake bytes are needed.
 - The controller sends its own log as ACL on handle 0x2edc (hci_qca
   QCA_DEBUG_HANDLE): the H4 reader skips ACL/SCO packets.
@@ -517,17 +526,39 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   playback handler never picks it. Likely missing: a separate "Speaker"
   device (the amp: Device_Speaker_Aspen, speaker protection / telemetry).
   /var/local/codec.trace makes the plug-in log every property query.
-- State left on the phone (2026-11-12): SweetCodec.driver and
-  VirtualAudio.plugin in /Library/Audio/Plug-Ins/HAL, mswrap.off removed
-  (OOB patch active). Not tested yet: Bluetooth playback with codec + patch
-  together. To go back to the working volume: `touch /var/local/mswrap.off`,
-  move VirtualAudio.plugin to HAL.disabled, remove SweetCodec.driver,
-  restart mediaserverd. Disk was 98% full: oslog -l captures are ~20 MB a
-  minute, delete them.
-- With VirtualAudio.plugin in place the volume is stuck at maximum (the
-  route ends on Null_Device, whose port has no volume properties). Both are
-  off again: VirtualAudio.plugin back in HAL.disabled, /var/local/mswrap.off
-  present (mswrap then execs mediaserverd plainly).
+- Bluetooth playback works (2026-11-12, OnePlus Buds 4, AAC 224 kbit/s,
+  volume works). What was still missing after the codec:
+  - Every route of the default VAD needs a mandatory alternate VAD vhaw
+    (Hawking, the audio-haptics device) on port types { phki, pnli }
+    (RoutingManager.cpp 4383 "VAD is Mandatory"). Without a phki port the
+    built routes AP -> pspk and AP -> phpB (A2DP) failed ("Recursion failed
+    after skipping optional alternate VAD") and only AP -> Null_Device (no
+    alternate VADs) was left. SweetCodec now also publishes a device named
+    "Hawking" (input stream, volume + mute on input element 0):
+    Device_Hawking_Aspen makes "Hawking Input" (phki) from it.
+  - VirtualAudio's own trace says why each route fails: in
+    com.apple.coreaudio (mobile, `prefs com.apple.coreaudio KEY str spew`)
+    the keys traceroutingmanager, tracerouting, traceroutingutilities,
+    traceportmanager, ... (one per va_* log scope; spew = 7) enable the
+    level > 5 messages ("Attempting to build concrete route for abstract
+    route ..."). Remove them afterwards (`prefs ... KEY del`): very chatty.
+  - The product is iPhone10,3 (MGGetProductType 0x669eebc5 -> internal
+    product 0x10; RoutingSettingsFactory_Aspen builds its database).
+  - Never `cp` over a loaded signed file (the plug-in): the kernel keeps
+    the old code signature on the vnode, the new pages fail it and the
+    process loses CS_VALID (csops flags 0x26000000) without being killed.
+    bluetoothd then refuses BTAudio.xpc ("unknown client pid", it allows
+    clients by signing identifier) and BTAudioHALPlugin loops on
+    "Connection interrupted". Install as a new inode (copy, then `mv`).
+  - Choppy sound was the HCI UART (115200, see Operating speed above).
+- State on the phone: SweetCodec.driver (Codec + Hawking) and
+  VirtualAudio.plugin in /Library/Audio/Plug-Ins/HAL, mswrap with
+  libsweet-vabt (OOB patch), btd at 3.2 Mbaud. Previous binaries:
+  /var/local/SweetCodec.prev, /var/local/btd.prev.
+- The built-in speaker route (AP -> pspk) is chosen and has volume, but
+  SweetCodec drops the samples, and VirtualAudio's speaker protection DSP
+  chain wants a separate "Speaker" device ("Unable to find the speaker
+  device"). Real speaker output waits on the ADSP audio PD (see Audio).
 - Safari downloads (fixed, xnu 0164): LocalStorageFileProvider issues the
   APFS-private _IOW('J', 2, u64) on the placeholder it creates in Downloads;
   ENOTTY on HFS failed the import ("failed to import placeholder"). 0164

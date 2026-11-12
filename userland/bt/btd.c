@@ -10,7 +10,8 @@
  * (600 MHz; GPLL0 USER_CTL 0x103: main and even both on). 7.3728 MHz
  * (M/N 384/31250) for 2400 and 115200 baud, 102.4 MHz (64/375) for 3.2 Mbaud.
  * Controller bring-up as Linux drivers/bluetooth/hci_qca.c and btqca.c: power-off pulse 0xC0 at 2400 baud,
- * power-on pulse 0xFC at 115200, both without flow control; then HCI (H4) with RTS/CTS.
+ * power-on pulse 0xFC at 115200, both without flow control; then HCI (H4) with RTS/CTS, at 3.2 Mbaud once the
+ * version answers (oper_speed).
  *
  *   btd version             power the BT core on, read the SoC version (EDL_PATCH_VER_REQ)
  *   btd up                  and the rampatch + NVM (/var/local/fw/bt: linux-firmware qca/crbtfw21.tlv, crnv21.bin),
@@ -222,6 +223,15 @@ static int set_baud(unsigned baud)
 	se_wr(GENI_SER_S_CLK_CFG, (div << 4) | 1u);
 	rx_start();
 	return 0;
+}
+
+/* qcom_geni_serial set_mctrl: RTS held off by hand, or left to the hardware */
+#define UART_MANUAL_RFR_EN	(1u << 31)
+#define UART_RFR_NOT_READY	(1u << 1)
+
+static void rts_hold(int hold)
+{
+	se_wr(SE_UART_MANUAL_RFR, hold ? UART_MANUAL_RFR_EN | UART_RFR_NOT_READY : 0);
 }
 
 static void flow_control(int on)
@@ -453,6 +463,41 @@ static int read_version(void)
 	return -1;
 }
 
+/*
+ * Operating speed, as hci_qca.c qca_set_speed(QCA_OPER_SPEED) for the WCN3990 (oper_speed 3200000): before the
+ * firmware, RTS held off and CTS ignored, EDL_SET_BAUDRATE (0xfc48, QCA_BAUDRATE_3200000 = 0x11), the host to
+ * the new rate, flow control back; the controller then sends a vendor event at the new rate (Linux drops it).
+ * The NVM's HCI tag gets the same index (btqca.c qca_tlv_check_data). 115200 baud carries ~11 KB/s, less than
+ * A2DP AAC at 224 kbit/s: bluetoothd flushed packets ("Audio Queue full") and the sound broke up.
+ * /var/local/btd.slow keeps 115200.
+ */
+#define EDL_SET_BAUDRATE_OPCODE	0xfc48
+#define QCA_BAUDRATE_115200	0x00
+#define QCA_BAUDRATE_3200000	0x11
+static unsigned oper_baud = 115200;
+
+static int oper_speed(void)
+{
+	uint8_t idx = QCA_BAUDRATE_3200000, code, par[256];
+	unsigned n;
+	rts_hold(1);
+	flow_control(0);
+	if (hci_cmd(EDL_SET_BAUDRATE_OPCODE, &idx, 1))
+		return -1;
+	usleep(10000);	/* Linux: 1-10 ms for the controller to take it */
+	if (set_baud(3200000))
+		return -1;
+	rxq_n = 0;
+	flow_control(1);
+	rts_hold(0);
+	if (hci_event(&code, par, &n, 300) == 0)
+		printf("bt: 3.2 Mbaud, controller event %#x (%u bytes)\n", code, n);
+	else
+		printf("bt: 3.2 Mbaud, no event from the controller\n");
+	oper_baud = 3200000;
+	return 0;
+}
+
 /* ---- firmware (btqca.c qca_download_firmware): the whole TLV file in 243-byte EDL_PATCH_TLV_REQ segments ---- */
 
 #define EDL_PATCH_TLV_REQ_CMD	0x1e
@@ -477,8 +522,8 @@ static uint8_t *slurp(const char *path, size_t *len)
 	return b;
 }
 
-/* NVM: the HCI tag (17) keeps 115200 (QCA_BAUDRATE_115200 = 0 in data[2]) and in-band sleep off (Linux turns it
- * on and speaks the IBS wake protocol); deep sleep (tag 27) stays as the file has it */
+/* NVM: the HCI tag (17) gets the operating baud index in data[2] and in-band sleep off (Linux turns it on and
+ * speaks the IBS wake protocol); deep sleep (tag 27) stays as the file has it */
 static void nvm_fixup(uint8_t *d, size_t n)
 {
 	size_t off = 0;
@@ -497,10 +542,11 @@ static void nvm_fixup(uint8_t *d, size_t n)
 		memcpy(&tlen, t + idx + 2, 2);
 		uint8_t *data = t + idx + 12;
 		if (id == 17 && tlen >= 3) {
-			printf("nvm: HCI tag %02x %02x %02x -> in-band sleep off, baud index 0 (115200)\n", data[0], data[1],
-			       data[2]);
+			uint8_t bi = oper_baud == 3200000 ? QCA_BAUDRATE_3200000 : QCA_BAUDRATE_115200;
+			printf("nvm: HCI tag %02x %02x %02x -> in-band sleep off, baud index %#x (%u)\n", data[0], data[1],
+			       data[2], bi, oper_baud);
 			data[0] &= ~0x80;	/* IBS: the host would have to wake the chip with 0xfd before each packet */
-			data[2] = 0;
+			data[2] = bi;
 		}
 		if (id == 2 && tlen == 6) {
 			/* the ADT's local-mac-address (tools/mkadt.py), what bluetoothd believes; LSB first here */
@@ -988,12 +1034,22 @@ int main(int argc, char **argv)
 	/* a chip left running by an earlier btd does not always take the pulses: off, a pause, on, again */
 	/* at boot (launchd job com.sweet.btd) the rails may not be up yet: wland turns them on for WLAN */
 	int ok = 0, tries = strcmp(argv[1], "serve") ? 4 : 30;
+	int fast = !getenv("BT_NO_PULSE") && access("/var/local/btd.slow", F_OK) != 0;
 	for (int i = 0; i < tries && !ok; i++) {
 		step("bt: power pulses");
+		oper_baud = 115200;
 		if (power_on())
 			return 1;
 		step("bt: version");
 		ok = !read_version();
+		if (ok && fast) {
+			step("bt: 3.2 Mbaud");
+			ok = !oper_speed() && !read_version();
+			if (!ok) {
+				printf("bt: no answer at 3.2 Mbaud, power cycling and staying at 115200\n");
+				fast = 0;
+			}
+		}
 		if (!ok)
 			usleep(i < 3 ? 200000 : 3000000);
 	}
