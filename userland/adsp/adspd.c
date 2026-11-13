@@ -645,7 +645,12 @@ static void qrtr_rx(const uint8_t *d, uint32_t n)
 #define APR_DOMAIN_ADSP		4
 #define APR_DOMAIN_APPS		5
 #define APR_SVC_ADSP_CORE	3
-#define APR_HDR_FIELD_CMD	((1u << 8) | (5u << 4))	/* SEQ_CMD, 20-byte header, version 0 */
+/*
+ * SEQ_CMD is 2 (Linux soc/qcom/apr.h: EVENT 0, CMD_RSP 1, SEQ_CMD 2, NSEQ_CMD 3). With 1 every command went out
+ * as a response: handlers that send their own RSP (GET_STATE, GET_VERSIONS, AFE GET_PARAM) answered, but no
+ * APR_BASIC_RSP_RESULT ever came, so AFE's clock set / port commands looked dead.
+ */
+#define APR_HDR_FIELD_CMD	((2u << 8) | (5u << 4))	/* SEQ_CMD, 20-byte header, version 0 */
 #define APR_BASIC_RSP_RESULT	0x000110e8
 #define AVCS_GET_VERSIONS	0x00012905
 #define AVCS_GET_VERSIONS_RSP	0x00012906
@@ -821,6 +826,31 @@ static int afe_port(uint16_t port, int start)
 	int st = apr_cmd(APR_SVC_AFE, start ? AFE_PORT_CMD_DEVICE_START : AFE_PORT_CMD_DEVICE_STOP, p, sizeof(p));
 	printf("afe: port %#x %s -> %d\n", port, start ? "start" : "stop", st);
 	return st;
+}
+
+/*
+ * Does AFE answer at all, before anything touches the hardware? The clock set was always the first AFE command
+ * of a boot and nothing ever answered after it (DEVICE_STOP neither): it may hang the AFE thread. This sends
+ * a read of the port's I2S config (AFE_PORT_CMD_GET_PARAM_V2, in-band) and a DEVICE_STOP of the idle port,
+ * and logs whatever comes back (apr_rx prints every packet).
+ */
+#define AFE_PORT_CMD_GET_PARAM_V2	0x000100f0
+#define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
+
+static void afe_probe(void)
+{
+	struct __attribute__((packed)) {
+		uint16_t port_id, payload_size;
+		uint32_t addr_lsw, addr_msw, mem_map_handle;
+		uint32_t module_id, param_id;
+	} g = {
+		.port_id = AFE_PORT_QUAT_MI2S_RX, .payload_size = 12 + 20, .module_id = AFE_MODULE_AUDIO_DEV_INTERFACE,
+		.param_id = AFE_PARAM_ID_I2S_CONFIG,
+	};
+	apr_send(APR_SVC_AFE, AFE_PORT_CMD_GET_PARAM_V2, &g, sizeof(g));
+	for (int t = 0; t < 200; t++)
+		edge_poll(5);
+	afe_port(AFE_PORT_QUAT_MI2S_RX, 0);
 }
 
 static void apr_rx_apps2(const uint8_t *d, uint32_t n)
@@ -1416,6 +1446,8 @@ static void command(char *line)
 		afe_running = !st;
 		if (st)
 			afe_clock(CLK_ID_QUAD_MI2S_IBIT, 0, 0);
+	} else if (!strcmp(line, "afe probe")) {
+		afe_probe();
 	} else if (!strcmp(line, "afe off") && afe_running) {
 		afe_port(AFE_PORT_QUAT_MI2S_RX, 0);
 		afe_clock(CLK_ID_QUAD_MI2S_IBIT, 0, 0);

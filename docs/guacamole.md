@@ -404,6 +404,20 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   apps_mem = memory for the PD). Without it the PD's calls to the HLOS wait,
   most likely what keeps AFE/ASM/ADM down. Files it reads (vendor
   /vendor/lib/rfsa/adsp, /vendor/dsp) are not in ../dumps yet.
+- AFE works, the speakers play (2026-11-13): adspd's APR header said
+  message type 1, which is CMD_RSP (Linux soc/qcom/apr.h: EVENT 0, CMD_RSP
+  1, SEQ_CMD 2, NSEQ_CMD 3). Our commands were taken for responses: those
+  with their own RSP (q6core GET_STATE / GET_VERSIONS, AFE GET_PARAM_V2)
+  answered, APR_BASIC_RSP_RESULT never came, so the clock set and every port
+  command looked dead. With SEQ_CMD (2): `afe on` = QUAD_MI2S_IBIT 3.072 MHz,
+  QUAT_MI2S_RX I2S config (SD1, stereo, 32-bit, 48 kHz), DEVICE_START, all
+  status 0; `tfa init` then brings both TFA9874 to MANSTATE 9 (PLL locked,
+  clocks stable, amp on). A DTMF tone from AFE's generator
+  (`apr 4 0x10102 0x5dc 0 0x02b905c5 0x00012000 0x00001006`: 1500 ms,
+  1477 + 697 Hz, gain 0x2000, one port 0x1006) is very loud: start lower.
+  No audio PD, FastRPC or listener needed (mainline Linux uses none either).
+  Next: ASM stream + ADM COPP to port 0x1006 (q6asm/q6adm), PCM from
+  SweetCodec to adspd, a "Speaker" device for VirtualAudio, a boot job.
 - Tried (2026-11-13): adspd `listener` (remotectl open
   "adsp_default_listener" -> handle, register -> 0, adsp_listener init2 ->
   0, next2 held by the ADSP) works, but the audio PD makes no call in 30 s
