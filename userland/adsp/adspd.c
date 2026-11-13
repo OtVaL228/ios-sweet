@@ -26,7 +26,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <spawn.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include "edge.h"
 #include "../audio/sweetpcm.h"
@@ -1834,9 +1836,77 @@ static void command(char *line)
 	}
 }
 
+/*
+ * The boot script (/var/local/adspd.boot, from the com.sweet.adspd job): serve's commands, one per line, run
+ * once the ADSP is up, plus `sleep SECS` (the ADSP keeps being serviced) and `exec PROGRAM ARGS...` (waited
+ * for, e.g. tfa init once AFE has the I2S clock running). '#' starts a comment.
+ */
+#define BOOT_SCRIPT "/var/local/adspd.boot"
+extern char **environ;
+
+static void command(char *line);
+
+static void run_exec(char *args)
+{
+	char *argv[16];
+	int n = 0;
+	for (char *t = strtok(args, " "); t && n < 15; t = strtok(NULL, " "))
+		argv[n++] = t;
+	argv[n] = NULL;
+	if (!n)
+		return;
+	pid_t pid;
+	int st = 0;
+	if (posix_spawn(&pid, argv[0], NULL, NULL, argv, environ)) {
+		printf("boot: cannot run %s\n", argv[0]);
+		return;
+	}
+	while (waitpid(pid, &st, WNOHANG) == 0)
+		idle(50);
+	printf("boot: %s -> %d\n", argv[0], WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+}
+
+static void run_boot_script(void)
+{
+	FILE *f = fopen(BOOT_SCRIPT, "r");
+	if (!f)
+		return;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "#\r\n")] = 0;
+		size_t n = strlen(line);
+		while (n && line[n - 1] == ' ')
+			line[--n] = 0;
+		if (!n)
+			continue;
+		printf("[%6llu] boot: %s\n", (unsigned long long)edge_ms(), line);
+		if (!strncmp(line, "sleep ", 6))
+			idle(1000u * (unsigned)atoi(line + 6));
+		else if (!strncmp(line, "exec ", 5))
+			run_exec(line + 5);
+		else
+			command(line);
+	}
+	fclose(f);
+	printf("boot: %s done\n", BOOT_SCRIPT);
+}
+
 static int serve(void)
 {
 	signal(SIGPIPE, SIG_IGN);
+	/*
+	 * ADSPD_BOOT=SECS (the com.sweet.adspd job): the ADSP is not running yet in this boot, so the state an
+	 * adspd of the last boot saved is stale; wait SECS first (Wi-Fi comes up meanwhile: an ADSP started
+	 * beside wland's bring-up is untried), then boot it fresh.
+	 */
+	const char *boot = getenv("ADSPD_BOOT");
+	if (boot) {
+		unlink(STATE_FILE);
+		unlink(QRTR_STATE_FILE);
+		unlink(PCM_HANDLE_FILE);
+		printf("serve: boot start in %s s\n", boot);
+		sleep((unsigned)atoi(boot));
+	}
 	if (bring_up(0))
 		return 1;
 	unlink(CMD_FIFO);
@@ -1846,6 +1916,7 @@ static int serve(void)
 	}
 	int fd = open(CMD_FIFO, O_RDWR | O_NONBLOCK);	/* RDWR: never EOF when writers come and go */
 	printf("serve: commands through %s\n", CMD_FIFO);
+	run_boot_script();
 	char buf[256];
 	size_t have = 0;
 	for (;;) {
@@ -1878,9 +1949,31 @@ static int serve(void)
 	}
 }
 
+/*
+ * launchd gives daemons a 6 MB jetsam limit (JetsamMemoryLimit in our job is not applied), and the ADSP
+ * firmware alone is 13 MB: the com.sweet.adspd job was killed (JETSAM_REASON_MEMORY_PERPROCESSLIMIT) in the
+ * middle of the PAS boot. Raise our own limit as launchd would (xnu bsd/sys/kern_memorystatus.h).
+ */
+#define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES	7
+struct memorystatus_memlimit_properties {
+	int32_t memlimit_active;	/* MB */
+	uint32_t memlimit_active_attr;
+	int32_t memlimit_inactive;
+	uint32_t memlimit_inactive_attr;
+};
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
+
+static void raise_memlimit(void)
+{
+	struct memorystatus_memlimit_properties m = { 256, 0, 256, 0 };
+	if (memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &m, sizeof(m)))
+		perror("memorystatus_control");
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	raise_memlimit();
 	if (argc < 2) {
 		fprintf(stderr, "usage: adspd boot | up [SECS] | afe [SECS] | serve | shutdown | smp2p\n");
 		return 2;

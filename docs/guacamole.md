@@ -30,7 +30,7 @@ as coming from a device tree (DT) or Linux.
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
 | Wi-Fi | works: WPA2-PSK join, DHCP, internet (wifi25: HTTPS 200 from apple.com); userland/wland from ios-flame over 0138 /dev/pmem; en0 + Apple80211 for wifid/Settings (0139, from ios-flame 0123) |
 | Bluetooth audio (A2DP) | works: AAC to headphones, volume (userland/audio SweetCodec "Codec" + "Hawking", btd at 3.2 Mbaud; see Bluetooth) |
-| Speaker audio | works: iOS -> SweetCodec ring -> adspd -> ADSP ASM/ADM/AFE -> TFA9874 (started by hand, see Audio) |
+| Speaker audio | works: iOS -> SweetCodec ring -> adspd -> ADSP ASM/ADM/AFE -> TFA9874, started at boot (com.sweet.adspd; see Audio) |
 | CPU frequency | not started |
 
 ## Workflow
@@ -448,8 +448,18 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   RawModeDisablesSpeakerProcessing (0xd7920), cached in __bss 0x63f461
   (value) / 0x63f462 (computed): libsweet-vabt sets both. The speaker stream
   then gets the d22_speaker_general chain.
-- Next: a boot job (adspd serve, smmu, afe on, tfa init, pcm on), the
-  receiver, the microphones.
+- At boot (2026-11-14): job com.sweet.adspd (tools/sweet-root-tweaks.py
+  --net; added to the phone's launchd.plist by hand, the old one is
+  /var/local/launchd.pre-adspd.plist) runs `adspd serve` with ADSPD_BOOT=30:
+  stale edge / QRTR / ring handle state removed, 30 s for Wi-Fi, a fresh
+  ADSP boot, then /var/local/adspd.boot (userland/adsp/adspd.boot: smmu,
+  afe on, exec tfa init, pcm on). Daemons get a 6 MB jetsam limit and
+  JetsamMemoryLimit in the job is not applied: the first boots killed adspd
+  in the middle of the PAS load (JETSAM_REASON_MEMORY_PERPROCESSLIMIT).
+  adspd raises its own limit (memorystatus_control
+  SET_MEMLIMIT_PROPERTIES, 256 MB). A PAS boot left half done by such a
+  kill took a second init_image fine.
+- Next: the receiver, the microphones, the speaker's own volume curve.
 - Tried (2026-11-13): adspd `listener` (remotectl open
   "adsp_default_listener" -> handle, register -> 0, adsp_listener init2 ->
   0, next2 held by the ADSP) works, but the audio PD makes no call in 30 s

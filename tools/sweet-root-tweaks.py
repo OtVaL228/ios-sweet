@@ -29,7 +29,8 @@ screen (image versions v8-v14 in NOTES.md):
                   guacamole: com.sweet.wland (Wi-Fi, /var/local/bin/wland up 0)
                   com.sweet.btd (Bluetooth, /var/local/bin/btd serve; bluetoothd
                   gets BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt, com.apple.BlueTool
-                  runs /var/local/bin/bluetoold)
+                  runs /var/local/bin/bluetoold), com.sweet.adspd (speaker audio:
+                  /var/local/bin/adspd serve with ADSPD_BOOT and /var/local/adspd.boot)
                   and com.sweet.sshd (the rootless Procursus bootstrap's sshd in
                   /var/jb), all RunAtLoad, so Wi-Fi and SSH come up on every
                   boot without a SWEETBOX autorun.sh
@@ -105,6 +106,21 @@ NET_JOBS = {
         'POSIXSpawnType': 'Interactive',
         'StandardOutPath': '/var/local/btd.out',
         'StandardErrorPath': '/var/local/btd.out',
+    },
+    # Speaker audio (userland/adsp): adspd boots the ADSP once per phone boot (a restart takes the modem
+    # and Wi-Fi down), after ADSPD_BOOT seconds, then runs /var/local/adspd.boot (userland/adsp/adspd.boot:
+    # AFE port, amps, the ASM stream on SweetCodec's ring) and keeps serving. No KeepAlive, for that reason.
+    '/System/Library/LaunchDaemons/com.sweet.adspd.plist': {
+        'Label': 'com.sweet.adspd',
+        'ProgramArguments': ['/var/local/bin/adspd', 'serve'],
+        'EnvironmentVariables': {'ADSPD_BOOT': '30'},
+        # the default daemon limit (6 MB) jetsams adspd while it loads the 13 MB ADSP firmware; launchd
+        # does not apply this for our job (still 6 MB), adspd raises its own limit (memorystatus_control)
+        'JetsamProperties': {'JetsamMemoryLimit': 128},
+        'RunAtLoad': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/adspd.out',
+        'StandardErrorPath': '/var/local/adspd.out',
     },
     '/System/Library/LaunchDaemons/com.sweet.sshd.plist': {
         'Label': 'com.sweet.sshd',
