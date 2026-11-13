@@ -30,7 +30,8 @@ as coming from a device tree (DT) or Linux.
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
 | Wi-Fi | works: WPA2-PSK join, DHCP, internet (wifi25: HTTPS 200 from apple.com); userland/wland from ios-flame over 0138 /dev/pmem; en0 + Apple80211 for wifid/Settings (0139, from ios-flame 0123) |
 | Bluetooth audio (A2DP) | works: AAC to headphones, volume (userland/audio SweetCodec "Codec" + "Hawking", btd at 3.2 Mbaud; see Bluetooth) |
-| Speaker audio, CPU frequency | not started (speaker: ADSP audio PD) |
+| Speaker audio | works: iOS -> SweetCodec ring -> adspd -> ADSP ASM/ADM/AFE -> TFA9874 (started by hand, see Audio) |
+| CPU frequency | not started |
 
 ## Workflow
 
@@ -428,8 +429,27 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   carry their context bank: msm_audio_ion.c smmu_sid_bits = (iommus 0x1b21
   & qcom,smmu-sid-mask 0xf) << 32 = 1 << 32 in the shared memory map and in
   every write. Without it the first map sent the SoC to crashdump.
-- Next: PCM from SweetCodec to adspd (a shared ring), the iOS volume, a
-  "Speaker" device for VirtualAudio, a boot job (adspd serve, afe on, tfa).
+- iOS plays through the speakers (2026-11-13). SweetCodec (48 kHz only now)
+  converts the codec's WriteMix to 16-bit stereo with VirtualAudio's
+  master x speaker volume / mute and appends it to /var/local/pcm.ring
+  (userland/audio/sweetpcm.h, a file both map MAP_SHARED; adspd makes it
+  0666). adspd `pcm on` keeps the ASM stream running on that ring: 4
+  periods in flight (85 ms), silence while short, latency held near two
+  periods (`pcm stats`: underruns, skips, wpos/rpos). `pcm_start` first
+  closes what an earlier adspd left (ASM session, COPP 0, the ring's memory
+  handle saved in /var/local/adspd.pcm): a second map of the same region
+  fails (status 1).
+- The speaker route needed no speaker protection: the routing settings give
+  the speaker a closed-loop protection chain (clsp), which wants a "Speaker"
+  device with a 4-channel telemetry input; without it activation failed
+  ("Unable to find the speaker device", stream formats 'what') and the route
+  fell back to Null_Device. The DSP chain factory (VirtualAudio 0x83a54)
+  makes the default chain when RunTimeDefaults says
+  RawModeDisablesSpeakerProcessing (0xd7920), cached in __bss 0x63f461
+  (value) / 0x63f462 (computed): libsweet-vabt sets both. The speaker stream
+  then gets the d22_speaker_general chain.
+- Next: a boot job (adspd serve, smmu, afe on, tfa init, pcm on), the
+  receiver, the microphones.
 - Tried (2026-11-13): adspd `listener` (remotectl open
   "adsp_default_listener" -> handle, register -> 0, adsp_listener init2 ->
   0, next2 held by the ADSP) works, but the audio PD makes no call in 30 s

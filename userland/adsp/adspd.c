@@ -26,8 +26,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include "edge.h"
+#include "../audio/sweetpcm.h"
 #include "../wland/link.h"
 #include "../wland/pmem.h"
 #include "../wland/qmi.h"
@@ -878,6 +880,8 @@ static void afe_probe(void)
 #define APR_SVC_ADM				8
 #define ASM_CMD_SHARED_MEM_MAP_REGIONS		0x00010d92
 #define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00010d93
+#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS	0x00010d94
+#define PCM_HANDLE_FILE	"/var/local/adspd.pcm"	/* the ring's ASM memory handle, for the next adspd */
 #define ASM_STREAM_CMD_OPEN_WRITE_V3		0x00010db3
 #define ASM_STREAM_CMD_CLOSE			0x00010bcd
 #define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2	0x00010d98
@@ -902,6 +906,7 @@ static void afe_probe(void)
 #define PCM_SID_MSW	1u
 #define PCM_PERIOD	4096u		/* bytes: 1024 frames of 16-bit stereo, 21.3 ms */
 #define PCM_PERIODS	16u
+#define PCM_INFLIGHT	4u		/* periods queued in the ADSP: 85 ms */
 #define PCM_SESSION	1
 #define PCM_PORT	((PCM_SESSION << 8) | 1)	/* session << 8 | stream */
 
@@ -910,16 +915,72 @@ static int pcm_open, pcm_copp = -1;
 static unsigned pcm_inflight, pcm_written, pcm_done;
 static uint64_t pcm_until;	/* edge_ms() when the tone ends */
 static double pcm_phase;
+static struct sweetpcm *pcm_ring;	/* SweetCodec's ring (`pcm on`), else the tone */
+static unsigned pcm_underruns, pcm_skips;
+
+/* the ring file SweetCodec maps: made here, mode 0666 (mediaserverd runs as mobile) */
+static int pcm_ring_open(void)
+{
+	if (pcm_ring)
+		return 0;
+	int fd = open(SWEETPCM_PATH, O_RDWR | O_CREAT, 0666);
+	if (fd < 0 || ftruncate(fd, SWEETPCM_SIZE) || fchmod(fd, 0666)) {
+		perror(SWEETPCM_PATH);
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	void *m = mmap(NULL, SWEETPCM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) {
+		perror("mmap " SWEETPCM_PATH);
+		return -1;
+	}
+	pcm_ring = m;
+	if (pcm_ring->magic != SWEETPCM_MAGIC || pcm_ring->frames != SWEETPCM_FRAMES) {
+		memset(pcm_ring, 0, sizeof(*pcm_ring) - sizeof(pcm_ring->data));
+		pcm_ring->rate = SWEETPCM_RATE;
+		pcm_ring->frames = SWEETPCM_FRAMES;
+		pcm_ring->channels = 2;
+		pcm_ring->magic = SWEETPCM_MAGIC;
+	}
+	pcm_ring->rpos = pcm_ring->wpos;
+	printf("pcm: ring %s, %u frames, wpos %llu\n", SWEETPCM_PATH, SWEETPCM_FRAMES,
+	       (unsigned long long)pcm_ring->wpos);
+	return 0;
+}
+
+/* one period from the ring: whole periods only (silence while short), latency kept near two periods */
+static void pcm_fill_ring(int16_t *s)
+{
+	const uint32_t n = PCM_PERIOD / 4;
+	uint64_t w = pcm_ring->wpos, r = pcm_ring->rpos;
+	if (w - r > 4 * n || w < r) {
+		r = w - 2 * n;
+		pcm_skips++;
+	}
+	if (w - r < n) {
+		memset(s, 0, PCM_PERIOD);
+		pcm_underruns++;
+		return;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t k = (uint32_t)((r + i) % SWEETPCM_FRAMES);
+		s[2 * i] = pcm_ring->data[2 * k];
+		s[2 * i + 1] = pcm_ring->data[2 * k + 1];
+	}
+	pcm_ring->rpos = r + n;
+}
 
 /* send with explicit ports and token; wait for the basic result of opcode or for rsp (0: none) */
-static int apr_cmd_ex(uint8_t svc, uint32_t opcode, uint16_t port, uint32_t token, const void *payload, uint16_t len,
-		      uint32_t rsp)
+static int apr_cmd_ports(uint8_t svc, uint32_t opcode, uint16_t sport, uint16_t dport, uint32_t token,
+			 const void *payload, uint16_t len, uint32_t rsp)
 {
 	uint8_t b[512];
 	struct apr_hdr h = {
 		.hdr_field = APR_HDR_FIELD_CMD, .pkt_size = (uint16_t)(sizeof(h) + len),
-		.src_svc = svc, .src_domain = APR_DOMAIN_APPS, .src_port = port,
-		.dest_svc = svc, .dest_domain = APR_DOMAIN_ADSP, .dest_port = port,
+		.src_svc = svc, .src_domain = APR_DOMAIN_APPS, .src_port = sport,
+		.dest_svc = svc, .dest_domain = APR_DOMAIN_ADSP, .dest_port = dport,
 		.token = token, .opcode = opcode,
 	};
 	memcpy(b, &h, sizeof(h));
@@ -939,10 +1000,21 @@ static int apr_cmd_ex(uint8_t svc, uint32_t opcode, uint16_t port, uint32_t toke
 	return -1;
 }
 
+static int apr_cmd_ex(uint8_t svc, uint32_t opcode, uint16_t port, uint32_t token, const void *payload, uint16_t len,
+		      uint32_t rsp)
+{
+	return apr_cmd_ports(svc, opcode, port, port, token, payload, len, rsp);
+}
+
 /* one period of the tone: amplitude 1000 of 32767 (about -30 dBFS), both channels */
 static void pcm_fill(unsigned idx)
 {
 	int16_t s[PCM_PERIOD / 2];
+	if (pcm_ring) {
+		pcm_fill_ring(s);
+		pm_wr(PCM_PA + (uint64_t)idx * PCM_PERIOD, s, sizeof(s));
+		return;
+	}
 	for (unsigned i = 0; i < PCM_PERIOD / 4; i++) {
 		int16_t v = edge_ms() < pcm_until ? (int16_t)(1000.0 * sin(pcm_phase)) : 0;
 		pcm_phase += 2.0 * 3.14159265358979 * 440.0 / 48000.0;
@@ -978,7 +1050,7 @@ static void asm_write_done(uint32_t token, const uint32_t *w)
 	pcm_done++;
 	if (w[3])
 		printf("asm: write done %u status %#x\n", token, w[3]);
-	if (pcm_open && edge_ms() < pcm_until + 500) {
+	if (pcm_open && (pcm_ring || edge_ms() < pcm_until + 500)) {
 		pcm_fill(token % PCM_PERIODS);
 		pcm_write(token % PCM_PERIODS);
 	}
@@ -990,6 +1062,21 @@ static int pcm_start(void)
 		return 0;
 	if (smmu_adsp_identity())
 		return -1;
+	/* what an earlier adspd left open in this ADSP boot (q6asm close, q6adm_device_close: dest_port = copp) */
+	int c1 = apr_cmd_ex(APR_SVC_ASM, ASM_STREAM_CMD_CLOSE, PCM_PORT, PCM_SESSION, NULL, 0, 0);
+	int c2 = apr_cmd_ports(APR_SVC_ADM, ADM_CMD_DEVICE_CLOSE_V5, AFE_PORT_QUAT_MI2S_RX, 0,
+			       (uint32_t)AFE_PORT_QUAT_MI2S_RX << 16, NULL, 0, 0);
+	printf("pcm: leftovers closed: session %d, copp 0 %d\n", c1, c2);
+	FILE *hf = fopen(PCM_HANDLE_FILE, "r");
+	uint32_t old = 0;
+	if (hf) {
+		if (fscanf(hf, "%x", &old) == 1 && old) {
+			int c3 = apr_cmd_ex(APR_SVC_ASM, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, 0, PCM_SESSION << 8, &old, sizeof(old), 0);
+			printf("pcm: unmapped the earlier ring handle %#x: %d\n", old, c3);
+		}
+		fclose(hf);
+		unlink(PCM_HANDLE_FILE);
+	}
 	/* shared memory for the ring */
 	struct __attribute__((packed)) {
 		uint16_t pool, nregions;
@@ -1003,6 +1090,10 @@ static int pcm_start(void)
 	       pcm_mem_handle);
 	if (st || !pcm_mem_handle)
 		return -1;
+	if ((hf = fopen(PCM_HANDLE_FILE, "w"))) {
+		fprintf(hf, "%x\n", pcm_mem_handle);
+		fclose(hf);
+	}
 	/* the stream */
 	struct __attribute__((packed)) {
 		uint32_t mode_flags;
@@ -1068,11 +1159,31 @@ static void pcm_tone(unsigned ms)
 	pcm_until = edge_ms() + ms;
 	pcm_written = pcm_done = 0;
 	if (!pcm_inflight)
-		for (unsigned i = 0; i < PCM_PERIODS; i++) {
+		for (unsigned i = 0; i < PCM_INFLIGHT; i++) {
 			pcm_fill(i);
 			pcm_write(i);
 		}
 	printf("tone: 440 Hz for %u ms\n", ms);
+}
+
+/* `pcm on`: the stream runs on and plays SweetCodec's ring; `pcm off`: back to silence and stop */
+static void pcm_ring_play(int on)
+{
+	if (!on) {
+		pcm_ring = NULL;	/* the periods in flight drain, then nothing is refilled */
+		pcm_until = 0;
+		printf("pcm: ring off\n");
+		return;
+	}
+	if (pcm_ring_open() || pcm_start())
+		return;
+	pcm_underruns = pcm_skips = 0;
+	if (!pcm_inflight)
+		for (unsigned i = 0; i < PCM_INFLIGHT; i++) {
+			pcm_fill(i);
+			pcm_write(i);
+		}
+	printf("pcm: playing the ring\n");
 }
 
 static void apr_rx_apps2(const uint8_t *d, uint32_t n)
@@ -1670,8 +1781,12 @@ static void command(char *line)
 			afe_clock(CLK_ID_QUAD_MI2S_IBIT, 0, 0);
 	} else if (!strncmp(line, "tone", 4)) {
 		pcm_tone(line[4] ? (unsigned)atoi(line + 5) : 1000);
+	} else if (!strcmp(line, "pcm on") || !strcmp(line, "pcm off")) {
+		pcm_ring_play(!strcmp(line, "pcm on"));
 	} else if (!strcmp(line, "pcm stats")) {
-		printf("pcm: open %d copp %d, %u written, %u done, %u in flight\n", pcm_open, pcm_copp, pcm_written, pcm_done, pcm_inflight);
+		printf("pcm: open %d copp %d, %u written, %u done, %u in flight, %u underruns, %u skips, ring %s wpos %llu rpos %llu\n",
+		       pcm_open, pcm_copp, pcm_written, pcm_done, pcm_inflight, pcm_underruns, pcm_skips, pcm_ring ? "on" : "off",
+		       pcm_ring ? (unsigned long long)pcm_ring->wpos : 0ull, pcm_ring ? (unsigned long long)pcm_ring->rpos : 0ull);
 	} else if (!strcmp(line, "afe probe")) {
 		afe_probe();
 	} else if (!strcmp(line, "afe off") && afe_running) {

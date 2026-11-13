@@ -23,6 +23,9 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include "sweetpcm.h"
 
 /* AudioHardware.h (not in AudioHardwareBase.h) */
 enum {
@@ -176,7 +179,7 @@ static OSStatus PerformConfigChange(AudioServerPlugInDriverRef s, AudioObjectID 
 {
 	(void)s; (void)o; (void)info;
 	pthread_mutex_lock(&state_mutex);
-	if (action == 44100 || action == 48000) {
+	if (action == 48000) {
 		sample_rate = (Float64)action;
 		struct mach_timebase_info tb;
 		mach_timebase_info(&tb);
@@ -377,7 +380,7 @@ static OSStatus size_of(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
 	case kAudioObjectPropertyControlList:
 		*out = (obj == kObj_HawkDevice ? 2 : 4 + 2 * N_ELEM_CTLS) * 4; return 0;
 	case kAudioDevicePropertyNominalSampleRate: *out = 8; return 0;
-	case kAudioDevicePropertyAvailableNominalSampleRates: *out = 2 * sizeof(AudioValueRange); return 0;
+	case kAudioDevicePropertyAvailableNominalSampleRates: *out = sizeof(AudioValueRange); return 0;
 	case kAudioDevicePropertyPreferredChannelsForStereo: *out = 8; return 0;
 	case kAudioDevicePropertyPreferredChannelLayout: *out = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + 2 * sizeof(AudioChannelDescription)); return 0;
 	case kAudioDevicePropertyDataSources: case kAudioSelectorControlPropertyAvailableItems:
@@ -385,7 +388,7 @@ static OSStatus size_of(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
 	case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat:
 		*out = sizeof(AudioStreamBasicDescription); return 0;
 	case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats:
-		*out = 2 * sizeof(AudioStreamRangedDescription); return 0;
+		*out = sizeof(AudioStreamRangedDescription); return 0;
 	case kAudioLevelControlPropertyDecibelRange: *out = sizeof(AudioValueRange); return 0;
 	case kAudioLevelControlPropertyConvertScalarToDecibels: case kAudioLevelControlPropertyConvertDecibelsToScalar:
 		*out = 4; return 0;
@@ -526,11 +529,11 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 	case kAudioDevicePropertySafetyOffset: RET_U32(64);
 	case kAudioDevicePropertyNominalSampleRate: RET_F64(sample_rate);
 	case kAudioDevicePropertyAvailableNominalSampleRates: {
-		if (in < 2 * sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
+		/* 48 kHz only: the speaker's ASM stream (adspd) runs at that rate */
+		if (in < sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
 		AudioValueRange *r = data;
-		r[0].mMinimum = r[0].mMaximum = 44100.0;
-		r[1].mMinimum = r[1].mMaximum = 48000.0;
-		*out = 2 * sizeof(AudioValueRange);
+		r[0].mMinimum = r[0].mMaximum = 48000.0;
+		*out = sizeof(AudioValueRange);
 		return 0;
 	}
 	case kAudioDevicePropertyIsHidden: RET_U32(0);
@@ -584,11 +587,10 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 		return 0;
 	}
 	case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats: {
-		if (in < 2 * sizeof(AudioStreamRangedDescription)) return kAudioHardwareBadPropertySizeError;
+		if (in < sizeof(AudioStreamRangedDescription)) return kAudioHardwareBadPropertySizeError;
 		AudioStreamRangedDescription *r = data;
-		r[0].mFormat = fmt_for(44100.0, 2); r[0].mSampleRateRange.mMinimum = r[0].mSampleRateRange.mMaximum = 44100.0;
-		r[1].mFormat = fmt_for(48000.0, 2); r[1].mSampleRateRange.mMinimum = r[1].mSampleRateRange.mMaximum = 48000.0;
-		*out = 2 * sizeof(AudioStreamRangedDescription);
+		r[0].mFormat = fmt_for(48000.0, 2); r[0].mSampleRateRange.mMinimum = r[0].mSampleRateRange.mMaximum = 48000.0;
+		*out = sizeof(AudioStreamRangedDescription);
 		return 0;
 	}
 	case kAudioControlPropertyScope:
@@ -633,7 +635,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 	case kAudioDevicePropertyNominalSampleRate: {
 		Float64 r = in >= 8 ? *(const Float64 *)data : 0;
 		pthread_mutex_unlock(&state_mutex);
-		if (r != 44100.0 && r != 48000.0) return kAudioHardwareIllegalOperationError;
+		if (r != 48000.0) return kAudioHardwareIllegalOperationError;
 		if (r != sample_rate && host)
 			host->RequestDeviceConfigurationChange(host, dev, (UInt64)r, NULL);
 		return 0;
@@ -642,7 +644,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 		const AudioStreamBasicDescription *f = data;
 		Float64 r = in >= sizeof(*f) ? f->mSampleRate : 0;
 		pthread_mutex_unlock(&state_mutex);
-		if (r != 44100.0 && r != 48000.0) return kAudioDeviceUnsupportedFormatError;
+		if (r != 48000.0) return kAudioDeviceUnsupportedFormatError;
 		if (r != sample_rate && host)
 			host->RequestDeviceConfigurationChange(host, dev, (UInt64)r, NULL);
 		return 0;
@@ -683,11 +685,57 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef s, AudioObjectID obj,
 	return 0;
 }
 
-/* ---- IO: nothing behind it, the clock is host time ---- */
+/*
+ * ---- IO: the clock is host time; the codec's output mix goes to the speakers through adspd ----
+ * WriteMix of the output stream is converted to 16-bit stereo with the volume / mute VirtualAudio set and
+ * appended to adspd's ring (sweetpcm.h), which adspd feeds to the ADSP's ASM stream (`adspd ... pcm on`).
+ * Without the ring (adspd not running) the mix is dropped, as before.
+ */
+static struct sweetpcm *ring;
+
+static void ring_map(void)
+{
+	if (ring)
+		return;
+	int fd = open(SWEETPCM_PATH, O_RDWR);
+	if (fd < 0) {
+		LOG("no %s: speaker output dropped", SWEETPCM_PATH);
+		return;
+	}
+	void *m = mmap(NULL, SWEETPCM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) {
+		LOG("mmap %s failed", SWEETPCM_PATH);
+		return;
+	}
+	if (((struct sweetpcm *)m)->magic != SWEETPCM_MAGIC || ((struct sweetpcm *)m)->frames != SWEETPCM_FRAMES) {
+		LOG("%s: not a ring", SWEETPCM_PATH);
+		munmap(m, SWEETPCM_SIZE);
+		return;
+	}
+	ring = m;
+	LOG("speaker output through %s", SWEETPCM_PATH);
+}
+
+static void ring_write(const Float32 *src, UInt32 frames)
+{
+	Float32 gain = (out_mute || elem_mute[0]) ? 0.0f : out_volume * elem_volume[0];	/* master x speaker */
+	uint64_t w = ring->wpos;
+	for (UInt32 i = 0; i < frames; i++) {
+		uint32_t k = (uint32_t)((w + i) % SWEETPCM_FRAMES);
+		for (int c = 0; c < 2; c++) {
+			Float32 v = src[2 * i + c] * gain * 32767.0f;
+			ring->data[2 * k + c] = (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+		}
+	}
+	__atomic_store_n(&ring->wpos, w + frames, __ATOMIC_RELEASE);
+}
 
 static OSStatus StartIO(AudioServerPlugInDriverRef s, AudioObjectID dev, UInt32 client)
 {
-	(void)s; (void)dev; (void)client;
+	(void)s; (void)client;
+	if (dev == kObj_Device)
+		ring_map();
 	pthread_mutex_lock(&state_mutex);
 	if (io_running++ == 0) {
 		anchor_host_time = mach_absolute_time();
@@ -731,10 +779,11 @@ static OSStatus BeginIOOperation(AudioServerPlugInDriverRef s, AudioObjectID d, 
 { (void)s; (void)d; (void)c; (void)op; (void)n; (void)i; return 0; }
 static OSStatus DoIOOperation(AudioServerPlugInDriverRef s, AudioObjectID d, AudioObjectID stream, UInt32 c, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *i, void *main, void *secondary)
 {
-	(void)s; (void)d; (void)stream; (void)c; (void)i; (void)secondary;
+	(void)s; (void)d; (void)c; (void)i; (void)secondary;
 	if (op == kAudioServerPlugInIOOperationReadInput)
 		memset(main, 0, frames * 8);	/* silence from the mic */
-	/* WriteMix: dropped (no hardware yet) */
+	else if (op == kAudioServerPlugInIOOperationWriteMix && stream == kObj_OutStream && ring)
+		ring_write(main, frames);
 	return 0;
 }
 static OSStatus EndIOOperation(AudioServerPlugInDriverRef s, AudioObjectID d, UInt32 c, UInt32 op, UInt32 n, const AudioServerPlugInIOCycleInfo *i)

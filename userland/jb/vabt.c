@@ -24,6 +24,8 @@ static const uint8_t va_uuid[16] = { 0x31, 0x96, 0x33, 0x3f, 0x5a, 0x48, 0x37, 0
 #define VA_A2DP_VTABLE 0x62a2d8u	/* Port_BluetoothA2DP (stored by its constructor at 0x405734) */
 #define VA_SLOT_OOB    0x1c0u
 #define VA_OOB_ORIG    0x404b9cu	/* what the slot holds in this build */
+#define VA_NOSPKPROC_VALUE 0x63f461u	/* RawModeDisablesSpeakerProcessing answer (bool, __bss) */
+#define VA_NOSPKPROC_DONE  0x63f462u	/* ... and its "computed" flag */
 
 static bool
 oob_supported(void *port)
@@ -47,6 +49,17 @@ image_added(const struct mach_header *mh, intptr_t slide)
 	}
 	if (uuid == NULL || memcmp(uuid, va_uuid, 16) != 0)
 		return;
+	/*
+	 * Speaker route without speaker protection: the speaker's DSP chain (clsp / clhs / sprt from the routing
+	 * settings) is closed-loop protection, which needs a "Speaker" device with a 4-channel telemetry input
+	 * (V/I sense) we do not have: its activation failed ("Unable to find the speaker device", stream formats
+	 * 'what') and every route fell back to Null_Device. The chain factory (0x83a54) makes the default chain
+	 * when RunTimeDefaults' "RawModeDisablesSpeakerProcessing" check (0xd7920) answers yes; that answer is
+	 * cached in __bss (computed flag 0x63f462, value 0x63f461) and only internal builds set it. Set it.
+	 */
+	*(volatile uint8_t *)(VA_NOSPKPROC_VALUE + (uintptr_t)slide) = 1;
+	*(volatile uint8_t *)(VA_NOSPKPROC_DONE + (uintptr_t)slide) = 1;
+	os_log(OS_LOG_DEFAULT, "SWEET VABT: speaker protection / EQ off (default DSP chain on the speaker route)");
 	uintptr_t *slot = (uintptr_t *)(VA_A2DP_VTABLE + VA_SLOT_OOB + (uintptr_t)slide);
 	if (*slot != VA_OOB_ORIG + (uintptr_t)slide) {
 		os_log(OS_LOG_DEFAULT, "SWEET VABT: VirtualAudio slot holds %#lx, not the expected method: left alone",
