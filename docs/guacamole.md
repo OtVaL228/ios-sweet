@@ -404,6 +404,14 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   apps_mem = memory for the PD). Without it the PD's calls to the HLOS wait,
   most likely what keeps AFE/ASM/ADM down. Files it reads (vendor
   /vendor/lib/rfsa/adsp, /vendor/dsp) are not in ../dumps yet.
+- Tried (2026-11-13): adspd `listener` (remotectl open
+  "adsp_default_listener" -> handle, register -> 0, adsp_listener init2 ->
+  0, next2 held by the ADSP) works, but the audio PD makes no call in 30 s
+  and AFE stays silent: not the listener. Every APR packet is logged and
+  none comes from AFE; intents are queued on every channel. Vendor files
+  (vendor_b and dsp_b mounted read-only in TWRP) are in
+  ../dumps/vendor-adsp: dsp/adsp (AVS modules, map_AVS_SHARED_LIBS_855),
+  rfsa/adsp, acdbdata, adsprpcd, libadsprpc.so.
 - WoA (Project-Aloha/windows_oem_oneplus_qc8150, WOA-Project
   windows_silicon_qcom_hana) also runs the audio PD over FastRPC: SIDs
   0x1b23/24/25 (FastRPCADSPSidInfo) translated through context banks

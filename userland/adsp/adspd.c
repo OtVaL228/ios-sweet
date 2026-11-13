@@ -970,9 +970,24 @@ struct rpc_msg {
 	uint64_t addr, size;
 } __attribute__((packed));
 
-static uint64_t rpc_rsp_ctx;
-static int32_t rpc_rsp_ret;
-static int rpc_rsp_seen;
+/*
+ * Calls by slot, each with its own part of the invoke buffer: slot 0 for calls we wait for, slot 1 for the
+ * listener's next2, which the ADSP holds until the audio PD calls the HLOS. Answers are matched by ctx.
+ */
+#define RPC_SLOTS	2
+#define RPC_SLOT_SIZE	0x80000u
+#define RPC_SLOT_PA(s)	(RPC_BUF_PA + (uint64_t)(s) * RPC_SLOT_SIZE)
+#define RPC_PID		1234	/* the audio PD's process (CREATE_STATIC pgid): user calls carry it as pid */
+#define RPC_MAXBUF	8
+
+struct rpc_call {
+	int busy, done;
+	uint64_t ctx;
+	int32_t ret;
+	uint32_t outoff[RPC_MAXBUF], outlen[RPC_MAXBUF];
+	unsigned nout;
+};
+static struct rpc_call rpc_calls[RPC_SLOTS];
 
 static void fastrpc_rx(const uint8_t *d, uint32_t n)
 {
@@ -982,25 +997,41 @@ static void fastrpc_rx(const uint8_t *d, uint32_t n)
 		memcpy(&ctx, d, 8);
 		memcpy(&ret, d + 8, 4);
 	}
-	printf("[%6llu] fastrpc: < %u bytes: ctx %#llx retval %d (%#x)\n", (unsigned long long)edge_ms(), n,
-	       (unsigned long long)ctx, ret, (uint32_t)ret);
-	rpc_rsp_ctx = ctx;
-	rpc_rsp_ret = ret;
-	rpc_rsp_seen = 1;
+	for (unsigned s = 0; s < RPC_SLOTS; s++)
+		if (rpc_calls[s].busy && rpc_calls[s].ctx == ctx) {
+			rpc_calls[s].ret = ret;
+			rpc_calls[s].done = 1;
+			if (s == 0 || ret)
+				printf("[%6llu] fastrpc: < slot %u ctx %#llx retval %d (%#x)\n", (unsigned long long)edge_ms(), s,
+				       (unsigned long long)ctx, ret, (uint32_t)ret);
+			return;
+		}
+	printf("[%6llu] fastrpc: < %u bytes for no call: ctx %#llx retval %d\n", (unsigned long long)edge_ms(), n,
+	       (unsigned long long)ctx, ret);
 }
 
-/* One invoke with in-buffers only: the args copied into the buffer at RPC_BUF_PA (fastrpc_get_args layout) */
-static int fastrpc_invoke(uint32_t handle, uint32_t method, const void *const *in, const uint32_t *inlen, unsigned nin,
-			  uint32_t pd)
+/*
+ * Send an invoke (fastrpc_get_args layout): nin in-buffers copied into the slot, nout out-buffers of outcap
+ * bytes reserved after them. Addresses as the ADSP sees them carry the context bank (RPC_DSP).
+ */
+static int rpc_send(unsigned slot, int32_t pid, uint32_t handle, uint32_t method, const void *const *in,
+		    const uint32_t *inlen, unsigned nin, const uint32_t *outcap, unsigned nout, uint32_t pd)
 {
-	unsigned n = nin;
+	struct rpc_call *c = &rpc_calls[slot];
+	unsigned n = nin + nout;
 	uint32_t meta = n * (16 + 8 + 16) + 8 * 16 + 4 * 64;	/* remote_buf, invoke_buf, phy_page; fdlist, crclist */
-	static uint8_t b[0x10000];
-	memset(b, 0, sizeof(b));
+	static uint8_t b[RPC_SLOT_SIZE];
+	uint64_t base = RPC_SLOT_PA(slot);
+	if (n > RPC_MAXBUF)
+		return -1;
+	memset(b, 0, meta);
 	uint32_t off = meta;
 	for (unsigned i = 0; i < n; i++) {
 		off = (off + RPC_ALIGN - 1) & ~(uint32_t)(RPC_ALIGN - 1);
-		uint64_t pv = RPC_BUF_PA + off, len = inlen[i];
+		uint64_t len = i < nin ? inlen[i] : outcap[i - nin];
+		if (off + len > RPC_SLOT_SIZE)
+			return -1;
+		uint64_t pv = base + off;
 		uint64_t pg = pv & ~0xfffull, pgs = (((pv + (len ? len : 1) - 1) & ~0xfffull) - pg) / 0x1000 + 1;
 		pg = RPC_DSP(pg);
 		memcpy(b + 16 * i, &pv, 8);
@@ -1011,30 +1042,70 @@ static int fastrpc_invoke(uint32_t handle, uint32_t method, const void *const *i
 		uint64_t psz = pgs * 0x1000;
 		memcpy(b + 24 * n + 16 * i, &pg, 8);
 		memcpy(b + 24 * n + 16 * i + 8, &psz, 8);
-		memcpy(b + off, in[i], inlen[i]);
-		off += inlen[i];
+		if (i < nin) {
+			memcpy(b + off, in[i], inlen[i]);
+		} else {
+			memset(b + off, 0, len);
+			c->outoff[i - nin] = off;
+			c->outlen[i - nin] = (uint32_t)len;
+		}
+		off += (uint32_t)len;
 	}
 	uint32_t size = (off + 0xfff) & ~0xfffu;
-	pm_wr(RPC_BUF_PA, b, (off + 3) & ~3u);
+	pm_wr(base, b, (off + 3) & ~3u);
 	static uint32_t ctxseq = 1;
 	struct rpc_msg m = {
-		.pid = 0, .tid = 1234, .ctx = ((uint64_t)(ctxseq++) << 8) | pd, .handle = handle,
-		.sc = RPC_SCALARS(method, nin, 0), .addr = RPC_DSP(RPC_BUF_PA), .size = size,
+		.pid = pid, .tid = 1234 + (int32_t)slot, .ctx = ((uint64_t)(ctxseq++) << 8) | pd, .handle = handle,
+		.sc = RPC_SCALARS(method, nin, nout), .addr = RPC_DSP(base), .size = size,
 	};
-	printf("[%6llu] fastrpc: > handle %u method %u, %u in-args, buffer %llx+%x, ctx %#llx\n", (unsigned long long)edge_ms(),
-	       handle, method, nin, (unsigned long long)m.addr, size, (unsigned long long)m.ctx);
-	rpc_rsp_seen = 0;
-	if (edge_send(CH_RPC, &m, sizeof(m)))
+	c->busy = 1;
+	c->done = 0;
+	c->ctx = m.ctx;
+	c->nout = nout;
+	if (slot == 0)
+		printf("[%6llu] fastrpc: > handle %u method %u, %u in / %u out, buffer %llx+%x, ctx %#llx\n",
+		       (unsigned long long)edge_ms(), handle, method, nin, nout, (unsigned long long)m.addr, size,
+		       (unsigned long long)m.ctx);
+	if (edge_send(CH_RPC, &m, sizeof(m))) {
+		c->busy = 0;
 		return -1;
-	for (int t = 0; t < 1000 && !rpc_rsp_seen; t++) {
+	}
+	return 0;
+}
+
+/* the call in slot answered: its retval, or -1 after ms */
+static int rpc_wait(unsigned slot, unsigned ms)
+{
+	struct rpc_call *c = &rpc_calls[slot];
+	for (unsigned t = 0; t < ms / 10 && !c->done; t++) {
 		edge_poll(10);
 		smp2p_service();
 	}
-	if (!rpc_rsp_seen) {
-		printf("fastrpc: no answer in 10 s\n");
+	if (!c->done) {
+		printf("fastrpc: slot %u: no answer in %u ms\n", slot, ms);
+		c->busy = 0;
 		return -1;
 	}
-	return rpc_rsp_ret;
+	c->busy = 0;
+	return c->ret;
+}
+
+/* out-buffer i of the answered call in slot */
+static int rpc_out(unsigned slot, unsigned i, void *dst, uint32_t len)
+{
+	struct rpc_call *c = &rpc_calls[slot];
+	if (i >= c->nout || len > c->outlen[i])
+		return -1;
+	return pm_rd(RPC_SLOT_PA(slot) + c->outoff[i], dst, len);
+}
+
+/* a kernel call (pid 0) with in-buffers only, as the driver's init calls */
+static int fastrpc_invoke(uint32_t handle, uint32_t method, const void *const *in, const uint32_t *inlen, unsigned nin,
+			  uint32_t pd)
+{
+	if (rpc_send(0, 0, handle, method, in, inlen, nin, NULL, 0, pd))
+		return -1;
+	return rpc_wait(0, 10000);
 }
 
 /* INIT_ATTACH (method 0 on the init handle, in: the pgid): joins the ADSP's guest OS process. No heap and no
@@ -1073,6 +1144,160 @@ static int audiopd_create(void)
 	int r = fastrpc_invoke(RPC_INIT_HANDLE, 8, in, len, 3, 1);
 	printf("audiopd: -> %d\n", r);
 	return r;
+}
+
+/*
+ * ---- default listener (quic/fastrpc adsp_default_listener.c, listener_android.c; BSD-3-Clause) ----
+ * Android's `adsprpcd audiopd` then opens "adsp_default_listener" through remotectl (handle 0), registers it
+ * and serves the audio PD's calls to the HLOS in a loop of adsp_listener next2 (handle 3, method 4): each
+ * answer carries the next call (ctx, handle, sc and its in-buffers packed as listener_buf.h: per buffer a
+ * 32-bit length, 8-byte alignment, the bytes; then the out-buffer lengths). This first version only logs the
+ * calls and answers AEE_EUNSUPPORTED, to see what the PD asks for.
+ */
+#define RPC_REMOTECTL_HANDLE	0
+#define RPC_LISTENER_HANDLE	3
+#define LST_BUFCAP		0x10000u
+#define AEE_EUNSUPPORTED	20
+
+static int lst_on;
+static uint32_t lst_ctx;
+static int32_t lst_result;
+static uint8_t lst_out[LST_BUFCAP];
+static uint32_t lst_outlen;
+static unsigned lst_calls;
+
+static int remotectl_open(const char *name, uint32_t *handle)
+{
+	uint32_t namelen = (uint32_t)strlen(name) + 1, prim[2] = { namelen, 128 };
+	const void *in[2] = { prim, name };
+	const uint32_t inlen[2] = { sizeof(prim), namelen }, outcap[2] = { 8, 128 };
+	if (rpc_send(0, RPC_PID, RPC_REMOTECTL_HANDLE, 0, in, inlen, 2, outcap, 2, 1))
+		return -1;
+	int r = rpc_wait(0, 10000);
+	uint32_t rout[2] = { 0, 0 };
+	char dlerr[128] = { 0 };
+	if (r == 0) {
+		rpc_out(0, 0, rout, sizeof(rout));
+		rpc_out(0, 1, dlerr, sizeof(dlerr));
+		dlerr[sizeof(dlerr) - 1] = 0;
+	}
+	printf("remotectl: open \"%s\" -> %d, handle %#x, nErr %d%s%s\n", name, r, rout[0], (int32_t)rout[1],
+	       dlerr[0] ? ", dlerror: " : "", dlerr);
+	*handle = rout[0];
+	return r ? r : (int32_t)rout[1];
+}
+
+static int rpc_call0(uint32_t handle, uint32_t method, const char *what)
+{
+	if (rpc_send(0, RPC_PID, handle, method, NULL, NULL, 0, NULL, 0, 1))
+		return -1;
+	int r = rpc_wait(0, 10000);
+	printf("%s -> %d\n", what, r);
+	return r;
+}
+
+/* next2: the answer to the previous call (lst_ctx, lst_result, lst_out) and room for the next one */
+static int listener_next(void)
+{
+	uint32_t prim[4] = { lst_ctx, (uint32_t)lst_result, lst_outlen, LST_BUFCAP };
+	const void *in[2] = { prim, lst_out };
+	const uint32_t inlen[2] = { sizeof(prim), lst_outlen }, outcap[2] = { 16, LST_BUFCAP };
+	return rpc_send(1, RPC_PID, RPC_LISTENER_HANDLE, 4, in, inlen, 2, outcap, 2, 1);
+}
+
+static void dump_buf(const char *what, const uint8_t *p, uint32_t n)
+{
+	int text = n > 1;
+	for (uint32_t i = 0; i < n; i++)
+		if ((p[i] < 0x20 || p[i] > 0x7e) && !(p[i] == 0 && i == n - 1))
+			text = 0;
+	if (text) {
+		printf("%s%u bytes \"%.*s\"\n", what, n, (int)n, (const char *)p);
+		return;
+	}
+	printf("%s%u bytes:", what, n);
+	for (uint32_t i = 0; i < n && i < 48; i++)
+		printf(" %02x", p[i]);
+	printf("%s\n", n > 48 ? " ..." : "");
+}
+
+/* one call from the audio PD: log it, answer AEE_EUNSUPPORTED */
+static void listener_dispatch(uint32_t handle, uint32_t sc, const uint8_t *bufs, uint32_t n)
+{
+	unsigned method = (sc >> 24) & 0x1f, nin = (sc >> 16) & 0xff, nout = (sc >> 8) & 0xff;
+	printf("[%6llu] listener: call %u: handle %#x method %u, %u in / %u out (sc %#x)\n", (unsigned long long)edge_ms(),
+	       ++lst_calls, handle, method, nin, nout, sc);
+	uint32_t off = 0;
+	for (unsigned i = 0; i < nin && off + 4 <= n; i++) {
+		uint32_t len;
+		memcpy(&len, bufs + off, 4);
+		off += 4;
+		if (len) {
+			off = (off + 7) & ~7u;
+			if (off + len > n) {
+				printf("listener:   in %u: %u bytes past the end\n", i, len);
+				break;
+			}
+			char what[32];
+			snprintf(what, sizeof(what), "listener:   in %u: ", i);
+			dump_buf(what, bufs + off, len);
+			off += len;
+		} else {
+			printf("listener:   in %u: empty\n", i);
+		}
+	}
+	for (unsigned i = 0; i < nout && off + 4 <= n; i++) {
+		uint32_t len;
+		memcpy(&len, bufs + off, 4);
+		off += 4;
+		printf("listener:   out %u: %u bytes\n", i, len);
+	}
+	lst_result = AEE_EUNSUPPORTED;
+	lst_outlen = 0;
+}
+
+static int listener_start(void)
+{
+	uint32_t h = 0;
+	if (remotectl_open("adsp_default_listener", &h))
+		return -1;
+	if (rpc_call0(h, 0, "listener: adsp_default_listener register") ||
+	    rpc_call0(RPC_LISTENER_HANDLE, 3, "listener: adsp_listener init2"))
+		return -1;
+	lst_ctx = 0;
+	lst_result = 0;
+	lst_outlen = 0;
+	lst_calls = 0;
+	if (listener_next())
+		return -1;
+	lst_on = 1;
+	printf("listener: waiting for the audio PD's calls\n");
+	return 0;
+}
+
+/* from the serve loop: a call came in (the next2 answered) */
+static void listener_service(void)
+{
+	struct rpc_call *c = &rpc_calls[1];
+	if (!lst_on || !c->done)
+		return;
+	c->busy = 0;
+	if (c->ret) {
+		printf("listener: next2 -> %d (%#x), stopping\n", c->ret, (uint32_t)c->ret);
+		lst_on = 0;
+		return;
+	}
+	uint32_t rout[4];
+	static uint8_t bufs[LST_BUFCAP];
+	rpc_out(1, 0, rout, sizeof(rout));
+	uint32_t n = rout[3] < LST_BUFCAP ? rout[3] : LST_BUFCAP;
+	rpc_out(1, 1, bufs, n);
+	lst_ctx = rout[0];
+	listener_dispatch(rout[1], rout[2], bufs, n);
+	if (listener_next()) {
+		printf("listener: next2 send failed, stopping\n");
+		lst_on = 0;
+	}
 }
 
 /* ---- main ---- */
@@ -1227,6 +1452,8 @@ static void command(char *line)
 		fastrpc_attach();
 	} else if (!strcmp(line, "audiopd")) {
 		audiopd_create();
+	} else if (!strcmp(line, "listener")) {
+		listener_start();
 	} else if (!strncmp(line, "pd ", 3)) {
 		servreg_query(line + 3);
 	} else if (!strcmp(line, "status")) {
@@ -1251,6 +1478,7 @@ static int serve(void)
 	for (;;) {
 		edge_poll(20);
 		smp2p_service();
+		listener_service();
 		ssize_t n = read(fd, buf + have, sizeof(buf) - 1 - have);
 		if (n > 0)
 			have += (size_t)n;
