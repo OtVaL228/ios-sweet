@@ -192,6 +192,26 @@ static void rx_stop(void)
 	se_wr(SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
 }
 
+/* qcom_geni_serial stop_tx: a TX waiting for CTS survives the process (a stalled firmware segment left
+ * "TX busy" for the next btd); cancel, then abort */
+#define SE_GENI_M_CMD_CTRL	0x604
+#define M_CMD_CANCEL		(1u << 2)
+#define M_CMD_ABORT		(1u << 1)
+
+static void tx_stop(void)
+{
+	if (!(se_rd(SE_GENI_STATUS) & 1u))	/* M_GENI_CMD_ACTIVE */
+		return;
+	se_wr(SE_GENI_M_CMD_CTRL, M_CMD_CANCEL);
+	if (wait_clear(SE + SE_GENI_STATUS, 1u, 20)) {
+		se_wr(SE_GENI_M_CMD_CTRL, M_CMD_ABORT);
+		if (wait_clear(SE + SE_GENI_STATUS, 1u, 20))
+			printf("uart: TX will not stop (status %#x, tx fifo %#x, m_irq %#x)\n", se_rd(SE_GENI_STATUS),
+			       se_rd(SE_GENI_TX_FIFO_STATUS), se_rd(SE_GENI_M_IRQ_STATUS));
+	}
+	se_wr(SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+}
+
 static void rx_start(void)
 {
 	se_wr(SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
@@ -290,8 +310,10 @@ static int uart_init(void)
 static int uart_write(const uint8_t *b, unsigned n)
 {
 	if (wait_clear(SE + SE_GENI_STATUS, 1u, 100)) {	/* M_GENI_CMD_ACTIVE */
-		printf("uart: TX busy\n");
-		return -1;
+		printf("uart: TX busy, stopping it\n");
+		tx_stop();
+		if (se_rd(SE_GENI_STATUS) & 1u)
+			return -1;
 	}
 	se_wr(SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
 	se_wr(SE_UART_TX_TRANS_LEN, n);
@@ -316,6 +338,7 @@ static int uart_write(const uint8_t *b, unsigned n)
 		}
 	printf("uart: TX of %u bytes not done (status %#x m_irq %#x fifo %#x)\n", n, se_rd(SE_GENI_STATUS),
 	       se_rd(SE_GENI_M_IRQ_STATUS), se_rd(SE_GENI_TX_FIFO_STATUS));
+	tx_stop();
 	return -1;
 }
 
@@ -1033,33 +1056,40 @@ int main(int argc, char **argv)
 		return 1;
 	/* a chip left running by an earlier btd does not always take the pulses: off, a pause, on, again */
 	/* at boot (launchd job com.sweet.btd) the rails may not be up yet: wland turns them on for WLAN */
-	int ok = 0, tries = strcmp(argv[1], "serve") ? 4 : 30;
-	int fast = !getenv("BT_NO_PULSE") && access("/var/local/btd.slow", F_OK) != 0;
-	for (int i = 0; i < tries && !ok; i++) {
-		step("bt: power pulses");
-		oper_baud = 115200;
-		if (power_on())
-			return 1;
-		step("bt: version");
-		ok = !read_version();
-		if (ok && fast) {
-			step("bt: 3.2 Mbaud");
-			ok = !oper_speed() && !read_version();
-			if (!ok) {
-				printf("bt: no answer at 3.2 Mbaud, power cycling and staying at 115200\n");
-				fast = 0;
+	/* 3.2 Mbaud twice, then 115200: a boot once stalled TX (no CTS) on the first patch segment at 3.2 Mbaud */
+	int fast = !getenv("BT_NO_PULSE") && access("/var/local/btd.slow", F_OK) != 0 ? 2 : 0;
+	for (;;) {
+		int ok = 0, tries = strcmp(argv[1], "serve") ? 4 : 30;
+		for (int i = 0; i < tries && !ok; i++) {
+			step("bt: power pulses");
+			oper_baud = 115200;
+			if (power_on())
+				return 1;
+			step("bt: version");
+			ok = !read_version();
+			if (ok && fast) {
+				step("bt: 3.2 Mbaud");
+				ok = !oper_speed() && !read_version();
+				if (!ok) {
+					printf("bt: no answer at 3.2 Mbaud, power cycling\n");
+					fast--;
+				}
 			}
+			if (!ok)
+				usleep(i < 3 ? 200000 : 3000000);
 		}
 		if (!ok)
-			usleep(i < 3 ? 200000 : 3000000);
+			return 1;
+		if (!strcmp(argv[1], "version"))
+			return 0;
+		step("bt: firmware");
+		if (!controller_up())
+			break;
+		if (!fast)
+			return 1;
+		fast--;
+		printf("bt: bring-up at %u baud failed, again%s\n", oper_baud, fast ? "" : " at 115200");
 	}
-	if (!ok)
-		return 1;
-	if (!strcmp(argv[1], "version"))
-		return 0;
-	step("bt: firmware");
-	if (controller_up())
-		return 1;
 	if (!strcmp(argv[1], "scan"))
 		scan(argc > 2 ? (unsigned)atoi(argv[2]) : 12);
 	if (!strcmp(argv[1], "serve"))

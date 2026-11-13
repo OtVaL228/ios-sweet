@@ -25,6 +25,7 @@ build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_nam
 build sweet-sysapps sysapps/sweet-sysapps.m -fobjc-arc -framework Foundation
 codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
 build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
+build hfsgrow fsutil/hfsgrow.c
 # Wi-Fi: ios-flame's wland (userland/wland/README.md): modem + WLFW + WCN3990 radio from userland over /dev/pmem
 (cd wland && $CC -Wno-unused-parameter -o ../out/wland wland.c smem.c pmem.c glink.c link.c qmi.c rmtfs.c pdmapper.c \
 	tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c) && codesign -f -s - out/wland && echo out/wland

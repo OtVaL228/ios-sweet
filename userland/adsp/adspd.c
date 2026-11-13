@@ -953,6 +953,14 @@ static int smmu_adsp_identity(void)
 #define RPC_BUF_SIZE	0x00100000ull
 #define RPC_ALIGN	128
 #define RPC_INIT_HANDLE	1
+/*
+ * The session's context bank in bits 32+ of every address the ADSP is given for the invoke buffer (adsprpc.c
+ * fastrpc_buf_alloc: buf->phys += smmu.cb << 32, cb = iommus SID & 0xf): the ADSP picks its stream from it.
+ * The first ADSP session is 0x1b23, cb 3. Bare physical addresses meant cb 0 (stream 0x1b20, not set up):
+ * most likely the crashdump of every earlier invoke. The audio PD's remote heap stays physical (CMA, no cb).
+ */
+#define RPC_CB		3ull
+#define RPC_DSP(pa)	((RPC_CB << 32) | (pa))
 #define RPC_SCALARS(m, in, out)	((((m) & 0x1f) << 24) | (((in) & 0xff) << 16) | (((out) & 0xff) << 8))
 
 struct rpc_msg {
@@ -994,6 +1002,7 @@ static int fastrpc_invoke(uint32_t handle, uint32_t method, const void *const *i
 		off = (off + RPC_ALIGN - 1) & ~(uint32_t)(RPC_ALIGN - 1);
 		uint64_t pv = RPC_BUF_PA + off, len = inlen[i];
 		uint64_t pg = pv & ~0xfffull, pgs = (((pv + (len ? len : 1) - 1) & ~0xfffull) - pg) / 0x1000 + 1;
+		pg = RPC_DSP(pg);
 		memcpy(b + 16 * i, &pv, 8);
 		memcpy(b + 16 * i + 8, &len, 8);
 		uint32_t num = len ? 1 : 0, pgidx = i;
@@ -1010,10 +1019,10 @@ static int fastrpc_invoke(uint32_t handle, uint32_t method, const void *const *i
 	static uint32_t ctxseq = 1;
 	struct rpc_msg m = {
 		.pid = 0, .tid = 1234, .ctx = ((uint64_t)(ctxseq++) << 8) | pd, .handle = handle,
-		.sc = RPC_SCALARS(method, nin, 0), .addr = RPC_BUF_PA, .size = size,
+		.sc = RPC_SCALARS(method, nin, 0), .addr = RPC_DSP(RPC_BUF_PA), .size = size,
 	};
 	printf("[%6llu] fastrpc: > handle %u method %u, %u in-args, buffer %llx+%x, ctx %#llx\n", (unsigned long long)edge_ms(),
-	       handle, method, nin, (unsigned long long)RPC_BUF_PA, size, (unsigned long long)m.ctx);
+	       handle, method, nin, (unsigned long long)m.addr, size, (unsigned long long)m.ctx);
 	rpc_rsp_seen = 0;
 	if (edge_send(CH_RPC, &m, sizeof(m)))
 		return -1;

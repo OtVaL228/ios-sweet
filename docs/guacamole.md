@@ -86,7 +86,13 @@ as coming from a device tree (DT) or Linux.
   IRQ GPIO122, 1.8 V switch GPIO119 (pull-up), SDA/SCL GPIO55/56 (qup17, mux 1),
   vdd = pm8150 L17A (RPMh "ldoa17") at 3.008 V. Coordinates 0..1439, 0..3119.
 - Userdata: LUN0, 4 KiB blocks, metadata-encrypted under Android.
-  The phone also has `esp`/`win` partitions (Windows on ARM): leave them alone.
+  Since 2026-11-13 it is the rest of LUN0 (GPT entry 19, LBA 1946112 -
+  61409277, 226.83 GiB): the Windows on ARM partitions `esp` (20) and `win`
+  (21) behind it were removed (primary and backup GPT rewritten from TWRP
+  with dd, start / type / GUID / name of userdata unchanged; old GPT in
+  ../dumps/backup/gpt-2026-11-13), then the HFSX root grown online from iOS
+  with `userland/fsutil/hfsgrow 243561127936` (HFSIOC_RESIZE_VOLUME). It was
+  16 GiB (the root image) inside a 52 GiB partition.
 
 ## GPU (Adreno 640, chip id 0x06040001, speed bin 0)
 
@@ -383,9 +389,21 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   (the ADSP's other APR channel, unused by Android's apr_tal_rpmsg) gives no
   intents. Android runs `adsprpcd audiopd`: FastRPC INIT_CREATE_STATIC of
   the audio PD with its remote heap; ios-sweet-grus stopped there too.
-- FastRPC over fastrpcglink-apps-dsp crashes the SoC: any invoke (the
-  audio PD create and even a plain attach) sends the phone to crashdump,
-  with nothing in the logs. adspd keeps the code but it must not be used.
+- FastRPC works (2026-11-13): every address the ADSP is given for the
+  invoke buffer carries the session's context bank in bits 32+ (downstream
+  adsprpc.c fastrpc_buf_alloc: phys += smmu.cb << 32, cb = iommus SID & 0xf;
+  first ADSP session 0x1b23 -> cb 3). Bare physical addresses meant cb 0
+  (stream 0x1b20, not set up): that was the crashdump on every invoke.
+  With RPC_DSP() in adspd: `attach` -> 0, `audiopd` (CREATE_STATIC, remote
+  heap 0xfd800000 physical, no hyp_assign: no remoteheap VMID in the DT)
+  -> 0, PDR msm/adsp/audio_pd UP. AFE still does not answer (clock set).
+- Next for AFE: Android's `adsprpcd audiopd` then registers as the default
+  listener (quic/fastrpc adsp_default_listener.c, listener_android.c:
+  remote_handle_open("adsp_default_listener"), register, then a loop of
+  adsp_listener_next2 serving reverse calls: apps_std = file access,
+  apps_mem = memory for the PD). Without it the PD's calls to the HLOS wait,
+  most likely what keeps AFE/ASM/ADM down. Files it reads (vendor
+  /vendor/lib/rfsa/adsp, /vendor/dsp) are not in ../dumps yet.
 - WoA (Project-Aloha/windows_oem_oneplus_qc8150, WOA-Project
   windows_silicon_qcom_hana) also runs the audio PD over FastRPC: SIDs
   0x1b23/24/25 (FastRPCADSPSidInfo) translated through context banks
@@ -419,8 +437,13 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   version answers at 115200, RTS held off and CTS ignored, EDL_SET_BAUDRATE
   (0xfc48, index 0x11), host RCG to 102.4 MHz (M/N 64/375, div 1), flow
   control back; the controller answers with vendor event 0xff at the new
-  rate, then the version again. If that fails btd power-cycles and stays at
-  115200; /var/local/btd.slow forces 115200. At 115200 (~11 KB/s) A2DP AAC
+  rate, then the version again. Two tries at 3.2 Mbaud (power cycle
+  between), then 115200; /var/local/btd.slow forces 115200. One boot
+  stalled TX (no CTS) on the first patch segment at 3.2 Mbaud, the run
+  before and after did not: cause unknown. The stalled TX command survives
+  the process ("uart: TX busy" for the next btd): btd cancels / aborts it
+  (qcom_geni_serial stop_tx). com.sweet.btd has no KeepAlive: when btd
+  exits, `launchctl kickstart system/com.sweet.btd`, then restart bluetoothd. At 115200 (~11 KB/s) A2DP AAC
   at 224 kbit/s broke up: bluetoothd "ANDP packet flushed: Audio Queue full".
 - Firmware (btqca.c): the whole file in 243-byte EDL_PATCH_TLV_REQ (0x1e)
   segments of vendor command 0xfc00. The patch is download mode 3: no answer
