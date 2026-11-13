@@ -416,8 +416,20 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   (`apr 4 0x10102 0x5dc 0 0x02b905c5 0x00012000 0x00001006`: 1500 ms,
   1477 + 697 Hz, gain 0x2000, one port 0x1006) is very loud: start lower.
   No audio PD, FastRPC or listener needed (mainline Linux uses none either).
-  Next: ASM stream + ADM COPP to port 0x1006 (q6asm/q6adm), PCM from
-  SweetCodec to adspd, a "Speaker" device for VirtualAudio, a boot job.
+- PCM plays from memory (2026-11-13), as q6asm/q6adm: ASM shared memory
+  map of a 16 x 4 KiB ring at 0xfe800000 (-> mem handle), OPEN_WRITE_V3
+  (session 1 stream 1, 16-bit PCM, null POPP), ADM DEVICE_OPEN_V5 on
+  0x1006 (playback, NULL_COPP_TOPOLOGY, stereo 16-bit 48 kHz -> copp 0; the
+  answer is { status, u16 copp_id, u16 reserved }), MATRIX_MAP_ROUTINGS_V5
+  session 1 -> copp, MEDIA_FMT_UPDATE_V2, RUN_V2, then ASM_DATA_CMD_WRITE_V2
+  per period, refilled on WRITE_DONE. adspd `tone MS` plays 440 Hz at
+  amplitude 1000/32767: heard from the speakers.
+- Audio buffer addresses carry the audio stream in bits 32+, as FastRPC's
+  carry their context bank: msm_audio_ion.c smmu_sid_bits = (iommus 0x1b21
+  & qcom,smmu-sid-mask 0xf) << 32 = 1 << 32 in the shared memory map and in
+  every write. Without it the first map sent the SoC to crashdump.
+- Next: PCM from SweetCodec to adspd (a shared ring), the iOS volume, a
+  "Speaker" device for VirtualAudio, a boot job (adspd serve, afe on, tfa).
 - Tried (2026-11-13): adspd `listener` (remotectl open
   "adsp_default_listener" -> handle, register -> 0, adsp_listener init2 ->
   0, next2 held by the ADSP) works, but the audio PD makes no call in 30 s

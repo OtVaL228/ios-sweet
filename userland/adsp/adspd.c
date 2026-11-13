@@ -19,6 +19,7 @@
  * Firmware: /var/local/fw/adsp/adsp.mdt + adsp.bNN (lower case).
  */
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -705,6 +706,11 @@ static int apr_cmd(uint8_t svc, uint32_t opcode, const void *payload, uint16_t l
 	return -1;
 }
 
+/* ASM / ADM answers with their own opcode (shared memory handle, COPP id): the last one, see apr_cmd_ex */
+static uint32_t rsp2_opcode, rsp2_w[4];
+static void asm_write_done(uint32_t token, const uint32_t *w);
+static int smmu_adsp_identity(void);
+
 static void apr_rx(const uint8_t *d, uint32_t n)
 {
 	struct apr_hdr h;
@@ -717,6 +723,14 @@ static void apr_rx(const uint8_t *d, uint32_t n)
 	uint32_t len = n - (uint32_t)(p - d);
 	uint32_t w[8] = { 0 };
 	memcpy(w, p, len < sizeof(w) ? len : sizeof(w));
+	if (h.opcode == 0x00010d99) {	/* ASM_DATA_EVENT_WRITE_DONE_V2, one per period: not logged */
+		asm_write_done(h.token, w);
+		return;
+	}
+	if (h.opcode != APR_BASIC_RSP_RESULT) {
+		rsp2_opcode = h.opcode;
+		memcpy(rsp2_w, w, sizeof(rsp2_w));
+	}
 	printf("[%6llu] apr: < svc %u from %u:%u opcode %#x token %u, %u bytes:", (unsigned long long)edge_ms(), h.dest_svc,
 	       h.src_domain, h.src_svc, h.opcode, h.token, len);
 	for (uint32_t i = 0; i < len / 4 && i < 8; i++)
@@ -851,6 +865,214 @@ static void afe_probe(void)
 	for (int t = 0; t < 200; t++)
 		edge_poll(5);
 	afe_port(AFE_PORT_QUAT_MI2S_RX, 0);
+}
+
+/*
+ * ---- playback: ASM stream -> ADM COPP -> AFE port (Linux sound/soc/qcom/qdsp6/q6asm.c, q6adm.c) ----
+ * Session 1, stream 1, 16-bit stereo PCM at 48 kHz from a ring of periods in memory below 4 GB that the
+ * ADSP reads through stream 0x1b21 (q6asmdai's, identity in smmu_adsp_identity). ADM opens a COPP on the
+ * speaker port with the null topology and the matrix routes the session to it. Each period goes out as
+ * ASM_DATA_CMD_WRITE_V2 and is refilled on its WRITE_DONE. `tone` plays a quiet 440 Hz sine through it.
+ */
+#define APR_SVC_ASM				7
+#define APR_SVC_ADM				8
+#define ASM_CMD_SHARED_MEM_MAP_REGIONS		0x00010d92
+#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00010d93
+#define ASM_STREAM_CMD_OPEN_WRITE_V3		0x00010db3
+#define ASM_STREAM_CMD_CLOSE			0x00010bcd
+#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2	0x00010d98
+#define ASM_SESSION_CMD_RUN_V2			0x00010daa
+#define ASM_DATA_CMD_WRITE_V2			0x00010dab
+#define ASM_NULL_POPP_TOPOLOGY			0x00010c68
+#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2	0x00010da5
+#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL		3
+#define ADM_CMD_DEVICE_OPEN_V5			0x00010326
+#define ADM_CMDRSP_DEVICE_OPEN_V5		0x00010329
+#define ADM_CMD_DEVICE_CLOSE_V5			0x00010327
+#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5		0x00010325
+#define ADM_PATH_PLAYBACK			1
+#define NULL_COPP_TOPOLOGY			0x00010312
+
+#define PCM_PA		0xfe800000ull	/* after the FastRPC buffer; nothing below 4 GB is XNU's */
+/*
+ * The audio buffers' stream in bits 32+ of every address the ADSP is given, as msm_audio_ion.c does
+ * (smmu_sid_bits = (iommus SID 0x1b21 & qcom,smmu-sid-mask 0xf) << 32 = 1 << 32). Without it the first
+ * shared memory map sent the SoC to crashdump (stream 0x1b20), as FastRPC did without its context bank.
+ */
+#define PCM_SID_MSW	1u
+#define PCM_PERIOD	4096u		/* bytes: 1024 frames of 16-bit stereo, 21.3 ms */
+#define PCM_PERIODS	16u
+#define PCM_SESSION	1
+#define PCM_PORT	((PCM_SESSION << 8) | 1)	/* session << 8 | stream */
+
+static uint32_t pcm_mem_handle;
+static int pcm_open, pcm_copp = -1;
+static unsigned pcm_inflight, pcm_written, pcm_done;
+static uint64_t pcm_until;	/* edge_ms() when the tone ends */
+static double pcm_phase;
+
+/* send with explicit ports and token; wait for the basic result of opcode or for rsp (0: none) */
+static int apr_cmd_ex(uint8_t svc, uint32_t opcode, uint16_t port, uint32_t token, const void *payload, uint16_t len,
+		      uint32_t rsp)
+{
+	uint8_t b[512];
+	struct apr_hdr h = {
+		.hdr_field = APR_HDR_FIELD_CMD, .pkt_size = (uint16_t)(sizeof(h) + len),
+		.src_svc = svc, .src_domain = APR_DOMAIN_APPS, .src_port = port,
+		.dest_svc = svc, .dest_domain = APR_DOMAIN_ADSP, .dest_port = port,
+		.token = token, .opcode = opcode,
+	};
+	memcpy(b, &h, sizeof(h));
+	memcpy(b + sizeof(h), payload, len);
+	rsp_opcode = 0;
+	rsp2_opcode = 0;
+	if (edge_send(CH_APR, b, sizeof(h) + len))
+		return -1;
+	for (int t = 0; t < 200; t++) {
+		edge_poll(5);
+		if (rsp_opcode == opcode)
+			return (int)rsp_status;
+		if (rsp && rsp2_opcode == rsp)
+			return 0;
+	}
+	printf("apr: no answer to %#x\n", opcode);
+	return -1;
+}
+
+/* one period of the tone: amplitude 1000 of 32767 (about -30 dBFS), both channels */
+static void pcm_fill(unsigned idx)
+{
+	int16_t s[PCM_PERIOD / 2];
+	for (unsigned i = 0; i < PCM_PERIOD / 4; i++) {
+		int16_t v = edge_ms() < pcm_until ? (int16_t)(1000.0 * sin(pcm_phase)) : 0;
+		pcm_phase += 2.0 * 3.14159265358979 * 440.0 / 48000.0;
+		s[2 * i] = s[2 * i + 1] = v;
+	}
+	pm_wr(PCM_PA + (uint64_t)idx * PCM_PERIOD, s, sizeof(s));
+}
+
+static int pcm_write(unsigned idx)
+{
+	uint32_t wr[8] = { (uint32_t)(PCM_PA + (uint64_t)idx * PCM_PERIOD), PCM_SID_MSW, pcm_mem_handle, PCM_PERIOD, idx,
+			   0, 0, 0 };
+	uint8_t b[sizeof(struct apr_hdr) + sizeof(wr)];
+	struct apr_hdr h = {
+		.hdr_field = APR_HDR_FIELD_CMD, .pkt_size = sizeof(b),
+		.src_svc = APR_SVC_ASM, .src_domain = APR_DOMAIN_APPS, .src_port = PCM_PORT,
+		.dest_svc = APR_SVC_ASM, .dest_domain = APR_DOMAIN_ADSP, .dest_port = PCM_PORT,
+		.token = idx, .opcode = ASM_DATA_CMD_WRITE_V2,
+	};
+	memcpy(b, &h, sizeof(h));
+	memcpy(b + sizeof(h), wr, sizeof(wr));
+	if (edge_send(CH_APR, b, sizeof(b)))
+		return -1;
+	pcm_inflight++;
+	pcm_written++;
+	return 0;
+}
+
+static void asm_write_done(uint32_t token, const uint32_t *w)
+{
+	if (pcm_inflight)
+		pcm_inflight--;
+	pcm_done++;
+	if (w[3])
+		printf("asm: write done %u status %#x\n", token, w[3]);
+	if (pcm_open && edge_ms() < pcm_until + 500) {
+		pcm_fill(token % PCM_PERIODS);
+		pcm_write(token % PCM_PERIODS);
+	}
+}
+
+static int pcm_start(void)
+{
+	if (pcm_open)
+		return 0;
+	if (smmu_adsp_identity())
+		return -1;
+	/* shared memory for the ring */
+	struct __attribute__((packed)) {
+		uint16_t pool, nregions;
+		uint32_t flags;
+		uint32_t lsw, msw, size;
+	} map = { ADSP_MEMORY_MAP_SHMEM8_4K_POOL, 1, 0, (uint32_t)PCM_PA, PCM_SID_MSW, PCM_PERIOD * PCM_PERIODS };
+	int st = apr_cmd_ex(APR_SVC_ASM, ASM_CMD_SHARED_MEM_MAP_REGIONS, 0, PCM_SESSION << 8, &map, sizeof(map),
+			    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS);
+	pcm_mem_handle = rsp2_w[0];
+	printf("asm: map %llx+%x -> %d, handle %#x\n", (unsigned long long)PCM_PA, PCM_PERIOD * PCM_PERIODS, st,
+	       pcm_mem_handle);
+	if (st || !pcm_mem_handle)
+		return -1;
+	/* the stream */
+	struct __attribute__((packed)) {
+		uint32_t mode_flags;
+		uint16_t sink, bits;
+		uint32_t postproc, fmt;
+	} open = { 0, 0, 16, ASM_NULL_POPP_TOPOLOGY, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
+	st = apr_cmd_ex(APR_SVC_ASM, ASM_STREAM_CMD_OPEN_WRITE_V3, PCM_PORT, PCM_SESSION, &open, sizeof(open), 0);
+	printf("asm: open write session %u -> %d\n", PCM_SESSION, st);
+	if (st)
+		return -1;
+	/* the COPP on the speaker port */
+	struct __attribute__((packed)) {
+		uint16_t flags, mode, ep1, ep2;
+		uint32_t topology;
+		uint16_t channels, bits;
+		uint32_t rate;
+		uint8_t map[8];
+	} adm = { 0, ADM_PATH_PLAYBACK, AFE_PORT_QUAT_MI2S_RX, 0xffff, NULL_COPP_TOPOLOGY, 2, 16, 48000, { 1, 2 } };
+	st = apr_cmd_ex(APR_SVC_ADM, ADM_CMD_DEVICE_OPEN_V5, AFE_PORT_QUAT_MI2S_RX, (uint32_t)AFE_PORT_QUAT_MI2S_RX << 16,
+			&adm, sizeof(adm), ADM_CMDRSP_DEVICE_OPEN_V5);
+	if (!st && rsp2_opcode == ADM_CMDRSP_DEVICE_OPEN_V5)
+		st = (int)rsp2_w[0];
+	pcm_copp = st ? -1 : (int)(rsp2_w[1] & 0xffff);	/* { status, u16 copp_id, u16 reserved } */
+	printf("adm: open port %#x -> %d, copp %d\n", AFE_PORT_QUAT_MI2S_RX, st, pcm_copp);
+	if (st)
+		return -1;
+	/* route the session to it */
+	struct __attribute__((packed)) {
+		uint32_t matrix, nsessions;
+		uint16_t session, ncopps;
+		uint16_t copp, pad;
+	} route = { 0, 1, PCM_SESSION, 1, (uint16_t)pcm_copp, 0 };
+	st = apr_cmd_ex(APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, 0, 0, &route, sizeof(route), 0);
+	printf("adm: route session %u -> copp %d: %d\n", PCM_SESSION, pcm_copp, st);
+	if (st)
+		return -1;
+	/* format and run */
+	struct __attribute__((packed)) {
+		uint32_t blk_size;
+		uint16_t channels, bits;
+		uint32_t rate;
+		uint16_t is_signed, reserved;
+		uint8_t map[8];
+	} fmt = { 20, 2, 16, 48000, 1, 0, { 1, 2 } };
+	st = apr_cmd_ex(APR_SVC_ASM, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, PCM_PORT, PCM_SESSION, &fmt, sizeof(fmt), 0);
+	printf("asm: media format 48000 Hz 2 ch 16-bit -> %d\n", st);
+	if (st)
+		return -1;
+	uint32_t run[3] = { 0, 0, 0 };
+	st = apr_cmd_ex(APR_SVC_ASM, ASM_SESSION_CMD_RUN_V2, PCM_PORT, PCM_SESSION, run, sizeof(run), 0);
+	printf("asm: run -> %d\n", st);
+	if (st)
+		return -1;
+	pcm_open = 1;
+	return 0;
+}
+
+/* `tone MS`: the sine for MS milliseconds, then silence */
+static void pcm_tone(unsigned ms)
+{
+	if (pcm_start())
+		return;
+	pcm_until = edge_ms() + ms;
+	pcm_written = pcm_done = 0;
+	if (!pcm_inflight)
+		for (unsigned i = 0; i < PCM_PERIODS; i++) {
+			pcm_fill(i);
+			pcm_write(i);
+		}
+	printf("tone: 440 Hz for %u ms\n", ms);
 }
 
 static void apr_rx_apps2(const uint8_t *d, uint32_t n)
@@ -1446,6 +1668,10 @@ static void command(char *line)
 		afe_running = !st;
 		if (st)
 			afe_clock(CLK_ID_QUAD_MI2S_IBIT, 0, 0);
+	} else if (!strncmp(line, "tone", 4)) {
+		pcm_tone(line[4] ? (unsigned)atoi(line + 5) : 1000);
+	} else if (!strcmp(line, "pcm stats")) {
+		printf("pcm: open %d copp %d, %u written, %u done, %u in flight\n", pcm_open, pcm_copp, pcm_written, pcm_done, pcm_inflight);
 	} else if (!strcmp(line, "afe probe")) {
 		afe_probe();
 	} else if (!strcmp(line, "afe off") && afe_running) {
