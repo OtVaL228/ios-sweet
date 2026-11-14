@@ -31,9 +31,11 @@ screen (image versions v8-v14 in NOTES.md):
                   gets BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt, com.apple.BlueTool
                   runs /var/local/bin/bluetoold), com.sweet.adspd (speaker audio:
                   /var/local/bin/adspd serve with ADSPD_BOOT and /var/local/adspd.boot)
-                  and com.sweet.sshd (the rootless Procursus bootstrap's sshd in
-                  /var/jb), all RunAtLoad, so Wi-Fi and SSH come up on every
-                  boot without a SWEETBOX autorun.sh
+                  com.sweet.sshd (the rootless Procursus bootstrap's sshd in
+                  /var/jb) and com.sweet.jbinit (/var/jb/etc/rc.d: ElleKit's
+                  loader, tweaks; boot-arg sweetnojb=1 skips it), all RunAtLoad,
+                  so Wi-Fi, SSH and tweaks come up on every boot without a
+                  SWEETBOX autorun.sh
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -128,6 +130,20 @@ NET_JOBS = {
         'RunAtLoad': True,
         'KeepAlive': True,
         'POSIXSpawnType': 'Interactive',
+    },
+    # Tweaks: the bootstrap's /var/jb/etc/rc.d scripts, once per boot, as a rootless jailbreak runs them.
+    # ElleKit's is its loader: it puts pspawn.dylib into launchd (task_for_pid(1), a remote thread), which
+    # adds libinjector.dylib to DYLD_INSERT_LIBRARIES of everything launchd and xpcproxy spawn from then on
+    # (xnu 0121 lets dyld take it). Boot-arg sweetnojb=1 skips them.
+    '/System/Library/LaunchDaemons/com.sweet.jbinit.plist': {
+        'Label': 'com.sweet.jbinit',
+        'ProgramArguments': ['/var/jb/bin/sh', '-c',
+                             'case " $(/var/jb/usr/sbin/sysctl -n kern.bootargs) " in *" sweetnojb=1 "*) exit 0;; esac; '
+                             'for f in /var/jb/etc/rc.d/*; do [ -x "$f" ] && "$f"; done; exit 0'],
+        'RunAtLoad': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/jbinit.out',
+        'StandardErrorPath': '/var/local/jbinit.out',
     },
 }
 

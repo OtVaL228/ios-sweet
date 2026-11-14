@@ -29,6 +29,7 @@ as coming from a device tree (DT) or Linux.
 | Photos, Settings > About, Wallet | work (0135 sandbox extensions; fairplayd job removed) |
 | Wallpaper picker, app extensions | work (0137 AMFI trust stand-in + ADT mac-address-*; once `lsreg -r`): all 10 poster providers |
 | Wi-Fi | works: WPA2-PSK join, DHCP, internet (wifi25: HTTPS 200 from apple.com); userland/wland from ios-flame over 0138 /dev/pmem; en0 + Apple80211 for wifid/Settings (0139, from ios-flame 0123) |
+| Rootless jailbreak: Procursus, SSH, Sileo, ElleKit tweaks | works: apt and Sileo install packages, tweaks load in SpringBoard and apps (see Jailbreak) |
 | Bluetooth audio (A2DP) | works: AAC to headphones, volume (userland/audio SweetCodec "Codec" + "Hawking", btd at 3.2 Mbaud; see Bluetooth) |
 | Speaker audio | works: iOS -> SweetCodec ring -> adspd -> ADSP ASM/ADM/AFE -> TFA9874, started at boot (com.sweet.adspd; see Audio) |
 | CPU frequency | not started |
@@ -322,6 +323,38 @@ ENOTSUP from the FileProvider processes ("SWEET IOCTL: ...").
   *.download placeholders stay in File Provider Storage/Downloads. Next:
   how fileproviderd resolves a fresh item URL to an item on our HFS root
   (document IDs / fsctl), the same path the Files app fixes (0160/0161) touched.
+
+## Jailbreak (rootless Procursus in /private/var/jb)
+
+The bootstrap (iOS 16, suite 1900) is unpacked by userland/jb/jbstrap; sshd
+runs as com.sweet.sshd. Nothing in the kernel is exploited: our AMFI stand-in
+already gives what a jailbreak patches in. Measured 2026-11-14 with
+probes over SSH: processes run with cs flags 0x26000001 (no CS_HARD/CS_KILL,
+so pages patched after load still execute), task_for_pid(1) works for a
+binary with task_for_pid-allow, and dyld takes DYLD_INSERT_LIBRARIES
+everywhere (0121).
+
+- Sileo installs through its suid helper Sileo.app/giveMeRoot, which only
+  serves its parent if proc_pidpath(parent) equals
+  realpath("/Applications/Sileo.app/Sileo"), a path built into it (2.5.1);
+  ours is in /var/jb, so it stopped at "failed to retrieve Sileo app path"
+  and apt never ran. On the root: a plain directory
+  /Applications/Sileo.app with only `Sileo -> /private/var/jb/Applications/
+  Sileo.app/Sileo` (no Info.plist, so LaunchServices sees no second Sileo).
+- Repositories: the bootstrap brings only Procursus;
+  /var/jb/etc/apt/sources.list.d/sileo.sources adds Havoc and Chariz.
+- Tweaks (ElleKit 1.2): /var/jb/usr/libexec/ellekit/loader (rc.d
+  ellekit-loader) writes pspawn.dylib into launchd with a remote thread;
+  pspawn rebinds posix_spawn in launchd and xpcproxy (fishhook) and adds
+  ellekit/libinjector.dylib to DYLD_INSERT_LIBRARIES of every new process,
+  which loads /var/jb/usr/lib/TweakInject/*.dylib by their filter plists.
+  Seen: VisibleIsland in SpringBoard, PreferenceLoader + libprefs in
+  Settings. com.sweet.jbinit (sweet-root-tweaks.py --net) runs
+  /var/jb/etc/rc.d/* once per boot; sweetnojb=1 skips it.
+  /var/mobile/.ekenablelogging makes pspawn log to /var/jb/var/mobile/log.txt;
+  /var/mobile/.eksafemode is ElleKit's safe mode. Processes started before the
+  loader (backboardd, early daemons) get no tweaks; userland/jb/sbwrap.c
+  gives SpringBoard libinjector itself either way.
 
 ## Audio (recon, nothing built yet)
 
