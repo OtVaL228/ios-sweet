@@ -315,14 +315,12 @@ builds for APFS; our root is HFS. Four walls, each seen in the unified log:
 0161 also logs, once per command, file system ioctls that end in ENOTTY or
 ENOTSUP from the FileProvider processes ("SWEET IOCTL: ...").
 
-- Safari downloads never finish (2026-11-08): SafariServices "starting to
-  import placeholder to the Downloads folder", then "failed to import
-  placeholder: NSCocoaError 256". fileproviderd: move-writer collision
-  (Cocoa 516) -> bounce to "<name> 2.download", then "can't get item for
-  URL ... for extension; Cocoa 256" and "root failed". The zero-byte
-  *.download placeholders stay in File Provider Storage/Downloads. Next:
-  how fileproviderd resolves a fresh item URL to an item on our HFS root
-  (document IDs / fsctl), the same path the Files app fixes (0160/0161) touched.
+- Safari downloads (fixed, xnu 0164). They never finished (2026-11-08):
+  SafariServices "failed to import placeholder: NSCocoaError 256", zero-byte
+  *.download placeholders left in File Provider Storage/Downloads.
+  LocalStorageFileProvider issues the APFS-private _IOW('J', 2, u64) on the
+  placeholder it creates in Downloads; ENOTTY on HFS failed the import. 0164
+  takes it as done for regular files on HFS; downloads now land in Files.
 
 ## Jailbreak (rootless Procursus in /private/var/jb)
 
@@ -355,6 +353,14 @@ everywhere (0121).
   /var/mobile/.eksafemode is ElleKit's safe mode. Processes started before the
   loader (backboardd, early daemons) get no tweaks; userland/jb/sbwrap.c
   gives SpringBoard libinjector itself either way.
+- IPAs on the phone: TrollStore Lite (com.opa334.trollstorelite 2.1.1, Havoc;
+  pulls ldid). Its trollstorehelper signs with ldid (entitlements kept) and
+  installs into /var/containers/Bundle/Application/<uuid> (marker file
+  _TrollStoreLite) as a regular app. 2026-11-14: decrypted Telegram 10.2.6
+  installed in 9.5 s and launched with its widget extension. On the phone:
+  an IPA downloaded in Safari (lands in Files, see Files app) or picked in
+  Files -> share -> TrollStore Lite, or "Install from URL" in the app.
+  Decrypted IPAs only (no FairPlay).
 
 ## Audio (recon, nothing built yet)
 
@@ -679,10 +685,6 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   SweetCodec drops the samples, and VirtualAudio's speaker protection DSP
   chain wants a separate "Speaker" device ("Unable to find the speaker
   device"). Real speaker output waits on the ADSP audio PD (see Audio).
-- Safari downloads (fixed, xnu 0164): LocalStorageFileProvider issues the
-  APFS-private _IOW('J', 2, u64) on the placeholder it creates in Downloads;
-  ENOTTY on HFS failed the import ("failed to import placeholder"). 0164
-  takes it as done for regular files on HFS; downloads now land in Files.
 - Result: bluetoothd stays up (STACK_READY), LE scanning delivers
   advertisements. Jobs (sweet-root-tweaks.py --net): com.sweet.btd,
   com.apple.BlueTool -> bluetoold, bluetoothd env. /var/local/btd.off
