@@ -299,6 +299,27 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
+// guacamole: the two-plane YCbCr formats (500-545: YCBCR8_420_2P and kin), which QuartzCore asks over plane 0 of a decoded '420v'
+// frame and which the runtime makes only with the surface's facts (OSType, size, chroma plane, kIOSurfaceYCbCrMatrix): video was black
+static NBTexture *surfaceYCbCrTexture(NBBuffer *buffer,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,size_t planes,
+                                      NSUInteger offset,NSUInteger row) {
+ NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+ const uintptr_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface);
+ const uint64_t chroma=planes>1?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1)-base:0,chromaRow=planes>1?IOSurfaceGetBytesPerRowOfPlane(surface,1):0;
+ uint32_t matrix=0;
+ CFTypeRef m=IOSurfaceCopyValue(surface,CFSTR("IOSurfaceYCbCrMatrix"));
+ if(m && CFGetTypeID(m)==CFStringGetTypeID()){
+  NSString *s=(__bridge NSString *)m;
+  matrix=[s isEqualToString:@"ITU_R_601_4"]?1:[s isEqualToString:@"ITU_R_709_2"]?2:[s isEqualToString:@"ITU_R_2020"]?3:
+   [s isEqualToString:@"SMPTE_240M_1995"]?4:7;
+ }
+ if(m)CFRelease(m);
+ NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,planes>0,IOSurfaceGetPixelFormat(surface),plane,
+  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma,chromaRow,matrix);
+ if(!handle){NBLOG(@"native-metal: YCbCr texture over surface refused: %@",lastError());return nil;}
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+}
 @implementation NBBuffer (Textures)
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
  return (id<MTLTexture>)textureOnBuffer(self,d,offset,row,false);
@@ -1447,7 +1468,8 @@ static char sweetMemoryOwnerKey;
  if(!row && sweetNarrow(d.pixelFormat)!=(uint64_t)d.pixelFormat)row=IOSurfaceGetWidth(surface)*4;  // 10-bit asked over BGRA
  if(at<(uintptr_t)base || at-(uintptr_t)base>=allocation){NBLOG(@"native-metal: surface texture refused: plane %lu outside the surface",(unsigned long)plane);return nil;}
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,at-(uintptr_t)base,row,true);
+ NBTexture *texture=(uint64_t)d.pixelFormat>=500 && (uint64_t)d.pixelFormat<=545?
+  surfaceYCbCrTexture(buffer,d,surface,plane,planes,at-(uintptr_t)base,row):textureOnBuffer(buffer,d,at-(uintptr_t)base,row,true);
  if(!texture){const uint32_t f=IOSurfaceGetPixelFormat(surface);
   NBLOG(@"native-metal: surface %#x '%c%c%c%c' %zux%zu plane %lu: format %lu %lux%lu, row %zu refused",IOSurfaceGetID(surface),
    (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),

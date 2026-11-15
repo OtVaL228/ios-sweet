@@ -18,9 +18,9 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
+    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -724,6 +724,35 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
             buffer.new_texture(&descriptor, offset, bytes_per_row)
         };
         Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
+    })
+}
+
+/// guacamole: `newTextureWithDescriptor:iosurface:plane:` of a two-plane YCbCr format (QuartzCore samples a decoded `420v`
+/// frame as one `YCBCR8_420_2P` texture over plane 0): the surface's facts the runtime reads the chroma plane and the
+/// conversion from (`ycbcr.rs`). `matrix`: 0 none, 1 BT.601, 2 BT.709, 3 BT.2020, 4 SMPTE 240M, else other (this
+/// runtime has no P3 matrices).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
+                                             bytes_per_row: u64, planar: bool, pixel_format: u32, plane: u64, width: u64,
+                                             height: u64, chroma_offset: u64, chroma_bytes_per_row: u64,
+                                             matrix: u32) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let descriptor = texture_descriptor(descriptor)?;
+        let mut facts = IoSurfaceYCbCr::new(pixel_format, plane, [width, height], chroma_offset, chroma_bytes_per_row);
+        let matrix = match matrix {
+            0 => None,
+            1 => Some(SurfaceYCbCrMatrix::Itu601),
+            2 => Some(SurfaceYCbCrMatrix::Itu709),
+            3 => Some(SurfaceYCbCrMatrix::Itu2020),
+            4 => Some(SurfaceYCbCrMatrix::Smpte240M),
+            _ => Some(SurfaceYCbCrMatrix::Other),
+        };
+        if let Some(matrix) = matrix {
+            facts = facts.with_matrix(matrix);
+        }
+        let plane = IoSurfacePlane::new(offset, bytes_per_row, planar).with_ycbcr(facts);
+        let texture = get(buffer)?.0.new_texture_with_iosurface_plane(&descriptor, plane);
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over surface"))?)))
     })
 }
 

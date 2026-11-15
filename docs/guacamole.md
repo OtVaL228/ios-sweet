@@ -306,6 +306,15 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   (and DisplayPipeStrideRequirements { StrideLinearHorizontal }, absent is
   fine) with no type check; SweetFramebuffer published a number. 0166
   publishes the dictionary (QuartzCore reads the same keys).
+- With 0166 YouTube played sound over a black picture: backboardd's
+  QuartzCore samples a decoded 420v frame as one MTLPixelFormatYCBCR8_420_2P
+  (500) texture over plane 0 ("Failed to allocate MTLTexture from IOSurface";
+  mtl2.log: "Unsupported ... MTLPixelFormatYCBCR8_420_2P"). metal2vulkan's
+  runtime makes those (ycbcr.rs) only given the surface's facts
+  (IoSurfacePlane::with_ycbcr: OSType, size, chroma plane, matrix); the bridge
+  gave none. nmb_texture_new_on_surface passes them for formats 500-545
+  (NativeBridgeMetalFrontend.mm surfaceYCbCrTexture). Video shows
+  (2026-11-15). Seen while playing: backboardd ~93% CPU, AegirPoster 55%.
 - When osanalyticshelper says "limit of 25 logs has been reached" no crash
   report is written: move the day's .ips out of
   /var/mobile/Library/Logs/CrashReporter (old ones: /var/tmp/crash-old).
