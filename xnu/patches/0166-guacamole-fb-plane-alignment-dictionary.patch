@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -294,7 +294,20 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	publishRefresh();
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 0166: a dictionary, not a number. VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService
++	 * takes CFDictionaryGetValue(DisplayPipePlaneBaseAlignment, "PlaneBaseAlignmentLinear") without a
++	 * type check: on our OSNumber mediaserverd died of -[__NSCFNumber objectForKey:] in every AVPlayer
++	 * with video (itemfig_createRenderTriplesForVideo), YouTube said "playback error".
++	 */
++	OSDictionary *align = OSDictionary::withCapacity(1);
++	OSNumber *align64 = OSNumber::withNumber(64ULL, 32);
++	if (align != NULL && align64 != NULL) {
++		align->setObject("PlaneBaseAlignmentLinear", align64);
++		setProperty("DisplayPipePlaneBaseAlignment", align);
++	}
++	OSSafeReleaseNULL(align64);
++	OSSafeReleaseNULL(align);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,

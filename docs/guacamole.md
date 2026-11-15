@@ -295,6 +295,22 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   bytes per row at +0x08. 0165 moves it. (0143's WebKit plane got 0 bytes per
   row the same way; without planes IOSurface.framework already answers plane 0
   with the surface's own row bytes.)
+- With 0165 (2026-11-15): 300/300 frames, H.264 720p 40 fps, 1080p 29 fps
+  (just real time), HEVC 720p 136 fps. YouTube in Safari then said "playback
+  error": mediaserverd died in a loop (11 times in 2 minutes) of
+  -[__NSCFNumber objectForKey:] in FigGetAlignmentForIOSurfaceOutputToDisplayService
+  (VideoToolbox) <- FPSupport_CopyDestinationPixelBufferAttributesWithIOSurfaceSupport
+  <- itemfig_createRenderTriplesForVideo: every AVPlayer with video, and the
+  players got -11819 (media services reset). It reads AppleCLCD's
+  DisplayPipePlaneBaseAlignment as a dictionary { PlaneBaseAlignmentLinear }
+  (and DisplayPipeStrideRequirements { StrideLinearHorizontal }, absent is
+  fine) with no type check; SweetFramebuffer published a number. 0166
+  publishes the dictionary (QuartzCore reads the same keys).
+- When osanalyticshelper says "limit of 25 logs has been reached" no crash
+  report is written: move the day's .ips out of
+  /var/mobile/Library/Logs/CrashReporter (old ones: /var/tmp/crash-old).
+- avplay FILE (scratch tool): AVPlayer + AVPlayerItemVideoOutput on a local
+  file reproduces a playback crash without Safari.
 - vtprobe FILE [N] [sw]: decodes a file's video track through VTDecompressionSession
   and prints the first frame's format, errors and the decode rate.
 
