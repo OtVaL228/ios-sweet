@@ -315,6 +315,18 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   gave none. nmb_texture_new_on_surface passes them for formats 500-545
   (NativeBridgeMetalFrontend.mm surfaceYCbCrTexture). Video shows
   (2026-11-15). Seen while playing: backboardd ~93% CPU, AegirPoster 55%.
+- Jerky playback (YouTube 360p in Safari): ~34 swaps/s with 12-20 gaps over
+  50 ms per 5 s, GPU busy 92-96% of vsyncs, backboardd ~115% CPU,
+  mediaserverd (decode) ~25%. tsample of backboardd's render thread: backdrop
+  blur 27% (GaussianBlurFilter, capture_backdrop 22%, filter_backdrop 14%:
+  Safari's bars and the page's backdrop-filter re-blur on every video frame),
+  draws through the bridge 36% (draw_resident, end_pass 19%); the YCbCr
+  conversion does not show. Reduce Transparency: 38 swaps/s, 1-6 long gaps,
+  GPU 97-100%, blur 18%: compositing at full resolution is the limit (@2x
+  rendering in Next). YouTube gives iPhone Safari 16 only the progressive
+  360p mp4 (no MediaSource on iPhone before 17.1: no isTypeSupported calls,
+  'src' URL, FigFilePlayer ~300-580 kbps); WebKit has
+  -[WKPreferences _setMediaSourceEnabled:] (on for iPad).
 - When osanalyticshelper says "limit of 25 logs has been reached" no crash
   report is written: move the day's .ips out of
   /var/mobile/Library/Logs/CrashReporter (old ones: /var/tmp/crash-old).
