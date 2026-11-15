@@ -885,6 +885,22 @@ static void scheduled(void *context);
    if(pixels>=2000000)gFullScreenPasses++;
   }
  }
+ // guacamole: with /var/local/mtl2-passlog, the next 400 passes' attachments (size, format, load/store, surface or not) into the
+ // log: which of a frame's passes cost the GPU (YouTube in Safari: 34 passes and 27 Mpx a frame)
+ {
+  static std::atomic<uint64_t> checkedUs{0};static std::atomic<int> left{0};
+  const uint64_t now=nowUs();
+  if(now-checkedUs.load()>1000000){checkedUs=now;if(left.load()<=0 && access("/var/local/mtl2-passlog",F_OK)==0){unlink("/var/local/mtl2-passlog");left=400;}}
+  if(left.load()>0 && left.fetch_sub(1)>0) {
+   NSMutableString *line=[NSMutableString stringWithFormat:@"pass %lux%lu",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight];
+   for(unsigned i=0;i<8;i++){MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];if(!c.texture)continue;
+    [line appendFormat:@" c%u %lux%lu f%lu L%lu S%lu%s",i,(unsigned long)c.texture.width,(unsigned long)c.texture.height,(unsigned long)c.texture.pixelFormat,
+     (unsigned long)c.loadAction,(unsigned long)c.storeAction,[(id)c.texture isKindOfClass:[NBTexture class]] && ((NBTexture *)c.texture).surface?" surf":""];}
+   if(d.depthAttachment.texture)[line appendFormat:@" d L%lu S%lu",(unsigned long)d.depthAttachment.loadAction,(unsigned long)d.depthAttachment.storeAction];
+   if(d.stencilAttachment.texture)[line appendFormat:@" s L%lu S%lu",(unsigned long)d.stencilAttachment.loadAction,(unsigned long)d.stencilAttachment.storeAction];
+   sm2_logs(line.UTF8String);
+  }
+ }
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;

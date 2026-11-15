@@ -1,0 +1,91 @@
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -3851,10 +3851,52 @@ impl RenderCommandEncoder {
+             }
+         }
+         let [width, height] = layout.extent;
+-        let render_area = vk::Rect2D {
++        let mut render_area = vk::Rect2D {
+             offset: vk::Offset2D { x: 0, y: 0 },
+             extent: vk::Extent2D { width, height },
+         };
++        // guacamole (M2V_TIGHT_RENDER_AREA=1): the render area is the bounds of what the pass's
++        // draws may write (their viewports within their scissors) where nothing of the pass
++        // reaches past them: no clear load (Metal clears the whole attachment), no resolve or
++        // stand-in, no execution, tile dispatch, imageblock or rate map. A tiler loads and stores
++        // only the bins the area covers, and the attachments keep their pixels outside it
++        // (Vulkan: load, store and resolve operations act inside the render area alone).
++        // QuartzCore resumes its framebuffer's pass after each backdrop blur to draw a bar or a
++        // button: ten full-screen loads and stores a frame (YouTube in Safari, 27 Mpx a frame).
++        let eligible = drew && executions.is_empty() && pending.is_empty()
++            && dispatches.is_empty() && imageblock.is_none()
++            && layout.colors.iter().flatten().all(|c| {
++                c.load != LoadAction::Clear
++                    && c.resolve.is_none()
++                    && c.copied_resolve.is_none()
++                    && c.stand_in.is_none()
++            })
++            && layout.depth_stencil.as_ref().is_none_or(|ds| {
++                ds.resolve.is_none()
++                    && ds.depth.is_none_or(|a| a.load != LoadAction::Clear)
++                    && ds.stencil.is_none_or(|a| a.load != LoadAction::Clear)
++            });
++        tight_render_area_log(|| {
++            let colors: Vec<String> = layout.colors.iter().flatten().map(|c| {
++                format!("{:?}/r{}/cr{}/si{}", c.load, c.resolve.is_some() as u8, c.copied_resolve.is_some() as u8,
++                    c.stand_in.is_some() as u8)
++            }).collect();
++            let ds = layout.depth_stencil.as_ref().map(|ds| {
++                format!("ds r{} d{:?} s{:?}", ds.resolve.is_some() as u8, ds.depth.map(|a| a.load), ds.stencil.map(|a| a.load))
++            });
++            format!("{width}x{height} drew {drew} eligible {eligible} bounds {:?} colors {colors:?} {ds:?}\n", drawn.bounds())
++        });
++        if tight_render_area() && eligible {
++            if let Some([x0, y0, x1, y1]) = drawn.bounds() {
++                let (x1, y1) = (x1.min(width), y1.min(height));
++                if x0 < x1 && y0 < y1 {
++                    render_area = vk::Rect2D {
++                        offset: vk::Offset2D { x: x0 as i32, y: y0 as i32 },
++                        extent: vk::Extent2D { width: x1 - x0, height: y1 - y0 },
++                    };
++                }
++            }
++        }
+         if let Some(first) = &first_texel_copies {
+             core.shadow_copies(first);
+         }
+@@ -8541,3 +8583,33 @@ mod tests {
+         }
+     }
+ }
++
++/// guacamole: `M2V_TIGHT_RENDER_AREA=1` bounds a pass's render area by its draws (`end_pass`).
++fn tight_render_area() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("M2V_TIGHT_RENDER_AREA").is_ok_and(|v| v == "1"))
++}
++
++/// guacamole: with `M2V_TIGHT_RENDER_AREA_LOG=1`, the first 400 passes' render area decisions
++/// into /var/local/m2v-area.log.
++fn tight_render_area_log(line: impl FnOnce() -> String) {
++    use std::io::Write;
++    use std::sync::atomic::{AtomicU32, Ordering};
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    static LEFT: AtomicU32 = AtomicU32::new(0);
++    if !*ON.get_or_init(|| std::env::var("M2V_TIGHT_RENDER_AREA_LOG").is_ok_and(|v| v == "1")) {
++        return;
++    }
++    // a pass at most each second looks for /var/local/m2v-cache/area-go, which starts the next 400 lines
++    static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
++    if CHECKED.swap(now, Ordering::Relaxed) != now && std::fs::remove_file("/var/local/m2v-cache/area-go").is_ok() {
++        LEFT.store(400, Ordering::Relaxed);
++    }
++    if LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_err() {
++        return;
++    }
++    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/var/local/m2v-area.log") {
++        let _ = f.write_all(line().as_bytes());
++    }
++}

@@ -327,6 +327,27 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   360p mp4 (no MediaSource on iPhone before 17.1: no isTypeSupported calls,
   'src' URL, FigFilePlayer ~300-580 kbps); WebKit has
   -[WKPreferences _setMediaSourceEnabled:] (on for iPad).
+- What a frame of it is (2026-11-15, /var/local/mtl2-passlog: the frontend
+  logs the next 400 passes' attachments): 34 passes, 141 draws. 10 of them
+  are QuartzCore's framebuffer pass (1125x2436, Load + Store) resumed after
+  each backdrop blur: 10 x 2.74 Mpx = the 27 Mpx a frame of the telemetry,
+  commit to complete 30-45 ms. Every pass has a second color attachment of
+  its size, DontCare/DontCare (the runtime makes it a Clear). GPU at 585 MHz
+  (the SD855's top) and DDR/SH0 voted to the top already.
+- Tried, no gain: TU_DEBUG=sysmem (36-61 ms a frame), TU_DEBUG=gmem
+  (84-127 ms), TU_AUTOTUNE_ALGO=profiled + TU_AUTOTUNE_FLAGS=tune_small
+  (the queue backed up to 10 s; never again without a watch). Turnip's
+  default autotune (bandwidth estimate) is the best of them.
+- Bridge patch 0102 (M2V_TIGHT_RENDER_AREA=1, off by default): a pass's
+  Vulkan render area bounded by its draws' scissors within viewports, where
+  no Clear/resolve/stand-in reaches past them; M2V_TIGHT_RENDER_AREA_LOG=1
+  plus touching /var/local/m2v-cache/area-go logs the next 400 decisions to
+  /var/local/m2v-area.log. Found: QuartzCore leaves the scissor full-screen
+  in 83 of 94 resumed passes (bounds 1125x2436; 11 a strip y 1244-1388), and
+  the runtime's Clear of the DontCare second attachment made every pass
+  ineligible. Bounds would have to come from the draws' vertices.
+- /var/local/mtl2-env is read by every Metal client (backboardd runs as
+  mobile: a trigger file it must delete goes in /var/local/m2v-cache).
 - When osanalyticshelper says "limit of 25 logs has been reached" no crash
   report is written: move the day's .ips out of
   /var/mobile/Library/Logs/CrashReporter (old ones: /var/tmp/crash-old).
