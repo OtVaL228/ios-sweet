@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -763,8 +763,13 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
++		/*
++		 * 0165: IOSurfaceClientGetBytesPerRowOfPlane reads the plane's row bytes at +0x10
++		 * (IOSurfaceClient + 0xe0 + plane * 0x80), not +0x08: every plane had 0 bytes per row, so
++		 * CVPixelBufferCreateWithIOSurface refused a decoded 420v frame (-6661) and no video played.
++		 */
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;

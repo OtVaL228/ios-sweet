@@ -276,6 +276,28 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   (vaemGetVirtualAudioDeviceIDs). web.telegram.org restarts itself when its
   shared worker dies (not a GPU error).
 
+## Video
+
+- Decoders: iOS 16's VideoToolbox loads software ones first,
+  /System/Library/VideoCodecs/H264SW.videocodec (VCPAVCRegisterDecoder) and
+  VCPHEVC.videocodec; the hardware ones (AVD.videodecoder: "AppleAVDCheckPlatform()
+  returned FALSE", H264H8 / AppleD5500) do not apply here. An app's
+  VTDecompressionSession is remote (vtdsr): mediaserverd decodes and sends the
+  frames back as IOSurfaces.
+- No video played (2026-11-15, userland/jb/vtprobe on 720p H.264 and HEVC):
+  every frame came back as -6661 (kCVReturnInvalidArgument), then the client
+  died of EXC_GUARD DEALLOC_GAP in __vtdsr_dequeueAllPendingFrames. The
+  decoded frames are 420v (two planes), and IOSurfaceGetBytesPerRowOfPlane gave
+  0 for every plane, so CVPixelBufferCreateWithIOSurface refused them (BGRA,
+  without planes, worked). The lock result's plane record (0x68 + plane *
+  0x80) is width +0x00, height +0x04, offset +0x0c, bytes per row +0x10, size
+  +0x14, bytes per element +0x18, element w/h +0x1a/+0x1b; SweetSurface wrote
+  bytes per row at +0x08. 0165 moves it. (0143's WebKit plane got 0 bytes per
+  row the same way; without planes IOSurface.framework already answers plane 0
+  with the surface's own row bytes.)
+- vtprobe FILE [N] [sw]: decodes a file's video track through VTDecompressionSession
+  and prints the first frame's format, errors and the decode rate.
+
 ## Files app
 
 On My iPhone is FileProvider's LocalStorage domain on FPFS, which iOS 16
@@ -621,8 +643,7 @@ Bring-up from userland (userland/adsp, over /dev/pmem like wland):
   [dst: Require out of band speech input support]; [dst: Require wireless
   splitter not in use]", for the ringtone "Route change failed: nort". No
   AVDTP_Start follows. Next: where VirtualAudio gets that policy and the
-  port properties. Video in Safari crashes mediaserverd separately
-  (exception in FigGetAlignmentForIOSurfaceOutputToDisplayService).
+  port properties. Video: see Video (planar IOSurfaces, 0165).
 - Why no route: the rule is AND (Aggregate Connection Inclusion Policy,
   0xeb494), and "out of band speech input support" asks the A2DP port for
   an OOB speech input device UUID (Port_BluetoothA2DP vtable 0x62a2d8, slot
