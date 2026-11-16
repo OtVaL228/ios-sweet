@@ -12,6 +12,9 @@
 # CPUS=N (default 1) sets cpus=; e.g. CPUS=8 tools/guac-mkboot.sh ...
 # KEYS=0/1 (default 1, PM8150 keys from 0084), TOUCH=0/1 and USB=0/1/2
 # (default 0: still sweet hardware) set sweetkeys/sweettouch/sweetusb.
+# ABLCMD sets the boot image header's cmdline, which ABL puts in /chosen/bootargs
+# for the shim (default console=null); ABLCMD="console=null androidboot.mode=charger"
+# shows the shim's charger screen under fastboot boot, as a charger power-on does.
 set -euo pipefail
 [ $# -ge 4 ] || { sed -n '2,11p' "$0"; exit 1; }
 # Resolve paths against the caller's directory BEFORE changing into the repo.
@@ -32,6 +35,6 @@ python3 tools/mkadt.py shim/out/guac-hi.adt --highmem --guacamole
 # sweettime: this machine's clock now, for the PM8150 RTC's offset (xnu 0133)
 ARGS="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -enable_kprintf_spam -noprogress sweettouch=${TOUCH:-0} sweetkeys=${KEYS:-1} sweetusb=${USB:-0} wdt=-1 sweettime=$(date +%s) $EXTRA"
 python3 tools/mkpayload.py "$K" shim/out/guac-hi.adt shim/out/payload-guac.bin --cmdline "$ARGS"
-python3 tools/mkguacboot.py "$STOCK" "$SHIM" "$OUT" --ramdisk shim/out/payload-guac.bin
+python3 tools/mkguacboot.py "$STOCK" "$SHIM" "$OUT" --ramdisk shim/out/payload-guac.bin --cmdline "${ABLCMD:-console=null}"
 echo "boot-args: $ARGS"
 echo "next: fastboot boot $OUT"

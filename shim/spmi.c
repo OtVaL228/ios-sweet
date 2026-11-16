@@ -1,11 +1,13 @@
 /*
- * Minimal SPMI PMIC-arbiter v5 client (EE0) for one job: tell ABL to stay
+ * Minimal SPMI PMIC-arbiter v5 client (EE0). First job: tell ABL to stay
  * in fastboot after the next reset, the way Linux does on SM8150:
  *   qpnp_pon_set_restart_reason(PON_RESTART_REASON_BOOTLOADER)
  *   -> PM8150 (SID0) PON_SOFT_RB_SPARE[7:1] = 2
  * PS_HOLD is already in warm-reset mode after ABL (ctl=0x01, ctl2=0x80),
  * so PSCI SYSTEM_RESET afterwards lands in fastboot. Verified on guacamole
- * with guac-probe v5.
+ * with guac-probe v5. The charger screen (charger.c) also reads the fuel
+ * gauge and charger, sets the SMB5 current limits and the PS_HOLD power-off
+ * type: spmi_write() takes only the registers listed in it.
  *
  * Layout (Linux drivers/spmi/spmi-pmic-arb.c, v5):
  *   core  + 0x900 + 4*apid : APID -> PPID map ([19:8] = sid<<8 | periph)
@@ -23,9 +25,7 @@
 #define SPMI_CHNLS	0x0c600000UL
 #define SPMI_OBSRVR	0x0e600000UL
 #define SPMI_CNFG	0x0c40a000UL
-#define PON_SID		0
-#define PON_PERIPH	0x08
-#define PON_SOFT_RB_SPARE	0x8f
+#define PON_SOFT_RB_SPARE	0x88f	/* PM8150 (SID0) PON 0x800 + 0x8f */
 #define PON_REASON_BOOTLOADER	0x02	/* enum pon_restart_reason; stored << 1 */
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
@@ -52,7 +52,8 @@ static int wait_done(uintptr_t ch)
 	return -2;
 }
 
-static int find_apid(void)
+/* The APID of (sid, peripheral); with owned, only one EE0 owns (a write channel). */
+static int find_apid(unsigned sid, unsigned periph, int owned)
 {
 	uint32_t n = rd32(SPMI_CORE + 0x4) & 0x7ff;
 	uint32_t ver = rd32(SPMI_CORE + 0x0);
@@ -61,34 +62,59 @@ static int find_apid(void)
 		return -1;
 	for (uint32_t i = 0; i < n; i++) {
 		uint32_t map = rd32(SPMI_CORE + 0x900 + 4 * i);
-		if (!map || ((map >> 8) & 0xfff) != ((PON_SID << 8) | PON_PERIPH))
+		if (!map || ((map >> 8) & 0xfff) != ((sid << 8) | periph))
 			continue;
-		if ((rd32(SPMI_CNFG + 0x700 + 4 * i) & 7) == 0)
-			found = (int)i;	/* writable by EE0 */
+		int ee0 = (rd32(SPMI_CNFG + 0x700 + 4 * i) & 7) == 0;
+		if (ee0 || (!owned && found < 0))
+			found = (int)i;
 	}
 	return found;
 }
 
-int pon_set_reboot_bootloader(void)
+int spmi_read(unsigned sid, unsigned addr, uint8_t *out)
 {
-	int apid = find_apid();
+	int apid = find_apid(sid, (addr >> 8) & 0xff, 0);
 	if (apid < 0)
 		return -1;
 	uintptr_t obs = SPMI_OBSRVR + 0x80UL * (unsigned)apid;
-	uintptr_t chn = SPMI_CHNLS + 0x10000UL * (unsigned)apid;
-
-	wr32(obs + 0x00, (1u << 27) | (PON_SOFT_RB_SPARE << 4));	/* EXT_READL, 1 byte */
+	wr32(obs + 0x00, (1u << 27) | ((addr & 0xff) << 4));	/* EXT_READL, 1 byte */
 	__asm__ volatile("dsb sy" ::: "memory");
 	if (wait_done(obs))
 		return -3;
-	uint8_t spare = (uint8_t)rd32(obs + 0x18);
+	*out = (uint8_t)rd32(obs + 0x18);
+	return 0;
+}
 
-	wr32(chn + 0x10, (spare & 0x01) | (PON_REASON_BOOTLOADER << 1));
+int spmi_write(unsigned sid, unsigned addr, uint8_t value)
+{
+	static const uint16_t pm8150[] = { 0x85a, 0x85b, PON_SOFT_RB_SPARE };	/* PS_HOLD_RST_CTL, CTL2 */
+	static const uint16_t pm8150b[] = { 0x1061, 0x1342, 0x1365, 0x1366, 0x1370 };	/* xnu 0167's */
+	const uint16_t *list = sid == 0 ? pm8150 : sid == 2 ? pm8150b : 0;
+	unsigned count = sid == 0 ? 3 : sid == 2 ? 5 : 0, ok = 0;
+	for (unsigned i = 0; i < count; i++)
+		ok |= list[i] == addr;
+	if (!ok)
+		return -1;
+	int apid = find_apid(sid, (addr >> 8) & 0xff, 1);
+	if (apid < 0)
+		return -1;
+	uintptr_t chn = SPMI_CHNLS + 0x10000UL * (unsigned)apid;
+	wr32(chn + 0x10, value);
 	__asm__ volatile("dsb sy" ::: "memory");
-	wr32(chn + 0x00, (0u << 27) | (PON_SOFT_RB_SPARE << 4));	/* EXT_WRITEL, 1 byte */
+	wr32(chn + 0x00, (0u << 27) | ((addr & 0xff) << 4));	/* EXT_WRITEL, 1 byte */
 	__asm__ volatile("dsb sy" ::: "memory");
 	return wait_done(chn) ? -4 : 0;
 }
+
+int pon_set_reboot_bootloader(void)
+{
+	uint8_t spare;
+	if (spmi_read(0, PON_SOFT_RB_SPARE, &spare))
+		return -3;
+	return spmi_write(0, PON_SOFT_RB_SPARE, (spare & 0x01) | (PON_REASON_BOOTLOADER << 1)) ? -4 : 0;
+}
 #else
 int pon_set_reboot_bootloader(void) { return 0; }
+int spmi_read(unsigned sid, unsigned addr, uint8_t *out) { (void)sid; (void)addr; (void)out; return -1; }
+int spmi_write(unsigned sid, unsigned addr, uint8_t value) { (void)sid; (void)addr; (void)value; return -1; }
 #endif

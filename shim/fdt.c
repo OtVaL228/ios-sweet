@@ -1,6 +1,6 @@
 /*
  * Just enough flattened-device-tree parsing to find what ABL put in
- * /chosen (initrd location). Big-endian, 4-byte aligned tokens.
+ * /chosen (initrd location, ABL's bootargs). Big-endian, 4-byte aligned tokens.
  */
 #include "fdt.h"
 
@@ -36,7 +36,8 @@ static uintptr_t skip_str(uintptr_t p)
 	return p + 1;
 }
 
-int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
+/* The value and length of property prop of /chosen; 0 if absent. */
+static int chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val, uint32_t *len)
 {
 	if (!fdt || be32(fdt) != FDT_MAGIC)
 		return 0;
@@ -61,18 +62,14 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 			depth--;
 			break;
 		case FDT_PROP: {
-			uint32_t len = be32(p), nameoff = be32(p + 4);
-			uintptr_t val = p + 8;
+			uint32_t l = be32(p), nameoff = be32(p + 4);
+			uintptr_t v = p + 8;
 			if (in_chosen && streq((const char *)(strings + nameoff), prop)) {
-				if (len == 4)
-					*out = be32(val);
-				else if (len == 8)
-					*out = (uint64_t)be32(val) << 32 | be32(val + 4);
-				else
-					return 0;
+				*val = v;
+				*len = l;
 				return 1;
 			}
-			p = align4(val + len);
+			p = align4(v + l);
 			break;
 		}
 		case FDT_NOP:
@@ -81,4 +78,39 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 			return 0;
 		}
 	}
+}
+
+int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
+{
+	uintptr_t val;
+	uint32_t len;
+	if (!chosen_prop(fdt, prop, &val, &len))
+		return 0;
+	if (len == 4)
+		*out = be32(val);
+	else if (len == 8)
+		*out = (uint64_t)be32(val) << 32 | be32(val + 4);
+	else
+		return 0;
+	return 1;
+}
+
+int fdt_chosen_has(uintptr_t fdt, const char *prop, const char *word)
+{
+	uintptr_t val;
+	uint32_t len;
+	if (!chosen_prop(fdt, prop, &val, &len))
+		return 0;
+	/* a word: at the start or after a space, followed by a space or the end */
+	for (uint32_t i = 0; i < len; i++) {
+		volatile const char *s = (volatile const char *)(val + i);
+		if (i && s[-1] != ' ')
+			continue;
+		uint32_t k = 0;
+		while (word[k] && i + k < len && s[k] == word[k])
+			k++;
+		if (!word[k] && (i + k == len || s[k] == ' ' || s[k] == 0))
+			return 1;
+	}
+	return 0;
 }

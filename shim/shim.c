@@ -13,6 +13,7 @@
 #include "ufs.h"
 #include "board.h"
 #include "spmi.h"
+#include "charger.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
@@ -380,6 +381,11 @@ static uint32_t to_us(uint64_t ticks)
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+	/* Powered on by a charger: the battery screen first (charger.c); it returns to start iOS. */
+	stage = "charger";
+	if (charger_requested(dtb))
+		charger_mode();
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";

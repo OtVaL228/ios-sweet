@@ -372,6 +372,21 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   through an EE0-owned write channel. 2026-11-16, a Type-C wall charger:
   +1290 mA into the battery right after boot, +1536 mA at 3.95 V (was
   +0.38-0.57 A).
+- Charger screen (shim/charger.c): ABL boots the boot image with
+  androidboot.mode=charger in /chosen/bootargs when a charger powers the
+  phone on. The shim then sets the same current limits as 0167, draws the
+  battery and percentage (FG monotonic SOC) on black, blanks after 15 s
+  (AMOLED black is off; the core sleeps on wfe with CNTKCTL_EL1's event
+  stream), shows it again on a power key press, starts iOS when the key is
+  held 2 s (not below 3% / 3.6 V), and powers off when the charger is gone
+  3 s: PM8150 PS_HOLD_RST_CTL2 (0x85b) bit 7 off, 1 ms, PS_HOLD_RST_CTL
+  (0x85a) type 4 = SHUTDOWN (ABL leaves 1, warm reset), bit 7 on, then PSCI
+  SYSTEM_OFF (qpnp_pon_reset_config). shim/spmi.c's spmi_write takes only
+  those PON registers, the reboot spare and 0167's five. Tested 2026-11-16
+  under fastboot boot with ABLCMD="console=null androidboot.mode=charger"
+  (guac-mkboot.sh puts it in the header's cmdline); a real charger power-on
+  needs the shim in the flashed boot partition. Build:
+  BOARD=guacamole CROSS=aarch64-elf- shim/build.sh (Homebrew toolchain).
 - /var/local/mtl2-env is read by every Metal client (backboardd runs as
   mobile: a trigger file it must delete goes in /var/local/m2v-cache).
 - When osanalyticshelper says "limit of 25 logs has been reached" no crash
