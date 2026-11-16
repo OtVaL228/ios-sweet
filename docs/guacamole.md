@@ -346,6 +346,21 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   in 83 of 94 resumed passes (bounds 1125x2436; 11 a strip y 1244-1388), and
   the runtime's Clear of the DontCare second attachment made every pass
   ineligible. Bounds would have to come from the draws' vertices.
+- Why Turnip keeps those passes in GMEM: its bandwidth autotune prices a
+  pass per pixel of the render area (tu_pass.cc: GMEM = loads + stores,
+  sysmem = clears + resolves). QuartzCore's second color is memoryless and
+  the runtime clears it (Metal reads a memoryless color as zero): a
+  full-screen clear in sysmem. Bridge patch 0103 (M2V_UNTOUCHED_MEMORYLESS=1,
+  set in /var/local/mtl2-env on the phone) keeps that DontCare where no draw
+  of the pass writes or reads the color: 180 of 200 passes. Frames the same
+  (34 swaps/s, 28-41 ms commit to complete). With TU_DEBUG=sysmem on top: the
+  GPU busy at 82-88% of vsyncs (was 92-100%), still ~33 swaps/s, backboardd's
+  render thread ~90% busy: the CPU side of the bridge is the next limit.
+- Power (2026-11-16): on the charger iOS gets ~0.4-0.57 A into the battery
+  idle (SweetBattery InstantAmperage), and with video and the GPU busy it
+  drains ~0.72 A while "IsCharging" stays Yes (3.52 -> 3.39 V in minutes);
+  at ~2% it rebooted itself while booting. Nothing sets PM8150B's input
+  current limit (Linux qcom_smb5): next for long GPU sessions.
 - /var/local/mtl2-env is read by every Metal client (backboardd runs as
   mobile: a trigger file it must delete goes in /var/local/m2v-cache).
 - When osanalyticshelper says "limit of 25 logs has been reached" no crash
