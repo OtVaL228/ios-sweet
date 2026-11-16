@@ -359,8 +359,19 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
 - Power (2026-11-16): on the charger iOS gets ~0.4-0.57 A into the battery
   idle (SweetBattery InstantAmperage), and with video and the GPU busy it
   drains ~0.72 A while "IsCharging" stays Yes (3.52 -> 3.39 V in minutes);
-  at ~2% it rebooted itself while booting. Nothing sets PM8150B's input
-  current limit (Linux qcom_smb5): next for long GPU sessions.
+  at ~2% it rebooted itself while booting. Nothing set PM8150B's input
+  current limit (Linux qcom_smb5).
+- 0167 (boot-arg sweetcharge=1, with sweetbattery=2): SweetBattery sets the
+  SMB5 USB input current limit once APSD is done, as smb5-lib.c's
+  smblib_set_icl_current() in high-current mode: 0x1370 = mA/50, 0x1366
+  bit 0 USBIN_MODE_CHG, 0x1342 bit 0 (ICL override) clear, 0x1365 bit 4
+  ICL_OVERRIDE_AFTER_APSD; SDP (a computer) left at its 500 mA, Type-C Rp
+  3.0 A 2000 mA, DCP/CDP/OCP or Rp 1.5 A 1500 mA, else 1000 mA; FCC (0x1061)
+  raised to 2000 mA where lower; float voltage only logged ("SWEET CHARGE:"
+  lines, on a change). sweet_spmi_write writes those five registers alone,
+  through an EE0-owned write channel. 2026-11-16, a Type-C wall charger:
+  +1290 mA into the battery right after boot, +1536 mA at 3.95 V (was
+  +0.38-0.57 A).
 - /var/local/mtl2-env is read by every Metal client (backboardd runs as
   mobile: a trigger file it must delete goes in /var/local/m2v-cache).
 - When osanalyticshelper says "limit of 25 logs has been reached" no crash

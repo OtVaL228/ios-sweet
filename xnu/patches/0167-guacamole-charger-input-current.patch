@@ -1,0 +1,234 @@
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,11 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/*
++ * 0167: one byte to a PM8150B charger register (SID 2: 0x1061 FCC, 0x1342 ICL override, 0x1365 load cfg,
++ * 0x1366 ICL options, 0x1370 USB ICL; nothing else), through a write channel owned by EE0. Thread context; 0 success.
++ */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,7 +1,10 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
++ * Reads through the observer channels; 0167 adds sweet_spmi_write for five
++ * PM8150B charger registers alone (input and charge current limits), through
++ * the write channel of an APID EE0 owns (shim/spmi.c's PON write: a write to
++ * another layout went to CrashDump on guac-probe v3). No interrupt clear,
++ * peripheral enable or other PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+@@ -17,6 +20,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++#define SP_CHN_PA  0x0c600000u   /* write channels: + 0x10000 * APID (Linux spmi-pmic-arb.c, v5) */
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -25,6 +29,7 @@ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
++static vm_offset_t sp_chn[512];   /* write channels mapped so far */
+ 
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+@@ -91,7 +96,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool charger = peripheral >= 0x10 && peripheral <= 0x13;       /* SMB5 CHGR, DCDC, BATIF, USBIN */
+ 	bool allowed = sid == 0 ? charger || peripheral == 0x48 ||     /* PM6150 QG */
+ 	    peripheral == 0x60 :                                        /* 0133: PM8150 RTC (sweet_rtc.c) */
+-	    sid == 2 && (charger || peripheral == 0x40 || peripheral == 0x41); /* 0136: PM8150B FG gen4 */
++	    sid == 2 && (charger || peripheral == 0x15 ||                /* 0167: PM8150B Type-C (Rp) */
++	    peripheral == 0x40 || peripheral == 0x41);                  /* 0136: PM8150B FG gen4 */
+ 	if (!sp_ready || !out || !allowed || addr > 0xffffu) {
+ 		return -1;
+ 	}
+@@ -125,4 +131,48 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	static const unsigned writable[] = { 0x1061, 0x1342, 0x1365, 0x1366, 0x1370 };
++	bool allowed = false;
++	for (unsigned i = 0; i < sizeof(writable) / sizeof(writable[0]); ++i) {
++		allowed |= sid == 2 && addr == writable[i];
++	}
++	if (!sp_ready || !allowed) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		printf("SWEET CHARGE: no EE0 write channel for sid=%u addr=%#x\n", sid, addr);
++		return -1;
++	}
++	if (!sp_chn[apid]) {
++		sp_chn[apid] = ml_io_map(SP_CHN_PA + 0x10000u * apid, 0x1000);
++	}
++	vm_offset_t ch = sp_chn[apid];
++	if (!ch) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = value;                    /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (addr & 0xffu) << 4;      /* EXT_WRITEL, BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET CHARGE: SPMI write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -14,6 +14,16 @@
+  * signed, 488.281 uA, positive = discharging. The SMB5 charger registers are
+  * those of PM6150 above, on SID 2. Temperature: BATT_INFO_BATT_TEMP 0x4150
+  * (11 bits, quarter kelvin, fg-gen3's formula); used only when plausible.
++ *
++ * 0167, sweetcharge=1 (with sweetbattery=2): nothing set the SMB5 input current limit, so iOS charged
++ * at the USB default (~0.5 A into the battery idle, and drained 0.72 A on the charger with video
++ * playing). Once APSD is done on an attached input, the USB ICL is set by the source as smb5-lib.c's
++ * smblib_set_icl_current() does in high-current mode (USBIN_CURRENT_LIMIT_CFG in 50 mA steps,
++ * USBIN_MODE_CHG, no ICL override, ICL_OVERRIDE_AFTER_APSD): a computer's port (SDP) is left at its
++ * 500 mA, Type-C Rp 3.0 A 2000 mA, DCP/CDP/OCP or Rp 1.5 A 1500 mA, anything else 1000 mA; the
++ * fast charge current is raised to 2000 mA (0.5 C of 4000 mAh) where it is lower. The float voltage
++ * is only logged; the charger's own JEITA and AICL stay in charge. Registers: smb5-reg.h of the
++ * OnePlus SM8150 kernel.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -26,6 +36,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -37,7 +48,8 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fCharge;
++	uint8_t fChargeSeen[3];          /* 0167: APSD result, Rp and ICL last logged */
+ 	int fLastMode, fKind;           /* sweetbattery: 1 PM6150, 2 PM8150B */
+ 	unsigned fDesign, fPolls;       /* design capacity (mAh); polls so far */
+ 	unsigned fTemperature;          /* centidegrees C */
+@@ -47,6 +59,7 @@ private:
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
+ 	void pollFuelGauge(void);
++	void configureCharging(void);
+ 	static bool readShadow(unsigned address, unsigned copy, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+@@ -88,6 +101,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLastMode = -1;
+ 	fKind = 0;
++	fCharge = false;
++	fChargeSeen[0] = fChargeSeen[1] = fChargeSeen[2] = 0xff;   /* the first configuration is logged */
+ 	fDesign = 5020;
+ 	fPolls = 0;
+ 	fTemperature = 2500;
+@@ -283,6 +298,9 @@ SweetBattery::pollFuelGauge(void)
+ 		}
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
++	if (fCharge && external) {
++		configureCharging();
++	}
+ 	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;
+ 	bool charging = capable && state >= 1 && state <= 4 &&
+@@ -291,6 +309,51 @@ SweetBattery::pollFuelGauge(void)
+ 	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
+ }
+ 
++/* 0167: the attached source's input current limit (the header comment). */
++void
++SweetBattery::configureCharging(void)
++{
++	uint8_t apsdStatus, apsd, rp, icl, options, override, load, fcc, fv;
++	if (sweet_spmi_read(2, 0x1307, &apsdStatus) || !(apsdStatus & 1u) ||   /* APSD_STATUS: DTC done */
++	    sweet_spmi_read(2, 0x1308, &apsd) || sweet_spmi_read(2, 0x1506, &rp) ||
++	    sweet_spmi_read(2, 0x1370, &icl) || sweet_spmi_read(2, 0x1366, &options) ||
++	    sweet_spmi_read(2, 0x1342, &override) || sweet_spmi_read(2, 0x1365, &load) ||
++	    sweet_spmi_read(2, 0x1061, &fcc) || sweet_spmi_read(2, 0x1070, &fv)) {
++		return;
++	}
++	unsigned ma;
++	if (apsd & 0x01u) {                     /* SDP_CHARGER: a computer's port */
++		ma = 0;
++	} else if (rp & 0x02u) {                /* SNK_RP_3P0 */
++		ma = 2000;
++	} else if ((apsd & 0x0eu) || (rp & 0x04u)) { /* DCP, CDP, OCP; SNK_RP_1P5 */
++		ma = 1500;
++	} else {
++		ma = 1000;
++	}
++	bool changed = false;
++	if (ma && (icl != ma / 50u || !(options & 1u) || (override & 1u) || !(load & 0x10u))) {
++		changed = !sweet_spmi_write(2, 0x1370, (uint8_t)(ma / 50u)) &&
++		    !sweet_spmi_write(2, 0x1366, (uint8_t)(options | 1u)) &&            /* USBIN_MODE_CHG */
++		    !sweet_spmi_write(2, 0x1342, (uint8_t)(override & ~1u)) &&          /* ICL_OVERRIDE off */
++		    !sweet_spmi_write(2, 0x1365, (uint8_t)(load | 0x10u));              /* ICL_OVERRIDE_AFTER_APSD */
++	}
++	if (fcc < 2000u / 50u) {
++		changed |= !sweet_spmi_write(2, 0x1061, (uint8_t)(2000u / 50u));
++	}
++	if (changed || fChargeSeen[0] != apsd || fChargeSeen[1] != rp || fChargeSeen[2] != icl) {
++		uint8_t iclNow = icl, fccNow = fcc;
++		(void)sweet_spmi_read(2, 0x1370, &iclNow);
++		(void)sweet_spmi_read(2, 0x1061, &fccNow);
++		IOLog("SWEET CHARGE: APSD %#x Rp %#x: ICL %u -> %u mA (options %#x override %#x load %#x), "
++		    "FCC %u -> %u mA, float voltage raw %#x%s\n", apsd, rp, icl * 50u, iclNow * 50u, options,
++		    override, load, fcc * 50u, fccNow * 50u, fv, ma ? "" : " (computer port: left)");
++		fChargeSeen[0] = apsd;
++		fChargeSeen[1] = rp;
++		fChargeSeen[2] = iclNow;
++	}
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+@@ -358,6 +421,10 @@ SweetBattery::start(IOService *provider)
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = (real == 1 || real == 2) && sweet_spmi_init() == 0;
+ 	fKind = fReal ? real : 0;
++	int charge = 0;
++	(void)PE_parse_boot_argn("sweetcharge", &charge, sizeof(charge));
++	fCharge = fKind == 2 && charge == 1;
++	IOLog("SWEET CHARGE: input current control %s\n", fCharge ? "on" : "off (sweetcharge=1 turns it on)");
+ 	if (fKind == 2) {
+ 		fDesign = 4000;         /* OnePlus 7 Pro: 4000 mAh (no capacity in its DT) */
+ 	}
