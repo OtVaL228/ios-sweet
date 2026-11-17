@@ -381,6 +381,19 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   passes, heap sets...), its own time spread over hundreds of lines, plus
   settle_draw 6.6%, bind::instantiate 6.5%, Recording::record 7%,
   binding::bind 3.5%, write_sets 3%, ArgumentTable::retain 2.5%.
+- Bridge patch 0104 (M2V_DRAW_PHASES=1): draw_resident's phases timed
+  (mach_absolute_time; cntvct_el0 read from EL0 gave garbage), the mean per
+  draw appended to /var/local/m2v-cache/phases.log every 5000 draws.
+  drawbench 150 x 4 +memoryless, us a draw (of ~42 in draw_resident, ~61
+  in all): 1 draw_settings 3.8, 2 settle_draw 5.0, 3 vertex reach / heap
+  sets / index passes 4.8, 6 attachments, tile memory, stand-ins, the
+  instance 4.9, 7 fixed state and depth 3.5, 8 the VkPipeline 3.5, 10 set
+  0 allocated and written 2.8, 11 the Vulkan draws and uses 1.9, 14 the
+  recording and install to the end 9.6, the rest ~2. Recording::record
+  already skips state its command buffer holds (render/bound.rs). Phases
+  1-8 (~26 us) give QuartzCore's next draw the same answers as its last
+  (same pipeline and state, new vertex bytes and texture): the target of a
+  same-state memo.
 - Power (2026-11-16): on the charger iOS gets ~0.4-0.57 A into the battery
   idle (SweetBattery InstantAmperage), and with video and the GPU busy it
   drains ~0.72 A while "IsCharging" stays Yes (3.52 -> 3.39 V in minutes);

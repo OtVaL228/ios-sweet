@@ -1,0 +1,202 @@
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -5778,6 +5778,7 @@ impl RenderCommandEncoder {
+         buffers: DrawBuffers<'_>,
+         empty: bool,
+     ) -> Result<(), Error> {
++        let mut _phases = DrawPhases::begin();
+         let pipeline = match self.pipeline.as_ref().map(RenderPipelineState::kind) {
+             None => return Err(invalid(call, Problem::NoPipelineState)),
+             Some(RenderStateKind::Tile(_)) => {
+@@ -5879,6 +5880,7 @@ impl RenderCommandEncoder {
+         // (`render/restart.rs`).
+         let restarted = self.restarted(assembly, &draw);
+         let assembly = restarted.map_or(assembly, |r| r.assembly());
++        _phases.mark(0);
+         let settings = self.draw_settings(call, &pipeline, assembly, true)?;
+         let (topology, primitive_restart) = (settings.topology, settings.primitive_restart);
+         let unsized_points = settings.unsized_points;
+@@ -5921,6 +5923,7 @@ impl RenderCommandEncoder {
+         }
+         // The encoder's kept bind state, brought to the draw's (`live_bind.rs`), held for the
+         // draw: no draw of the encoder runs inside another past here.
++        _phases.mark(1);
+         let live = Arc::clone(&self.live);
+         let mut live = lock(&live);
+         let settled = self.settle_draw(
+@@ -5979,6 +5982,7 @@ impl RenderCommandEncoder {
+         let interface = &variant.pipeline().interface;
+         // A pulled attribute's 32-bit displacement past 4 GiB of its buffer
+         // (`render/vertex_reach.rs`).
++        _phases.mark(2);
+         self.check_vertex_reach(&variant.pipeline().vertex_input.pulled, &draw)?;
+         self.vertex
+             .check_function_tables(call, Stage::Vertex, interface)?;
+@@ -6028,6 +6032,7 @@ impl RenderCommandEncoder {
+             });
+         // Set 1, the heap: its writes at the elements of their resource IDs, and the device's
+         // texture table at the texture handle tables.
++        _phases.mark(3);
+         let heap = heap_sets::heap_elements(&variant.pipeline().layout, &plan, &live.state)?;
+         let texture_table =
+             heap_sets::texture_table(self.core.device(), &variant.pipeline().layout)?;
+@@ -6161,6 +6166,7 @@ impl RenderCommandEncoder {
+                 )?)
+             }
+         };
++        _phases.mark(4);
+         // The dynamic states the pipeline holds, which the draw records and its secondary's record
+         // keeps (`render/bound.rs`): a pipeline that discards rasterization has no fragment
+         // shader or fragment output state, so those states are none of its own (`fragment_state`).
+@@ -6175,6 +6181,7 @@ impl RenderCommandEncoder {
+         let dynamic_strides = dynamic.contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+         // The instance the draw records into, and what stands in for the pass's attachments from
+         // the draw on: the encoder's layout once the draw is recorded.
++        _phases.mark(5);
+         let storage = self.storage_attachments(graphics)?;
+         let (interlocked, interlocked_writes) = InterlockedStorage::of(graphics, &storage);
+         let failing = match &failing_state {
+@@ -6529,6 +6536,7 @@ impl RenderCommandEncoder {
+         }
+         let profile = device.compile_device().profile();
+         let selects = graphics.writes_viewport_index;
++        _phases.mark(6);
+         let mut fixed = self.draw_fixed(
+             graphics,
+             failing.as_ref(),
+@@ -6682,6 +6690,7 @@ impl RenderCommandEncoder {
+         let bound_each = device
+             .binds_each(variant.objects().kinds())
+             .then(|| variant.objects().tested_formats(&formats));
++        _phases.mark(7);
+         // The draw's `VkPipeline`: made, or being made on the device's pool while the draw goes
+         // on, where its recording can wait for it (`render/pending.rs`): not in an execution's
+         // replay, whose host step records now, nor for a draw that records nothing, nor in a pass
+@@ -6721,6 +6730,7 @@ impl RenderCommandEncoder {
+             let memo = Some(&mut self.bind_memo);
+             binding::bind(call, &device, &mut state, &plan, &command, &tables, memo)?
+         };
++        _phases.mark(8);
+         // The draw's push bytes, filled in place.
+         let push = binding::push_writes(commands.push_constants, &bound.holes)?;
+         // A plan that draws one amplification at a time records the draw once per amplification,
+@@ -6739,6 +6749,7 @@ impl RenderCommandEncoder {
+             false => &amplified[..],
+         };
+         let objects = Arc::clone(variant.objects());
++        _phases.mark(9);
+         // Set 0 per draw; set 1 the device's (written below, once nothing refuses).
+         let mut writes = bound.writes;
+         let heap_writes: Vec<_> = writes.extract_if(.., |write| write.set > 0).collect();
+@@ -6747,6 +6758,7 @@ impl RenderCommandEncoder {
+         // and sampler written is live (the command buffer retains them below, and a refusal
+         // leaves the set unused in its pool).
+         unsafe { binding::write_sets(&device, set.as_slice(), &writes) }?;
++        _phases.mark(10);
+         // The Vulkan draws: the binder's, the index bounds pass's two, or the index rewrite
+         // pass's one.
+         let sized = device.shared().sized_index_bind;
+@@ -6888,6 +6900,7 @@ impl RenderCommandEncoder {
+             )?),
+             None => None,
+         };
++        _phases.mark(11);
+         // Its sampler tables, which the command buffer lists again as it commits.
+         let listing = SamplerListing::of(
+             (&plan, &objects),
+@@ -7054,6 +7067,7 @@ impl RenderCommandEncoder {
+             && self.state.reach_state().is_some();
+         // A draw that rasterizes nothing reaches no tile: it changes nothing the capture finds.
+         let rasterizes = !graphics.rasterizer_discard;
++        _phases.mark(12);
+         // Recording starts here: nothing below can be refused.
+         self.driver_restarts |= tessellated;
+         if let Some(made) = made {
+@@ -7070,6 +7084,7 @@ impl RenderCommandEncoder {
+         if let (Some(held), Some(used)) = (self.imageblock.as_mut(), &imageblock_use) {
+             held.adopt(used.alignment);
+         }
++        _phases.mark(13);
+         self.install(next, stood, continuation);
+         self.installed_extended_draw(&pipeline);
+         self.tile_memory_splits += usize::from(tile_memory_split);
+@@ -8631,3 +8646,78 @@ fn untouched_memoryless() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var("M2V_UNTOUCHED_MEMORYLESS").is_ok_and(|v| v == "1"))
+ }
++
++/// guacamole: `M2V_DRAW_PHASES=1` times `draw_resident`'s phases (the `_phases.mark(n)` lines: n is the phase that
++/// ends there; 14 runs to the end) and every 5000 draws appends each phase's mean per draw, in microseconds, to
++/// /var/local/m2v-cache/phases.log.
++struct DrawPhases {
++    on: bool,
++    last: u64,
++}
++
++static DRAW_PHASES: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
++static DRAW_PHASE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++fn draw_phases_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("M2V_DRAW_PHASES").is_ok_and(|v| v == "1"))
++}
++
++unsafe extern "C" {
++    fn mach_absolute_time() -> u64;
++}
++
++#[inline]
++fn phase_ticks() -> u64 {
++    // SAFETY: libSystem's monotonic clock, 24 MHz ticks here (mach_timebase_info 125/3 ns).
++    unsafe { mach_absolute_time() }
++}
++
++static DRAW_PHASE_HITS: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
++
++impl DrawPhases {
++    #[inline]
++    fn begin() -> DrawPhases {
++        let on = draw_phases_on();
++        DrawPhases { on, last: if on { phase_ticks() } else { 0 } }
++    }
++
++    #[inline]
++    fn mark(&mut self, phase: usize) {
++        if self.on {
++            let now = phase_ticks();
++            DRAW_PHASES[phase].fetch_add(now.wrapping_sub(self.last), std::sync::atomic::Ordering::Relaxed);
++            DRAW_PHASE_HITS[phase].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            self.last = now;
++        }
++    }
++}
++
++impl Drop for DrawPhases {
++    fn drop(&mut self) {
++        if !self.on {
++            return;
++        }
++        self.mark(14);
++        let n = DRAW_PHASE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        if n % 5000 != 0 {
++            return;
++        }
++        let hz = 24_000_000.0f64; // mach_absolute_time's ticks (timebase 125/3 ns)
++        let mut line = format!("draws {n}:");
++        let mut total = 0.0;
++        for (i, p) in DRAW_PHASES.iter().enumerate() {
++            let us = p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 1e6 / hz / 5000.0;
++            total += us;
++            let hits = DRAW_PHASE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed);
++            line += &format!(" {i}={us:.1}/{hits}");
++        }
++        line += &format!(" total={total:.1} us\n");
++        use std::io::Write;
++        if let Ok(mut f) =
++            std::fs::OpenOptions::new().append(true).create(true).open("/var/local/m2v-cache/phases.log")
++        {
++            let _ = f.write_all(line.as_bytes());
++        }
++    }
++}
