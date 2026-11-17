@@ -368,6 +368,19 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   malloc left the top of the profile; per draw ~10% cheaper by a rough
   estimate (the page's scene changed between runs). YouTube then drew 9-13
   passes a frame, 25-48 swaps/s, GPU 30-67%: smooth.
+- userland/metal2/test/drawbench (copy metal-work/m2v-bridge/runtime_examples.air
+  next to it as drawbench.air; list it in mtl2-clients): QuartzCore-shaped
+  draws through Metal.framework without QuartzCore or the user, on a
+  1125x2436 BGRA8 target (+ "second": the memoryless color), positions and
+  colors by setVertexBytes, alternating textures. It reproduces
+  backboardd's costs: ~60 us a draw, 120-190 us a pass end (40 draws x 4
+  passes: frame CPU 10.5 ms, GPU 2.8 ms; 150 x 35: 306 ms / 81 ms). Its
+  profile: draw_resident 66% of the thread, Turnip's own draw and
+  descriptor work ~7%; draw_resident is 1600 lines of per-draw checks and
+  steps (tessellation, mesh, capture, shadows, reroutes, stand-ins, index
+  passes, heap sets...), its own time spread over hundreds of lines, plus
+  settle_draw 6.6%, bind::instantiate 6.5%, Recording::record 7%,
+  binding::bind 3.5%, write_sets 3%, ArgumentTable::retain 2.5%.
 - Power (2026-11-16): on the charger iOS gets ~0.4-0.57 A into the battery
   idle (SweetBattery InstantAmperage), and with video and the GPU busy it
   drains ~0.72 A while "IsCharging" stays Yes (3.52 -> 3.39 V in minutes);
