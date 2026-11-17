@@ -435,6 +435,67 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
 - vtprobe FILE [N] [sw]: decodes a file's video track through VTDecompressionSession
   and prints the first frame's format, errors and the decode rate.
 
+### Video and GPU: state and plan (2026-11-17, where the session stopped)
+
+Done: H.264/HEVC decode and display (0165 plane row bytes, 0166 display
+alignment dictionary, bridge YCbCr textures), YouTube in Safari plays
+smoothly at 360p (25-48 swaps/s, GPU 30-67% in its current layout).
+
+On the phone now (not defaults of a fresh root; undo each to compare):
+- /var/local/mtl2-tu-debug = sysmem (Turnip renders every pass in sysmem;
+  untested on UI swipes, may be worse there than the default autotune);
+- /var/local/mtl2-env = M2V_UNTOUCHED_MEMORYLESS=1 (bridge patch 0103);
+- SweetMetal2.bundle with mimalloc (M2V_SYSTEM_MALLOC=1 goes back) and
+  patches 0102-0104 (render area log, untouched memoryless, phase timers;
+  all off by default);
+- /var/jb/usr/lib/TweakInject/SweetMSE.dylib (userland/jb/msetweak.m) and
+  com.apple.mobilesafari MediaSourceEnabled = true (prefs);
+- the flashed boot_b: ios-flash-charger.img (0167 sweetcharge=1, the shim's
+  charger screen).
+
+MSE in Safari (for more than 360p on YouTube):
+- iPhone Safari 16 has no window.MediaSource. Safari applies its own
+  MediaSourceEnabled default (com.apple.mobilesafari, off on an iPhone)
+  through -[WKPreferences _setMediaSourceEnabled:]: setting the default
+  alone or setting the preference at -[WKWebView
+  initWithFrame:configuration:] did not stick. SweetMSE makes that setter
+  always set YES: window.MediaSource is then a function.
+- But MediaSource.isTypeSupported answers false for every mp4 type, AAC
+  audio too (H.264, HEVC, VP9 webm, AV1 also false; Opus webm, which WebKit
+  parses itself, true), even with MediaContentTypesRequiringHardwareSupport
+  emptied and its fallback on (also in SweetMSE). AVFoundation itself, from
+  an unsandboxed process, says yes ([AVURLAsset isPlayableExtendedMIMEType:]
+  1 for avc1/hvc1/mp4a; AVStreamDataParser audiovisualMIMETypes 38 types,
+  no playableExtendedMIMETypeWithCodecs: on 16). So WebKit's AVFoundation
+  MSE engine refuses inside WebKit: next, WebKit's Media log channel in
+  WebContent and the GPU process (the engine lives there on iOS 16):
+  engine registration with MediaSourceEnabled in the GPU process's
+  preferences, MediaPlayerPrivateMediaSourceAVFObjC::isAvailable(), the
+  sandbox. Test page: a small HTML file printing typeof MediaSource and
+  isTypeSupported answers; the Mac's listening sockets are not reachable
+  from the phone in this setup, so serve it through `ssh -R
+  8765:127.0.0.1:8765` and open http://127.0.0.1:8765/ on the phone.
+- Alternative: a YouTube IPA (AVPlayer + HLS, 720p/1080p; avplay plays
+  1080p H.264 in real time here) with a version spoofer (uYouEnhanced
+  "Version Spoofer", YTLite "Spoof app version") against the forced update.
+
+GPU plan, in order:
+1. Check TU_DEBUG=sysmem on UI swipes (home screen, Control Center, app
+   switcher) against the default autotune: keep it only if not worse.
+2. The bridge's CPU cost per draw (~60 us, drawbench; Turnip's share ~4 us):
+   no single hot spot; phases 1-8 (~26 us, 0104) repeat the previous draw's
+   answers for QuartzCore. Candidates by size: binding::instantiate + set 0
+   writes (~8 us), settle_draw (~4 us), Recording + install (~9.6 us),
+   draw_settings (~1.5 us), ArgumentTable::retain, command_uses, set_zero.
+   Measure each change with drawbench (150 4 200 second) and
+   M2V_DRAW_PHASES=1, and look at the screen. Expect 1.5-2x on the CPU side
+   for a week of work; worth it once a scene is limited by it again.
+3. GPU side of blur-heavy scenes (the 34-pass YouTube layout: ten
+   full-screen framebuffer passes resumed with Load + Store, 27 Mpx a
+   frame): bound resumed passes by their draws' vertices (scissors are
+   full-screen in 83 of 94; 0102 logs that), UBWC for QuartzCore's
+   offscreen textures (now linear), render at @2x as the last resort.
+
 ## Files app
 
 On My iPhone is FileProvider's LocalStorage domain on FPFS, which iOS 16
