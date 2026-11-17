@@ -327,7 +327,7 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   360p mp4 (no MediaSource on iPhone before 17.1: no isTypeSupported calls,
   'src' URL, FigFilePlayer ~300-580 kbps); WebKit has
   -[WKPreferences _setMediaSourceEnabled:] (on for iPad).
-- What a frame of it is (2026-11-15, /var/local/mtl2-passlog: the frontend
+- What a frame of it is (2026-11-15, removing /var/local/m2v-cache/passlog: the frontend
   logs the next 400 passes' attachments): 34 passes, 141 draws. 10 of them
   are QuartzCore's framebuffer pass (1125x2436, Load + Store) resumed after
   each backdrop blur: 10 x 2.74 Mpx = the 27 Mpx a frame of the telemetry,
@@ -356,6 +356,18 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   (34 swaps/s, 28-41 ms commit to complete). With TU_DEBUG=sysmem on top: the
   GPU busy at 82-88% of vsyncs (was 92-100%), still ~33 swaps/s, backboardd's
   render thread ~90% busy: the CPU side of the bridge is the next limit.
+- 2026-11-17: the frontend's pass log (above) re-armed itself every second
+  for two days: backboardd (mobile) could not remove /var/local/mtl2-passlog,
+  mtl2.log grew to 428 MB and sm2_logs was ~1.7% of the render thread. Its
+  trigger is now /var/local/m2v-cache/passlog, armed only by a removal.
+  Clean profile (sysmem + 0103, the 34-pass scene): the render thread 89%
+  busy, the bridge's draws 40% of it (~70 us a draw), end_encoding 20%
+  (~145 us a pass), malloc/free 15% spread over the runtime. The bridge's
+  Rust heap is now mimalloc (NativeMetalBridge.rs BridgeAllocator;
+  M2V_SYSTEM_MALLOC=1 in /var/local/mtl2-env goes back to the system's):
+  malloc left the top of the profile; per draw ~10% cheaper by a rough
+  estimate (the page's scene changed between runs). YouTube then drew 9-13
+  passes a frame, 25-48 swaps/s, GPU 30-67%: smooth.
 - Power (2026-11-16): on the charger iOS gets ~0.4-0.57 A into the battery
   idle (SweetBattery InstantAmperage), and with video and the GPU busy it
   drains ~0.72 A while "IsCharging" stays Yes (3.52 -> 3.39 V in minutes);

@@ -885,12 +885,13 @@ static void scheduled(void *context);
    if(pixels>=2000000)gFullScreenPasses++;
   }
  }
- // guacamole: with /var/local/mtl2-passlog, the next 400 passes' attachments (size, format, load/store, surface or not) into the
- // log: which of a frame's passes cost the GPU (YouTube in Safari: 34 passes and 27 Mpx a frame)
+ // guacamole: removing /var/local/m2v-cache/passlog (a directory its processes can write: backboardd runs as mobile) logs the
+ // next 400 passes' attachments (size, format, load/store, surface or not): which of a frame's passes cost the GPU (YouTube in
+ // Safari: 34 passes and 27 Mpx a frame). Only a removal arms it: a trigger it could not remove logged every second, for days.
  {
   static std::atomic<uint64_t> checkedUs{0};static std::atomic<int> left{0};
   const uint64_t now=nowUs();
-  if(now-checkedUs.load()>1000000){checkedUs=now;if(left.load()<=0 && access("/var/local/mtl2-passlog",F_OK)==0){unlink("/var/local/mtl2-passlog");left=400;}}
+  if(now-checkedUs.load()>1000000){checkedUs=now;if(left.load()<=0 && unlink("/var/local/m2v-cache/passlog")==0)left=400;}
   if(left.load()>0 && left.fetch_sub(1)>0) {
    NSMutableString *line=[NSMutableString stringWithFormat:@"pass %lux%lu",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight];
    for(unsigned i=0;i<8;i++){MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];if(!c.texture)continue;

@@ -41,6 +41,7 @@ metal2vulkan = { path = "$SRC/crates/metal2vulkan", features = ["ash"] }
 metal2vulkan-runtime = { path = "$SRC/crates/metal2vulkan-runtime" }
 libc = "0.2"
 sha2 = { version = "0.10", features = ["asm"] }
+mimalloc = { version = "0.1", default-features = false }
 [profile.release]
 panic = "unwind"
 debug = 1

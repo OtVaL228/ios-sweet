@@ -11,6 +11,56 @@
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
 
+/// guacamole: the runtime allocates and frees in every draw and pass (malloc and free were 15% of backboardd's render
+/// thread with YouTube playing in Safari, spread over the runtime): its heap is mimalloc, unless the process starts with
+/// M2V_SYSTEM_MALLOC=1 (/var/local/mtl2-env), read once at the first allocation, before which nothing of ours is held.
+/// Nothing the runtime allocates is freed outside Rust, and nothing C allocates is freed by it.
+struct BridgeAllocator;
+
+static USE_SYSTEM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 not read, 1 system, 2 mimalloc
+
+impl BridgeAllocator {
+    #[inline]
+    fn system() -> bool {
+        match USE_SYSTEM.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {
+                // getenv allocates nothing
+                let on = unsafe { libc::getenv(c"M2V_SYSTEM_MALLOC".as_ptr()) };
+                let system = !on.is_null() && unsafe { *on } == b'1' as c_char;
+                USE_SYSTEM.store(if system { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+                system
+            }
+            v => v == 1,
+        }
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for BridgeAllocator {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if Self::system() { unsafe { std::alloc::System.alloc(layout) } } else { unsafe { mimalloc::MiMalloc.alloc(layout) } }
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if Self::system() { unsafe { std::alloc::System.alloc_zeroed(layout) } } else { unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) } }
+    }
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if Self::system() { unsafe { std::alloc::System.dealloc(ptr, layout) } } else { unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) } }
+    }
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if Self::system() {
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        } else {
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: BridgeAllocator = BridgeAllocator;
+
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
